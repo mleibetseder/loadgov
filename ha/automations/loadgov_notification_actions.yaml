@@ -1,0 +1,100 @@
+# DRAFT, not active until the owner applies it (ha/README.md). Home Assistant 2026.10 syntax.
+# Handles the LOADGOV:* buttons set by
+# "loadgov: Alerts to phones".
+#
+# Button ids handled today: LOADGOV:profile=<name> (POST /v1/action) and
+# LOADGOV:cancel_holder:<heavy|compile> (POST /v1/cancel-holder). Only buttons the daemon can execute are
+# offered, so none answers an error by design. When freeze/unfreeze or prune_caches land, add the ids
+# to `passthrough` below (one line) and enable the matching label in loadgov_alerts.yaml.
+- id: loadgov_notification_actions
+  alias: "loadgov: notification actions"
+  description: >-
+    Maps a tapped LOADGOV:* notification button to the matching loadgov rest_command, then reports the
+    HTTP status on every phone in `phones` and in `record_script` when one is set. cancel_holder always sends
+    confirm true (set inside rest_command.loadgov_cancel_holder).
+  mode: queued
+  max: 5
+  variables:
+    # Site values: edit these, nothing else in this file is site specific.
+    phones:
+      - notify.YOUR_PHONE        # one notify action per phone to notify (Developer Tools -> Actions)
+    alert_path: "/"              # dashboard path a notification tap opens, e.g. /lovelace/alerts
+    record_script: ""            # optional script (fields: title, message) that records every event; empty = off
+  triggers:
+    - trigger: event
+      event_type: mobile_app_notification_action
+      note: "Fired by the Companion app when a notification action button is tapped."
+  conditions:
+    - condition: template
+      value_template: >-
+        {{ trigger.event.data.action is string and trigger.event.data.action.startswith('LOADGOV:') }}
+      note: "Only our own buttons; buttons of other automations are ignored."
+  actions:
+    - variables:
+        sub: "{{ trigger.event.data.action[8:] }}"
+        parts: "{{ sub.split(':') }}"
+        cmd: "{{ parts[0] }}"
+        slot: "{{ parts[1] if parts | length > 1 else '' }}"
+        reason: "Home Assistant notification button {{ trigger.event.data.action }}"
+        passthrough: []  # later: ['freeze', 'unfreeze', 'prune_caches'] (sent to /v1/action as the action id)
+        label: >-
+          {% if cmd == 'cancel_holder' %}cancel_holder {{ slot }}{% else %}{{ sub }}{% endif %}
+    # Route first (choose), so unknown ids stop here. A response_variable is scoped to its branch, so
+    # the branches only pick the service; the one shared call below keeps the response in scope.
+    - choose:
+        - conditions:
+            - condition: template
+              value_template: "{{ sub is match('^profile=[a-z][a-z0-9_-]*$') or sub in passthrough }}"
+          sequence:
+            - variables:
+                svc: rest_command.loadgov_action
+                call_data:
+                  action: "{{ sub }}"
+                  reason: "{{ reason }}"
+        - conditions:
+            - condition: template
+              value_template: "{{ cmd == 'cancel_holder' and slot in ['heavy', 'compile'] }}"
+          sequence:
+            - variables:
+                svc: rest_command.loadgov_cancel_holder
+                call_data:
+                  slot: "{{ slot }}"
+                  reason: "{{ reason }}"
+      default:
+        - stop: "Unknown LOADGOV action {{ trigger.event.data.action }}"
+          error: true
+    - action: "{{ svc }}"
+      data: "{{ call_data }}"
+      response_variable: resp
+      continue_on_error: true
+    - variables:
+        status: "{{ (resp | default({}, true)).get('status', 0) | int(0) }}"
+        ok: "{{ 200 <= status < 300 }}"
+        detail: >-
+          {% set c = (resp | default({}, true)).get('content') %}
+          {{ (c.get('error') if c is mapping else c) | default('', true) | string | truncate(160) }}
+        out_title: "{{ '✅' if ok else '⚠️' }} loadgov: {{ label }}"
+        out_msg: >-
+          {% if ok %}Accepted (HTTP {{ status }}).{% elif status == 0 %}No reply from loadgovd (down, unreachable or timeout).{% else %}Refused or failed: HTTP {{ status }} {{ detail }}{% endif %}
+    - repeat:
+        for_each: "{{ phones }}"
+        sequence:
+          - action: "{{ repeat.item }}"
+            data:
+              title: "{{ out_title }}"
+              message: "{{ out_msg }}"
+              data:
+                tag: loadgov-action-result
+                group: loadgov
+                timeout: 300
+                url: "{{ alert_path }}"
+                clickAction: "{{ alert_path }}"
+            continue_on_error: true
+    - if:
+        - condition: template
+          value_template: "{{ record_script | length > 0 }}"
+      then:
+        - action: "{{ record_script }}"
+          data:
+            title: "{{ out_title }}"
+            message: "{{ out_msg }}"

@@ -1,0 +1,105 @@
+# DRAFT, not active until the owner applies it (ha/README.md). Home Assistant 2026.10 syntax.
+# Remind every 45 min while a human hold is set on any slot (status field slots.<slot>.hold, see
+# docs/protocol.md "Status object"). Source: binary_sensor.loadgovd_hold_active and the attributes of
+# sensor.loadgovd_level (slots.<slot>.state/hold/holder/held_since), both from ha/packages/loadgov.yaml.
+# A silent profile or an owner ceiling is not a hold and does not remind.
+# Hook for the future freeze flag: when the daemon publishes one, extend binary_sensor.loadgovd_hold_active
+# in the package and add it to `what` below.
+# No buttons: releasing a hold/freeze from the phone arrives with /v1/hold.
+- id: loadgov_hold_reminder
+  alias: "loadgov: hold reminder"
+  description: >-
+    While a hold is set on a slot, notify every phone in `phones` every 45 minutes (first one 45 minutes after it began
+    or after HA started), naming the slot, the hold reason and since when. Clears the reminder and stops when
+    the hold ends.
+  mode: restart
+  variables:
+    # Site values: edit these, nothing else in this file is site specific.
+    phones:
+      - notify.YOUR_PHONE        # one notify action per phone to notify (Developer Tools -> Actions)
+    alert_path: "/"              # dashboard path a notification tap opens, e.g. /lovelace/alerts
+    record_script: ""            # optional script (fields: title, message) that records every event; empty = off
+  triggers:
+    - trigger: state
+      id: active
+      entity_id: binary_sensor.loadgovd_hold_active
+      to: "on"
+    - trigger: homeassistant
+      id: active
+      event: start
+    - trigger: state
+      id: cleared
+      entity_id: binary_sensor.loadgovd_hold_active
+      to: "off"
+  conditions: []
+  actions:
+    - choose:
+        - conditions:
+            - condition: trigger
+              id: cleared
+          sequence:
+            - repeat:
+                for_each: "{{ phones }}"
+                sequence:
+                  - action: "{{ repeat.item }}"
+                    data:
+                      message: clear_notification
+                      data:
+                        tag: loadgov-hold-reminder
+                    continue_on_error: true
+            - stop: "Hold cleared, reminder stopped."
+        - conditions:
+            - condition: trigger
+              id: active
+            - condition: state
+              entity_id: binary_sensor.loadgovd_hold_active
+              state: "on"
+          sequence:
+            # since_ha is an ISO string on purpose: variables render to strings, so convert with as_datetime at use.
+            - variables:
+                since_ha: "{{ states.binary_sensor.loadgovd_hold_active.last_changed.isoformat() }}"
+            - repeat:
+                while:
+                  - condition: state
+                    entity_id: binary_sensor.loadgovd_hold_active
+                    state: "on"
+                sequence:
+                  - wait_template: "{{ is_state('binary_sensor.loadgovd_hold_active', 'off') }}"
+                    timeout:
+                      minutes: 45
+                    continue_on_timeout: true
+                  - if:
+                      - condition: state
+                        entity_id: binary_sensor.loadgovd_hold_active
+                        state: "on"
+                    then:
+                      - variables:
+                          sl: "{{ state_attr('sensor.loadgovd_level', 'slots') or {} }}"
+                          what: >-
+                            {% set ns = namespace(w=[]) %}
+                            {% for s in ['heavy', 'compile'] %}{% set x = sl.get(s) or {} %}{% if x.get('hold') %}{% set ns.w = ns.w + [s ~ ' slot held (' ~ x.get('hold') ~ ')' ~ (', since ' ~ as_local(as_datetime(x.get('held_since'))).strftime('%a %H:%M') if x.get('held_since') else '')] %}{% endif %}{% endfor %}
+                            {{ ns.w | join('; ') }}
+                          msg: >-
+                            Freeze/hold still active since {{ as_local(as_datetime(since_ha)).strftime('%a %H:%M') }}
+                            ({{ ((now() - as_datetime(since_ha)).total_seconds() // 60) | int }} min){% if what | trim %}: {{ what | trim }}{% endif %}.
+                      - repeat:
+                          for_each: "{{ phones }}"
+                          sequence:
+                            - action: "{{ repeat.item }}"
+                              data:
+                                title: "🟡 loadgov: hold still active"
+                                message: "{{ msg }}"
+                                data:
+                                  tag: loadgov-hold-reminder
+                                  group: loadgov
+                                  url: "{{ alert_path }}"
+                                  clickAction: "{{ alert_path }}"
+                              continue_on_error: true
+                      - if:
+                          - condition: template
+                            value_template: "{{ record_script | length > 0 }}"
+                        then:
+                          - action: "{{ record_script }}"
+                            data:
+                              title: "🟡 loadgov: hold still active"
+                              message: "{{ msg }}"

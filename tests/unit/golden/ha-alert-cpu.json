@@ -1,0 +1,15 @@
+{
+  "v": 1,
+  "type": "alert",
+  "key": "cpu",
+  "level": "warning",
+  "title": "CPU busy",
+  "message": "CPU 75% busy, above 70% (target 65%) for 3 checks",
+  "top3": [{"pid": 101, "comm": "rustc", "pcpu": 97.1, "rss_mb": 6800}],
+  "avail_mb": 7000,
+  "swap_mb": 120,
+  "profile": "balanced",
+  "ceiling": null,
+  "actions": ["profile=silent", "freeze"],
+  "at": "2025-11-10T18:40:00Z"
+}

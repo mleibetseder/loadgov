@@ -1,0 +1,159 @@
+# DRAFT, not active until the owner applies it (ha/README.md). Home Assistant 2026.10 syntax.
+# HA raises the "loadgovd down" alert. Needs sensor.loadgovd_level and input_boolean.loadgov_down_alerted
+# from ha/packages/loadgov.yaml (rest sensor, polled every 30 s; unavailable when the daemon or its REST
+# listener does not answer). The input_boolean remembers that a down alert was sent, so the "back"
+# history entry is only written after a real alert and a duplicate down trigger sends nothing twice.
+- id: loadgov_daemon_down
+  alias: "loadgov: daemon down"
+  description: >-
+    loadgovd status sensor unavailable for 2 minutes (or still unavailable/unknown 2 minutes after HA
+    started): critical notification on every phone in `phones`. Cleared when the sensor answers again (any state except
+    unavailable/unknown, also when HA starts with a healthy sensor); "back" is recorded in the history only if a down alert was sent. Also fires when only the
+    REST listener is down while the daemon runs (check /run/loadgovd/status.json on the host: rest.state,
+    rest.error).
+  mode: queued
+  max: 5
+  variables:
+    # Site values: edit these, nothing else in this file is site specific.
+    phones:
+      - notify.YOUR_PHONE        # one notify action per phone to notify (Developer Tools -> Actions)
+    alert_path: "/"              # dashboard path a notification tap opens, e.g. /lovelace/alerts
+    record_script: ""            # optional script (fields: title, message) that records every event; empty = off
+  triggers:
+    - trigger: state
+      id: down
+      entity_id: sensor.loadgovd_level
+      to: unavailable
+      for:
+        minutes: 2
+    - trigger: homeassistant
+      id: start_check
+      event: start
+    - trigger: state
+      id: back
+      entity_id: sensor.loadgovd_level
+      from:
+        - unavailable
+        - unknown
+      not_to:
+        - unavailable
+        - unknown
+  conditions: []
+  actions:
+    - choose:
+        - conditions:
+            - condition: trigger
+              id:
+                - down
+                - start_check
+          sequence:
+            - if:
+                - condition: trigger
+                  id: start_check
+              then:
+                - delay:
+                    minutes: 2
+                  note: "Give the first status poll time; catches a daemon that is already down when HA starts."
+            - choose:
+                # down and not yet alerted: alert. Down and already alerted: nothing (HA restart during an
+                # outage, unavailable -> unknown -> unavailable). Healthy: clear.
+                - conditions:
+                    - condition: state
+                      entity_id: sensor.loadgovd_level
+                      state:
+                        - unavailable
+                        - unknown
+                    - condition: state
+                      entity_id: input_boolean.loadgov_down_alerted
+                      state: "off"
+                  sequence:
+                    - action: input_boolean.turn_on
+                      target:
+                        entity_id: input_boolean.loadgov_down_alerted
+                    - repeat:
+                        for_each: "{{ phones }}"
+                        sequence:
+                          - action: "{{ repeat.item }}"
+                            data:
+                              title: "🔴 loadgovd down"
+                              message: "loadgovd down — paused work stays paused. No status for 2 minutes."
+                              data:
+                                tag: loadgov-daemon-down
+                                group: loadgov
+                                url: "{{ alert_path }}"
+                                clickAction: "{{ alert_path }}"
+                                channel: loadgov-critical
+                                priority: high
+                                ttl: 0
+                            continue_on_error: true
+                    - if:
+                        - condition: template
+                          value_template: "{{ record_script | length > 0 }}"
+                      then:
+                        - action: "{{ record_script }}"
+                          data:
+                            title: "🔴 loadgovd down"
+                            message: "loadgovd down — paused work stays paused."
+                - conditions:
+                    - condition: not
+                      conditions:
+                        - condition: state
+                          entity_id: sensor.loadgovd_level
+                          state:
+                            - unavailable
+                            - unknown
+                  sequence:
+                    - repeat:
+                        for_each: "{{ phones }}"
+                        sequence:
+                          - action: "{{ repeat.item }}"
+                            data:
+                              message: clear_notification
+                              data:
+                                tag: loadgov-daemon-down
+                            continue_on_error: true
+                    - if:
+                        - condition: state
+                          entity_id: input_boolean.loadgov_down_alerted
+                          state: "on"
+                      then:
+                        - action: input_boolean.turn_off
+                          target:
+                            entity_id: input_boolean.loadgov_down_alerted
+                        - if:
+                            - condition: template
+                              value_template: "{{ record_script | length > 0 }}"
+                          then:
+                            - action: "{{ record_script }}"
+                              data:
+                                title: "✅ loadgovd back"
+                                message: "loadgovd answers again (level {{ states('sensor.loadgovd_level') }})."
+        - conditions:
+            - condition: trigger
+              id: back
+          sequence:
+            - repeat:
+                for_each: "{{ phones }}"
+                sequence:
+                  - action: "{{ repeat.item }}"
+                    data:
+                      message: clear_notification
+                      data:
+                        tag: loadgov-daemon-down
+                    continue_on_error: true
+            - if:
+                - condition: state
+                  entity_id: input_boolean.loadgov_down_alerted
+                  state: "on"
+              then:
+                - action: input_boolean.turn_off
+                  target:
+                    entity_id: input_boolean.loadgov_down_alerted
+                - if:
+                    - condition: template
+                      value_template: "{{ record_script | length > 0 }}"
+                  then:
+                    - action: "{{ record_script }}"
+                      data:
+                        title: "✅ loadgovd back"
+                        message: "loadgovd answers again (level {{ trigger.to_state.state }})."

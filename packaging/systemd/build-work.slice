@@ -1,0 +1,13 @@
+[Unit]
+Description=loadgov: all governed build work (parent of the build-work-*.slice units)
+
+[Slice]
+CPUAccounting=yes
+MemoryAccounting=yes
+# Balanced profile (max_cores 3.5). A dead daemon or a daemon-reload still leaves this cap in place.
+CPUQuota=350%
+# Memory backstop: the daemon applies these from loadgov.toml [backstop] when enabled; the static lines
+# below are the same limit surviving a dead daemon. Uncomment only with values from tools/backstop_sizing.py, and
+# remove both again on rollback (then `systemctl daemon-reload`).
+#MemoryMax=12G
+#MemorySwapMax=2G

@@ -1,0 +1,148 @@
+# Dashboard view for the "Build Host Load Governor" device (custom integration loadgov, HA 2026.10).
+# DRAFT: not applied to any Home Assistant instance. Paste into a dashboard's raw configuration editor, or
+# keep as a YAML-mode dashboard. Entity ids are fixed by the integration (host_<key>).
+title: Build Host
+views:
+  - title: Load Governor
+    path: loadgov
+    icon: mdi:server
+    type: sections
+    max_columns: 3
+    sections:
+      - type: grid
+        cards:
+          - type: heading
+            heading: Control
+            icon: mdi:tune
+          - type: tile
+            entity: select.host_load_profile
+            name: Profile
+            features:
+              - type: select-options
+          - type: tile
+            entity: switch.host_load_gate_hold
+            name: Hold new work
+            icon: mdi:hand-back-left
+            features:
+              - type: toggle
+          - type: tile
+            entity: switch.host_instant_quiet_freeze
+            name: Instant quiet (freeze)
+            icon: mdi:snowflake
+            vertical: false
+          - type: tile
+            entity: button.host_resume_paused_workers
+            name: Resume paused workers
+            tap_action:
+              action: perform-action
+              perform_action: button.press
+              target:
+                entity_id: button.host_resume_paused_workers
+              confirmation:
+                text: Resume all paused workers?
+          - type: tile
+            entity: button.host_kill_build_daemons
+            name: Kill build daemons
+            tap_action:
+              action: perform-action
+              perform_action: button.press
+              target:
+                entity_id: button.host_kill_build_daemons
+              confirmation:
+                text: Stop idle Gradle and Kotlin daemons?
+      - type: grid
+        cards:
+          - type: heading
+            heading: Limits
+            icon: mdi:speedometer
+          - type: tile
+            entity: number.host_max_cores
+            name: Max cores
+            features:
+              - type: numeric-input
+                style: buttons
+          - type: tile
+            entity: number.host_target_cpu_pct
+            name: Target CPU
+            features:
+              - type: numeric-input
+                style: buttons
+          - type: tile
+            entity: number.host_load_max
+            name: Load max
+            features:
+              - type: numeric-input
+                style: buttons
+          - type: tile
+            entity: number.host_max_implementers
+            name: Max implementers
+            features:
+              - type: numeric-input
+                style: buttons
+          - type: tile
+            entity: number.host_ram_floor_gb
+            name: RAM floor
+            features:
+              - type: numeric-input
+                style: buttons
+      - type: grid
+        cards:
+          - type: heading
+            heading: State
+            icon: mdi:chart-line
+          - type: tile
+            entity: sensor.host_effective_profile
+            name: Effective profile
+          - type: tile
+            entity: sensor.host_owner_ceiling
+            name: Owner ceiling
+          - type: tile
+            entity: sensor.host_heavy_holder
+            name: Heavy slot holder
+          - type: tile
+            entity: binary_sensor.host_restriction_active
+            name: Restriction
+          - type: tile
+            entity: binary_sensor.host_hold_active
+            name: Hold
+          - type: tile
+            entity: binary_sensor.host_workers_paused
+            name: Workers paused
+          - type: tile
+            entity: sensor.host_paused_workers
+            name: Paused count
+      - type: grid
+        cards:
+          - type: heading
+            heading: Load
+            icon: mdi:cpu-64-bit
+          - type: tile
+            entity: sensor.host_busy_pct
+            name: Busy
+          - type: tile
+            entity: sensor.host_cap_cores_build_work
+            name: Cap build-work.slice
+          - type: tile
+            entity: sensor.host_cap_cores_mirror
+            name: Cap mirrored cgroup
+          - type: tile
+            entity: sensor.host_memory_available
+            name: Memory available
+          - type: tile
+            entity: sensor.host_swap_used
+            name: Swap used
+          - type: history-graph
+            title: Pressure (avg60)
+            hours_to_show: 6
+            entities:
+              - sensor.host_cpu_pressure
+              - sensor.host_memory_pressure
+              - sensor.host_io_pressure
+      - type: grid
+        cards:
+          - type: heading
+            heading: Diagnostics
+            icon: mdi:stethoscope
+          - type: tile
+            entity: sensor.host_daemon_features
+            name: Daemon features

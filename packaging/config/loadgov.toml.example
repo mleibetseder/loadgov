@@ -1,0 +1,170 @@
+# /etc/loadgov/loadgov.toml: optional. A missing file means the built-in defaults shown here.
+# Everything specific to your site (projects, addresses, lock names, log paths) is set here, never in code;
+# see README.md "Configure for your site".
+# Only the four profiles below exist; a table overrides just the keys it names.
+# Ranges: max_cores 1.0-6.0 step 0.5, target_cpu_pct 35-90 step 5, load_max 1.0-6.0 step 0.5,
+# max_implementers 0-4, ram_floor_gb 2.0-6.0 step 0.5.
+
+default_profile = "balanced"
+
+[governor]
+# false: shadow, log WOULD cap=... audit lines only; true: write cpu.max of build-work.slice (and every
+# mirror_cgroups entry of [compat]). The last cap stays when the daemon stops; it is never set to max.
+enforce = false
+
+[memguard]
+# false: shadow, log WOULD PAUSE|RESUME|ABORT|REAP audit lines only; true: freeze/SIGSTOP/docker pause
+# work, SIGTERM the largest rustc and the JVM build daemons (docs/protocol.md "Memory guard").
+# Paused work stays paused if the daemon dies; `loadgovd --recover --force` thaws it.
+enforce = false
+# pre_gate_reap_gb = 8      # built-in default, stays. Acts only with enforce = true, only for `loadctl run --kind
+#                           # gate`, only below this much MemAvailable, only on IDLE Gradle/Kotlin daemons (outside
+#                           # every job scope). 0 = off; set it if a gate loses a warm daemon it needed
+# log_path = "/var/log/loadgov/memguard.log"   # legacy memory-guard log style lines
+# Containers that are never docker-paused, whatever a project's regex says (fnmatch globs):
+# deny_containers = ["*-test-db*", "*-review-*"]   # the default
+# Implementer trees of a legacy dispatcher: a `bash <prefix>*` whose snapshot file has a line starting with
+# `marker`; the trees are reported under `project`. Off unless set.
+# legacy_snapshot = { prefix = "/tmp/dispatcher-snap.", marker = "# Usage: dispatch.sh", project = "example-project" }
+# A host-wide pause file under /run/lock, present while that project has work paused (read by `loadctl wait`).
+# pause_marker = { file = "example-guard.paused", project = "example-project" }
+# Per-project rule instead of the global one (LOW = the RAM floor, RESUME = max(6 GB, floor + 2 GB)).
+# There are no built-in projects:
+# [memguard.projects.example-project]
+# low_mb = 2048
+# high_mb = 4096
+# swap_mb = 2048
+# resume_samples = 12
+# containers = '^(gates-[0-9]|review-)'
+# agent_cwd = "/srv/work/example-project"
+
+[backstop]
+# Hard kernel limit under build-work.slice (docs/protocol.md "Memory backstop"). OFF, and NO built-in
+# values: enabled = true without both numbers below is a config error. Fill them from the trial-run history:
+#   loadctl history --all --csv | python3 tools/backstop_sizing.py -      (after a week of history, see docs/deployment.md)
+# and state the source next to the numbers, for example:
+#   # source: backstop_sizing.py over 2026-11-14..2026-11-21, peak build-work memory.current 10240 MB, +20 %
+# memory_max_mb must be >= 4096; memory_swap_max_mb >= 0. With enabled = true the daemon also sets
+# memory.oom.group = 1 on every `loadctl run` job scope, so an OOM kill takes that one scope down as a group.
+# Rollback: remove this table (or enabled = false) and restart; the daemon writes `max` back (the only case).
+enabled = false
+# memory_max_mb = 12288
+# memory_swap_max_mb = 2048
+
+[reaper]
+# false: only log WOULD REAP; true: thaw and terminate paused trees whose agent session is gone.
+enforce = false
+
+[slots]
+# false: arbitrate among loadgov clients only and log WOULD flock events; true: take the real
+# /run/lock flock files and write the holder lines so legacy scripts see loadgov holders.
+enforce = false
+# The compile slot's lock file under /run/lock (default host-compile-slot.lock). The environment variable
+# LOADGOV_COMPILE_LOCK sets the same when this key is absent.
+# compile_lock = "host-compile-slot.lock"
+
+[profiles.silent]
+max_cores = 2.0
+target_cpu_pct = 50
+load_max = 2.0
+max_implementers = 1
+cargo_build_jobs = 1
+
+[profiles.balanced]
+max_cores = 3.5
+target_cpu_pct = 65
+load_max = 3.0
+max_implementers = 2
+cargo_build_jobs = 2
+# Per profile, with these defaults when omitted:
+# load_hold = 5.0          # its own key, never derived from load_max
+# impl_max_quiet = 2       # defaults to max_implementers
+# ram_floor_gb = 3.0
+# vitest_max_workers = 2
+# gate_shard_budget = 2
+
+[profiles.boost]
+max_cores = 5.5
+target_cpu_pct = 85
+load_max = 5.0
+max_implementers = 3
+cargo_build_jobs = 3
+
+[profiles.drain]
+max_cores = 2.0
+target_cpu_pct = 50
+load_max = 2.0
+max_implementers = 0
+cargo_build_jobs = 1
+hold_heavy_slot = true   # stored only; the hold itself is taken through the slots
+
+# ---- Headroom (loadctl wait) -------------------------------------------------------------------
+# Defaults are the stricter values below for every kind (impl, review, gate, compile).
+# load1_max / load5_max may be numbers or "nproc" expressions ("nproc", "nproc-2", "nproc*0.5"),
+# resolved against the host's core count when a decision is made (a result <= 0 makes every decision
+# fail with a "misconfigured" reason); load5_max = false disables it. max_wait_s = 0 waits forever.
+# Load thresholds scale with the active profile (load_max / default profile's load_max) and
+# mem_min_gb rises by the profile's ram_floor_gb above the default profile's.
+[headroom]
+io_psi_gate = false      # io PSI some avg60 < 25 blocks only when true; otherwise only recorded (would_block_io)
+# io_psi_max = 25
+
+# Defaults for every project, per kind (all keys optional):
+# [headroom.kinds.impl]
+# load1_max = "nproc-2"
+# load5_max = "nproc-1.5"
+# psi_max = 20
+# mem_min_gb = 4
+# swap_max_mb = 1024
+# mem_psi_max = 5
+# confirm_s = 60
+# poll_s = 30
+# max_wait_s = 7200       # 0 = wait forever
+
+# Per-project overrides (there are no built-in projects). A project that waits like a legacy script
+# (every 120 s, forever) and has looser limits:
+# [projects.example-project.kinds.impl]
+# load1_max = 6
+# load5_max = false
+# psi_max = 50
+# mem_min_gb = 6
+# poll_s = 120
+# max_wait_s = 0
+# [projects.example-project.kinds.gate]
+# load1_max = "nproc"
+# load5_max = false
+# psi_max = 50
+# mem_min_gb = 4
+# poll_s = 120
+# max_wait_s = 0
+
+# REST control surface for Home Assistant (docs/protocol.md "REST"). Off by default.
+# `bind` has no default and is required when enabled: the host's own LAN address; 0.0.0.0, :: and
+# loopback addresses are refused.
+# The token lives in /etc/loadgov/tokens.env (see tokens.env.example).
+# [rest]
+# enabled = false
+# bind = "192.0.2.10"
+# port = 7420
+# allow = []              # source IPs or CIDRs; empty = token only. Add the HA VM IP here later.
+# rate_per_s = 5
+# max_connections = 16    # 1-64; extra connections are closed unread; one source IP may hold half of them
+# allow_private_bridge = false  # a bind in 172.16.0.0/12 (docker bridges) is refused unless this is true
+
+# Push alerts to a Home Assistant webhook (docs/protocol.md "Alerts"). Off by default.
+# The webhook id is LOADGOV_HA_WEBHOOK_ID in /etc/loadgov/tokens.env, never here.
+# [ha]
+# enabled = false
+# url = "http://homeassistant.local:8123"   # http:// or https://, no credentials
+
+# Keep legacy log files alive after the legacy loops stop (optional).
+# [compat]
+# alert_log_paths = []     # e.g. ["/var/log/loadgov/host-alerts.log"]
+# mirror_cgroups = []      # cgroups below the cgroup root that follow the governor's cap, e.g. ["legacy-loop"]
+# governor_log_path = "/var/log/loadgov/governor.log"  # legacy governor log lines
+
+# Owner claims (--owner) are always refused from inside build-work* cgroups. Add the cgroups and the ancestor
+# command lines (regexes) of your own dispatchers here; both lists are empty by default.
+# [principal]
+# deny_cgroups = ["/legacy-loop"]
+# ancestor_deny = ['dispatch-[^/ ]*\.sh', 'queue\.sh']

@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# Shim for the legacy `hwmon` script: status, gate, wait and history are answered by loadgovd; watch and anything
+# else (and every command while the daemon is down) run the legacy script with the same arguments.
+set -u
+LEGACY_DIR=${LOADGOV_LEGACY_DIR:-/opt/loadgov/legacy}
+LOADCTL=${LOADCTL:-loadctl}
+SOCK=${LOADGOV_SOCKET:-/run/loadgovd/loadgovd.sock}
+up() {
+  [ -S "$SOCK" ] || return 1
+  "$LOADCTL" status --json >/dev/null 2>&1
+  local rc=$?
+  [ "$rc" -ne 3 ] && [ "$rc" -ne 127 ]
+}
+legacy() { exec "$LEGACY_DIR/hwmon/hwmon" "$@"; }
+cmd=${1:-status}
+case "$cmd" in
+  status | gate | wait | history) up || legacy "$@" ;;
+  *) legacy "$@" ;;
+esac
+case "$cmd" in
+  status)
+    exec "$LOADCTL" status --hwmon
+    ;;
+  gate) # exit 0 when work may start (OK or BUSY), 1 at LIMIT
+    out=$("$LOADCTL" status --hwmon) || exit $?
+    printf '%s\n' "$out"
+    case "$(printf '%s\n' "$out" | head -n 1)" in
+      *"level LIMIT") exit 1 ;;
+    esac
+    exit 0
+    ;;
+  history) # last n samples (default 40) as CSV with a header, like hwmon; the columns are loadgov's own
+    exec "$LOADCTL" history "${2:-40}" --csv
+    ;;
+  wait) # until the level is below LIMIT on 2 samples (default max 1800 s)
+    exec "$LOADCTL" level-wait "${2:-1800}"
+    ;;
+esac

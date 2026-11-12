@@ -1,0 +1,79 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Build Host Load Governor",
+        "description": "Address and bearer token of the loadgovd REST surface.",
+        "data": { "host": "Host", "port": "Port", "token": "Token" }
+      },
+      "reauth_confirm": {
+        "title": "Token rejected",
+        "description": "Enter the current bearer token of loadgovd.",
+        "data": { "token": "Token" }
+      }
+    },
+    "error": {
+      "cannot_connect": "Cannot reach loadgovd at this address.",
+      "invalid_auth": "loadgovd rejected the token.",
+      "source_not_allowed": "Source address not allowed: add this Home Assistant address to [rest] allow in loadgov.toml."
+    },
+    "abort": {
+      "already_configured": "This loadgovd is already configured.",
+      "reauth_successful": "The token was updated."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Smart trigger entities",
+        "description": "Entities the smart triggers watch. The triggers themselves are switched on here.",
+        "data": {
+          "presence_zone": "Presence zone",
+          "tv_media_players": "TV media players",
+          "quiet_hours_switch": "Quiet hours switch",
+          "remote_load_sensor": "Remote host load sensor",
+          "remote_cpu_sensor": "Remote host CPU sensor",
+          "remote_load_threshold": "Remote host load threshold",
+          "remote_cpu_threshold": "Remote host CPU threshold (%)",
+          "notify_targets": "Notify targets",
+          "trigger_presence": "Presence trigger",
+          "trigger_tv_quiet": "TV quiet trigger",
+          "trigger_quiet_hours": "Quiet hours trigger",
+          "trigger_remote_load": "Remote host load trigger"
+        }
+      }
+    }
+  },
+  "services": {
+    "set_profile": {
+      "name": "Set profile",
+      "description": "Switch the load profile as owner.",
+      "fields": {
+        "profile": { "name": "Profile", "description": "silent, balanced, boost or drain." },
+        "until": { "name": "Until", "description": "Wall-clock time, for example 07:00 Europe/Berlin." },
+        "ttl": { "name": "Duration", "description": "For example 90s, 15m or 2h." },
+        "reason": { "name": "Reason", "description": "Audit reason." },
+        "config_entry_id": { "name": "Config entry", "description": "Only needed with several daemons." }
+      }
+    },
+    "set_ceiling": {
+      "name": "Set ceiling",
+      "description": "Cap every raise at a profile (owner ceiling).",
+      "fields": {
+        "profile": { "name": "Profile", "description": "silent, balanced, boost or drain." },
+        "until": { "name": "Until", "description": "Wall-clock time, for example 23:30 Europe/Berlin." },
+        "ttl": { "name": "Duration", "description": "For example 30m." },
+        "reason": { "name": "Reason", "description": "Audit reason." },
+        "config_entry_id": { "name": "Config entry", "description": "Only needed with several daemons." }
+      }
+    },
+    "clear_ceiling": {
+      "name": "Clear ceiling",
+      "description": "Remove the owner ceiling.",
+      "fields": {
+        "reason": { "name": "Reason", "description": "Audit reason." },
+        "config_entry_id": { "name": "Config entry", "description": "Only needed with several daemons." }
+      }
+    }
+  }
+}

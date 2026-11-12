@@ -1,0 +1,57 @@
+set_profile:
+  fields:
+    profile:
+      required: true
+      example: silent
+      selector:
+        select:
+          options: [silent, balanced, boost, drain]
+    until:
+      example: "07:00 Europe/Berlin"
+      selector:
+        text:
+    ttl:
+      example: "2h"
+      selector:
+        text:
+    reason:
+      selector:
+        text:
+    config_entry_id:
+      selector:
+        config_entry:
+          integration: loadgov
+
+set_ceiling:
+  fields:
+    profile:
+      required: true
+      example: silent
+      selector:
+        select:
+          options: [silent, balanced, boost, drain]
+    until:
+      example: "23:30 Europe/Berlin"
+      selector:
+        text:
+    ttl:
+      example: "30m"
+      selector:
+        text:
+    reason:
+      selector:
+        text:
+    config_entry_id:
+      selector:
+        config_entry:
+          integration: loadgov
+
+clear_ceiling:
+  fields:
+    reason:
+      selector:
+        text:
+    config_entry_id:
+      selector:
+        config_entry:
+          integration: loadgov

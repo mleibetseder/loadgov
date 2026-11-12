@@ -1,0 +1,31 @@
+[Unit]
+Description=loadgovd: host load governor
+Documentation=https://github.com/mleibetseder/loadgov
+After=local-fs.target
+StartLimitIntervalSec=0
+
+# Paused work stays paused when this service stops or dies: there is deliberately no
+# ExecStopPost and no thaw on exit. A restart re-adopts the paused registry in state.json and resumes it by
+# the normal rule; `loadgovd --recover --force` (daemon stopped) is the only thaw-all.
+
+[Service]
+Type=notify
+NotifyAccess=main
+ExecStart=/opt/loadgov/.venv/bin/loadgovd
+Restart=always
+RestartSec=2
+WatchdogSec=60
+RuntimeDirectory=loadgovd
+RuntimeDirectoryMode=0755
+RuntimeDirectoryPreserve=no
+StateDirectory=loadgov
+LogsDirectory=loadgov
+# The guard must survive the memory pressure it exists to handle.
+OOMScoreAdjust=-900
+Nice=-5
+MemoryMax=256M
+# Headroom for the unix socket, the REST listener (max 64 connections), lock files and /proc reads.
+LimitNOFILE=4096
+
+[Install]
+WantedBy=multi-user.target

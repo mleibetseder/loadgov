@@ -1,0 +1,121 @@
+# DRAFT, not active until the owner applies it (ha/README.md). Home Assistant 2026.10 syntax.
+# Receives the loadgovd alert push (docs/protocol.md
+# "Alerts", payload example tests/unit/golden/ha-alert-cpu.json).
+- id: loadgov_alerts_to_phones
+  alias: "loadgov: Alerts to phones"
+  description: >-
+    Webhook from loadgovd. Alerts notify every phone in `phones` with action buttons (tag loadgov-<key>, group
+    loadgov, tap opens `alert_path`); resolved events clear the matching notification; owner_change
+    events are an info notification without buttons. Every event is recorded with
+    `record_script` when one is set. Buttons are handled by "loadgov: notification actions".
+  mode: queued
+  max: 20
+  variables:
+    # Site values: edit these, nothing else in this file is site specific.
+    phones:
+      - notify.YOUR_PHONE        # one notify action per phone to notify (Developer Tools -> Actions)
+    alert_path: "/"              # dashboard path a notification tap opens, e.g. /lovelace/alerts
+    record_script: ""            # optional script (fields: title, message) that records every event; empty = off
+  triggers:
+    - trigger: webhook
+      # PLACEHOLDER. Replace with a fresh random id (python3 -c 'import secrets; print("loadgov-alert-" + secrets.token_urlsafe(24))')
+      # and put the same value in /etc/loadgov/tokens.env as LOADGOV_HA_WEBHOOK_ID. The id is the
+      # credential: treat it like a password and never commit the real value. (!secret is not usable
+      # for webhook_id in a UI automation.)
+      webhook_id: "loadgov-alert-REPLACE-WITH-GENERATED-ID"
+      allowed_methods:
+        - POST
+      local_only: true
+      note: "loadgovd posts the event JSON (v, type, key, level, title, message, top3, actions, ...)."
+  conditions: []
+  actions:
+    - variables:
+        p: "{{ trigger.json | default({}, true) }}"
+        ev_type: "{{ p.get('type', 'alert') | string | lower }}"
+        key: "{{ p.get('key', 'unknown') | string }}"
+        level: "{{ p.get('level', 'warning') | string | lower }}"
+        resolved: "{{ ev_type == 'resolved' or p.get('resolved', false) == true }}"
+        is_info: "{{ ev_type == 'info' or key == 'owner_change' }}"
+        critical: "{{ level == 'critical' }}"
+        tag: "loadgov-{{ key | replace(':', '-') }}"
+        slot: "{{ key.split(':')[1] if ':' in key else '' }}"
+        title: >-
+          {{ '🔴' if critical else ('ℹ️' if is_info else '🟡') }} loadgov: {{ p.get('title', key) }}
+        top_text: >-
+          {% set t = p.get('top3', []) %}{% if t %}
+          Top: {% for x in t[:3] %}{{ x.get('comm', '?') }} {{ x.get('pcpu', 0) | round(0) | int }}%{{ ', ' if not loop.last }}{% endfor %}{% endif %}
+        message: >-
+          {{ p.get('message', key) }}{% if top_text and (top_text | string | trim) %}
+          {{ top_text | string | trim }}{% endif %}
+        labels:
+          # Only buttons the daemon can execute today. Ids in the payload's `actions` that are not listed
+          # here are skipped, so no button ever answers an error by design.
+          profile=silent: "Throttle to Silent (2.0 cores)"
+          cancel_holder: "Cancel hung gate"
+          # Enable one line each when the daemon supports it (freeze/unfreeze with freeze support, prune_caches when
+          # it lands), and enable the matching route in loadgov_notification_actions.yaml:
+          # freeze: "Freeze heavy builds"
+          # prune_caches: "Prune build caches"
+          # unfreeze: "Resume paused workers"
+        buttons: >-
+          {% set ns = namespace(items=[]) %}
+          {% if not is_info %}
+          {% for a in p.get('actions', []) %}
+          {% set aid = 'LOADGOV:' ~ a ~ ((':' ~ slot) if a == 'cancel_holder' and slot else '') %}
+          {% if a == 'cancel_holder' and not slot %}{% elif a in labels %}
+          {% set ns.items = ns.items + [{'action': aid, 'title': labels[a]}] %}
+          {% elif a.startswith('profile=') %}
+          {% set ns.items = ns.items + [{'action': aid, 'title': 'Switch to ' ~ a[8:]}] %}
+          {% endif %}
+          {% endfor %}
+          {% endif %}
+          {{ ns.items[:3] }}
+      note: "Defaults keep the run alive if loadgovd sends an unexpected payload shape. Android shows at most 3 buttons."
+
+    - if:
+        - condition: template
+          value_template: "{{ resolved }}"
+      then:
+        - repeat:
+            for_each: "{{ phones }}"
+            sequence:
+              - action: "{{ repeat.item }}"
+                data:
+                  message: clear_notification
+                  data:
+                    tag: "{{ tag }}"
+                continue_on_error: true
+        - if:
+            - condition: template
+              value_template: "{{ record_script | length > 0 }}"
+          then:
+            - action: "{{ record_script }}"
+              data:
+                title: "✅ loadgov: {{ p.get('title', key) }}"
+                message: "Resolved: {{ key }}"
+      else:
+        - repeat:
+            for_each: "{{ phones }}"
+            sequence:
+              - action: "{{ repeat.item }}"
+                data:
+                  title: "{{ title }}"
+                  message: "{{ message }}"
+                  data:
+                    tag: "{{ tag }}"
+                    group: loadgov
+                    url: "{{ alert_path }}"
+                    clickAction: "{{ alert_path }}"
+                    channel: "{{ 'loadgov-critical' if critical else 'loadgov' }}"
+                    priority: "{{ 'high' if critical else 'default' }}"
+                    ttl: "{{ 0 if critical else 86400 }}"
+                    actions: "{{ buttons }}"
+                continue_on_error: true
+        - if:
+            - condition: template
+              value_template: "{{ record_script | length > 0 }}"
+          then:
+            - action: "{{ record_script }}"
+              data:
+                title: "{{ title }}"
+                message: "{{ message }}"

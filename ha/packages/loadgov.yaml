@@ -1,0 +1,105 @@
+# loadgov package: DRAFT, not active until the owner applies it (see ha/README.md).
+# Targets Home Assistant 2026.10. Needs `homeassistant: packages: !include_dir_named packages` (or an
+# explicit `loadgov: !include packages/loadgov.yaml`) in configuration.yaml.
+# Secret used: loadgov_auth_header ("Bearer <token>"). The address is the REST bind of loadgovd.
+
+# Remembers that a "loadgovd down" alert was sent (used by automations/loadgov_daemon_down.yaml). Restored
+# across restarts. Do not toggle by hand.
+input_boolean:
+  loadgov_down_alerted:
+    name: "loadgov down alert sent"
+    icon: mdi:alert-circle-outline
+
+rest_command:
+  # POST /v1/action {"action": "profile=silent", "reason": "..."}
+  # Fields: action (required), reason (optional).
+  loadgov_action:
+    url: "http://YOUR_LOADGOV_HOST:7420/v1/action"
+    method: post
+    headers:
+      Authorization: !secret loadgov_auth_header
+    content_type: "application/json"
+    payload: >-
+      {{ {'action': action, 'reason': reason | default('Home Assistant action button')} | tojson }}
+    timeout: 10
+
+  # POST /v1/cancel-holder {"slot": "heavy"|"compile", "confirm": true, "reason": "..."}
+  # confirm is fixed to true on purpose: the call only happens after a human tapped the button.
+  loadgov_cancel_holder:
+    url: "http://YOUR_LOADGOV_HOST:7420/v1/cancel-holder"
+    method: post
+    headers:
+      Authorization: !secret loadgov_auth_header
+    content_type: "application/json"
+    payload: >-
+      {{ {'slot': slot, 'confirm': true, 'reason': reason | default('Home Assistant: cancel hung gate')} | tojson }}
+    timeout: 10
+
+  # POST /v1/set: profile and/or limits (daemon requires at least one of profile, max_cores,
+  # target_cpu_pct, load_max, max_implementers, ram_floor_gb). Optional: ttl ("90s", "15m", "2h") or
+  # until ("HH:MM Europe/Berlin"), reason.
+  loadgov_set:
+    url: "http://YOUR_LOADGOV_HOST:7420/v1/set"
+    method: post
+    headers:
+      Authorization: !secret loadgov_auth_header
+    content_type: "application/json"
+    payload: >-
+      {% set d = {'reason': reason | default('Home Assistant set')} %}
+      {% if profile is defined %}{% set _ = d.update({'profile': profile}) %}{% endif %}
+      {% if max_cores is defined %}{% set _ = d.update({'max_cores': max_cores | float}) %}{% endif %}
+      {% if target_cpu_pct is defined %}{% set _ = d.update({'target_cpu_pct': target_cpu_pct | float}) %}{% endif %}
+      {% if load_max is defined %}{% set _ = d.update({'load_max': load_max | float}) %}{% endif %}
+      {% if max_implementers is defined %}{% set _ = d.update({'max_implementers': max_implementers | int}) %}{% endif %}
+      {% if ram_floor_gb is defined %}{% set _ = d.update({'ram_floor_gb': ram_floor_gb | float}) %}{% endif %}
+      {% if ttl is defined %}{% set _ = d.update({'ttl': ttl}) %}{% endif %}
+      {% if until is defined %}{% set _ = d.update({'until': until}) %}{% endif %}
+      {{ d | tojson }}
+    timeout: 10
+
+  # No reset or hold-release command on purpose: /v1/reset all does not release a hold and clears unrelated
+  # overrides. Releasing holds and freezes from the phone arrives with /v1/hold.
+
+# One poll of GET /v1/status every 30 s feeds a sensor and a binary sensor (a single request).
+# The sensor goes unavailable when the daemon or its REST listener does not answer (timeout 10 s or a
+# non-2xx reply); the daemon-down alert keys on that.
+rest:
+  - resource: "http://YOUR_LOADGOV_HOST:7420/v1/status"
+    method: GET
+    headers:
+      Authorization: !secret loadgov_auth_header
+    scan_interval: 30
+    timeout: 10
+    sensor:
+      - name: "loadgovd level"
+        unique_id: loadgovd_level
+        icon: mdi:gauge
+        value_template: "{{ value_json.status.level | default(none) }}"
+        json_attributes_path: "$.status"
+        json_attributes:
+          - at
+          - limits
+          - slots
+          - daemon
+          - rest
+          - ha_push
+    binary_sensor:
+      # On while a human hold is set on any slot (status field slots.<slot>.hold, a reason string
+      # or null; docs/protocol.md "Status object"). Feeds the 45-min reminder. A silent profile or an
+      # owner ceiling is NOT a hold. Hook for the future freeze flag: when the daemon publishes one
+      # (no such status field exists today), add `or s.get('limits', {}).get('freeze') is not none`.
+      - name: "loadgovd hold active"
+        unique_id: loadgovd_hold_active
+        icon: mdi:hand-back-left
+        value_template: >-
+          {% set sl = (value_json.status | default({})).get('slots', {}) %}
+          {{ sl.get('heavy', {}).get('hold') is not none
+             or sl.get('compile', {}).get('hold') is not none }}
+      # Informational only (no automation uses it): limits.restricted is any human restriction (owner
+      # ceiling, hold or freeze, owner profile tighter than balanced, tightening owner override).
+      - name: "loadgovd restriction active"
+        unique_id: loadgovd_restriction_active
+        icon: mdi:hand-back-left
+        value_template: >-
+          {% set s = value_json.status | default({}) %}
+          {{ s.get('limits', {}).get('restricted', false) == true }}

@@ -1,0 +1,51 @@
+# A test-only config with the values the daemon used to ship built in (legacy parity), under generic
+# project names: proj-a (own headroom thresholds, a legacy dispatcher, a mirrored cgroup) and proj-b
+# (own memory-guard rule, project containers, a host-wide pause marker).
+
+[compat]
+mirror_cgroups = ["loop-a"]
+
+[principal]
+ancestor_deny = ['dispatch[^/ ]*\.sh', 'job-queue\.sh', '/tmp/loop-a-snap\.']
+deny_cgroups = ["/loop-a"]
+
+[slots]
+compile_lock = "host-compile-slot.lock"
+
+[memguard]
+deny_containers = ["*-test-db*", "*-review-*", "proj-a-test-*"]
+legacy_snapshot = { prefix = "/tmp/loop-a-snap.", marker = "# Usage: dispatch.sh", project = "proj-a" }
+pause_marker = { file = "proj-b-guard.paused", project = "proj-b" }
+
+[memguard.projects.proj-b]
+low_mb = 2048
+high_mb = 4096
+swap_mb = 2048
+resume_samples = 12
+containers = '^(gates-[0-9]|review-p|fix-p|p[0-9]+[a-z0-9]*-tests-run|job-[0-9]+)'
+agent_cwd = "/srv/work/proj-b"
+
+# proj-a waits like its legacy scripts: every 120 s, forever.
+[projects.proj-a.kinds.impl]
+load1_max = 6
+load5_max = false
+psi_max = 50
+mem_min_gb = 6
+poll_s = 120
+max_wait_s = 0
+
+[projects.proj-a.kinds.review]
+load1_max = "nproc"
+load5_max = false
+psi_max = 50
+mem_min_gb = 6
+poll_s = 120
+max_wait_s = 0
+
+[projects.proj-a.kinds.gate]
+load1_max = "nproc"
+load5_max = false
+psi_max = 50
+mem_min_gb = 4
+poll_s = 120
+max_wait_s = 0

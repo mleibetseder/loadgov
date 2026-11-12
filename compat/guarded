@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# Shim for the legacy `guarded` script: one heavy command with the RAM ceiling in mind. `loadctl run` waits for
+# hwmon level < LIMIT (2 samples), runs the command in its own scope at low priority and kills that scope when MemAvailable drops
+# below 2560 MB (exit 137, Gradle/Kotlin daemons included). Without loadgovd the legacy script runs.
+set -u
+LEGACY_DIR=${LOADGOV_LEGACY_DIR:-/opt/loadgov/legacy}
+LOADCTL=${LOADCTL:-loadctl}
+SOCK=${LOADGOV_SOCKET:-/run/loadgovd/loadgovd.sock}
+up() {
+  [ -S "$SOCK" ] || return 1
+  "$LOADCTL" status --json >/dev/null 2>&1
+  local rc=$?
+  [ "$rc" -ne 3 ] && [ "$rc" -ne 127 ]
+}
+up || exec "$LEGACY_DIR/hwmon/guarded" "$@"
+project=$(basename "$PWD")
+exec "$LOADCTL" run --kind compile --project "${project:-root}" --label guarded --headroom level --floor-mb 2560 --on-floor kill -- "$@"
