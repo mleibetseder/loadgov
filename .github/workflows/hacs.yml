@@ -1,0 +1,35 @@
+name: hacs
+
+# HACS and hassfest validation of custom_components/loadgov (the integration sits at the repository root).
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: hacs-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  hacs:
+    # The HACS action only validates public repositories: it runs on the public mirror, skipped here.
+    if: ${{ !github.event.repository.private }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: hacs/action@d556e736723344f83838d08488c983a15381059a # 22.5.0
+        with:
+          category: integration
+          # No brand images yet (no brand/ folder, not in home-assistant/brands).
+          ignore: brands
+
+  hassfest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: home-assistant/actions/hassfest@86d4564712fa02543c808e3a693dd04f9d3f8361 # master

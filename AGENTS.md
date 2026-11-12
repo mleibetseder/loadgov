@@ -12,7 +12,7 @@ Rules for anyone (human or agent) changing this repository.
 - `tests/unit/`: fast tests with fake `/proc` and `/sys` trees; no root, no host access.
 - `tests/integration/`: host tests; run only with `LOADGOV_INTEGRATION=1`, as root, on a private `loadgov-test.slice`.
 - `legacy/`: optional, not part of the public tree: the shell and Python scripts `loadgovd` replaces, where a site keeps them. Do not edit them; they are the reference for current behaviour and thresholds. Where a legacy README and its script disagree, the script wins.
-- `docs/`: deployment guide, protocol, MCP server, ADRs. `ha/`: the Home Assistant integration and drafts. `packaging/`, `compat/`, `tools/`: install, shims, helper scripts.
+- `docs/`: deployment guide, protocol, MCP server, ADRs. `custom_components/loadgov/`: the Home Assistant integration (HACS layout, root `hacs.json`). `ha/`: its tests (separate uv project) and the drafts. `packaging/`, `compat/`, `tools/`: install, shims, helper scripts.
 
 ## Commands
 

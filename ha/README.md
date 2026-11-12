@@ -17,7 +17,7 @@ Button ids offered now: `LOADGOV:profile=silent` (Throttle to Silent (2.0 cores)
 
 ## Custom integration `loadgov`
 
-`custom_components/loadgov/` (HACS layout; copy the folder to `<config>/custom_components/`, restart, add **Build Host Load Governor** under Settings, Devices and services; enter the daemon's host (the `[rest] bind` address, no default), port `7420` and the REST bearer token). Install it on a running instance only after review. It replaces the `rest` poll of `packages/loadgov.yaml` (keep the package for the webhook alerts and `rest_command`s; the integration's own entities are `host_*`, the package's are `loadgovd_*`, so both can run side by side).
+`custom_components/loadgov/` at the repository root (HACS layout, see the README "Install the Home Assistant integration"; or copy the folder to `<config>/custom_components/`, restart, add **Build Host Load Governor** under Settings, Devices and services; enter the daemon's host (the `[rest] bind` address, no default), port `7420` and the REST bearer token). Install it on a running instance only after review. It replaces the `rest` poll of `packages/loadgov.yaml` (keep the package for the webhook alerts and `rest_command`s; the integration's own entities are `host_*`, the package's are `loadgovd_*`, so both can run side by side).
 
 - One device, polled every 10 s (`GET /v1/status`); all entities go `unavailable` when the daemon does not answer.
 - `select.host_load_profile`; numbers `host_max_cores`, `host_target_cpu_pct`, `host_load_max`, `host_max_implementers`, `host_ram_floor_gb` (capped at 6.0); `switch.host_load_gate_hold` (`POST /v1/hold`, slot `heavy`); sensors and binary sensors `host_*`.

@@ -36,7 +36,7 @@ addopts = "-ra"
 [tool.ruff]
 line-length = 110
 target-version = "py313"
-extend-exclude = ["legacy", "ha"]
+extend-exclude = ["legacy", "ha", "custom_components"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "B", "UP", "SIM"]

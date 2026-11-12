@@ -1,7 +1,7 @@
 {
   "domain": "loadgov",
   "name": "Build Host Load Governor",
-  "codeowners": [],
+  "codeowners": ["@mleibetseder"],
   "config_flow": true,
   "documentation": "https://github.com/mleibetseder/loadgov/blob/main/ha/README.md",
   "integration_type": "device",

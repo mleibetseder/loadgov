@@ -735,7 +735,7 @@ def test_status_has_memguard_capabilities_and_validates(rig):
 def test_ha_integration_lights_up_on_the_capabilities_field(rig):
     from pathlib import Path
 
-    src = (Path(__file__).resolve().parents[2] / "ha/custom_components/loadgov/coordinator.py").read_text()
+    src = (Path(__file__).resolve().parents[2] / "custom_components/loadgov/coordinator.py").read_text()
     assert 'status.get("capabilities")' in src and "FEATURE_FREEZE" in src
     st = rig.d.tick()
     assert set(st["capabilities"]) == {"freeze", "reap"}  # the strings const.py names

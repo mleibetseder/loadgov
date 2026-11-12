@@ -16,6 +16,7 @@ dev = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = [".."]
 asyncio_mode = "auto"
 addopts = "-ra"
 
@@ -25,6 +26,7 @@ package = false
 [tool.ruff]
 line-length = 110
 target-version = "py314"
+src = [".", ".."]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "B", "UP", "SIM"]

@@ -4,7 +4,7 @@ A host-wide load governor for a Linux build server: CPU and fan throttling, RAM 
 serialization and heavy-slot coordination, for work that agents and CI start on the same machine.
 
 One daemon, `loadgovd`, with a `loadctl` CLI, an optional MCP server (`loadgov-mcp`) and a Home Assistant
-integration (`ha/`). The daemon and the CLI use only the Python standard library. The architecture decisions
+integration (`custom_components/loadgov/`). The daemon and the CLI use only the Python standard library. The architecture decisions
 are in [ADR-0001](docs/decisions/ADR-0001-language-ipc-cgroups.md), the wire protocol and the behaviour of each
 engine in [docs/protocol.md](docs/protocol.md).
 
@@ -22,6 +22,24 @@ uv run ruff check && uv run ruff format --check
 ```
 
 See [AGENTS.md](AGENTS.md) for the rules that apply when changing this repo.
+
+## Install the Home Assistant integration
+
+The integration lives in `custom_components/loadgov/` at the repository root, so HACS can install it. It needs
+Home Assistant 2026.10.0 or newer and a running `loadgovd` with its REST surface on. Review it before you install
+it on your Home Assistant.
+
+With HACS:
+
+1. In Home Assistant open HACS, then the menu (three dots), then **Custom repositories**.
+2. Add `https://github.com/mleibetseder/loadgov` with the category **Integration**.
+3. Find **loadgov** in HACS, **Download** it, then restart Home Assistant.
+4. Under Settings, Devices and services, **Add integration**, choose **Build Host Load Governor** and enter the
+   daemon's host, port (`7420`) and REST bearer token.
+
+Manually: copy the `custom_components/loadgov` folder into `<config>/custom_components/`, restart Home Assistant
+and add the integration as in step 4. The package, automations and dashboard drafts in `ha/` are separate; see
+[ha/README.md](ha/README.md).
 
 ## Configure for your site
 
@@ -64,7 +82,8 @@ client shims in `compat/`, and Home Assistant (the integration's options and `se
 | `src/loadgov/` | the daemon (`loadgovd`), the CLI (`loadctl`) and the MCP server, standard library only |
 | `compat/` | shell shims that keep older scripts working on top of `loadctl` (optional) |
 | `packaging/` | systemd units, the install script, the example configuration |
-| `ha/` | Home Assistant integration, package, automations and dashboard drafts |
+| `custom_components/loadgov/` | the Home Assistant integration (HACS layout), with `hacs.json` at the root |
+| `ha/` | Home Assistant package, automations and dashboard drafts, and the integration's tests |
 | `skills/loadgov/` | an agent skill that explains `loadctl` and the MCP tools to coding agents |
 | `tools/` | `shadow_compare.py` (observe-mode comparison), `backstop_sizing.py` |
 | `docs/` | deployment guide, protocol reference, MCP server, decisions |
