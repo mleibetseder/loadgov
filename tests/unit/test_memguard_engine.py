@@ -715,6 +715,45 @@ def test_claude_p_sessions_under_the_project_cwd_are_stopped_minus_claude(tmp_pa
     assert r.kernel.signals("SIGSTOP") == [(1101, "SIGSTOP")]
 
 
+def _matches(tmp_path, fake_host, agent_cwd, cwd):
+    """True when a `claude -p` session in `cwd` is stopped by a project with `agent_cwd` (one tree per sample)."""
+    r = Rig(tmp_path, fake_host, projects={"proj-b": GuardProject(2048, 4096, 2048, 12, None, agent_cwd)})
+    r.add(1100, "claude", 1, 600, cmd="claude -p go", cwd=cwd)
+    r.add(1101, "cargo", 1100, 400)
+    r.step(avail=1900)
+    return r.kernel.signals("SIGSTOP") == [(1101, "SIGSTOP")]
+
+
+def test_agent_cwd_string_matches_itself_and_below_but_not_a_sibling_name(tmp_path, fake_host):
+    for i, (cwd, want) in enumerate(
+        (("/x/proj", True), ("/x/proj/sub", True), ("/x/proj-other", False), ("/x/project", False))
+    ):
+        assert _matches(tmp_path / str(i), fake_host, "/x/proj", cwd) is want, cwd
+
+
+def test_agent_cwd_list_matches_every_entry_on_a_path_boundary(tmp_path, fake_host):
+    lst = ["/x/proj/", "/x/proj-wt"]
+    for i, (cwd, want) in enumerate(
+        (("/x/proj/sub", True), ("/x/proj-wt/a", True), ("/x/proj-wt", True), ("/x/proj-other", False))
+    ):
+        assert _matches(tmp_path / str(i), fake_host, lst, cwd) is want, cwd
+
+
+def test_agent_cwd_accepts_a_string_or_a_list_and_rejects_the_rest():
+    def cwd(v):
+        return (
+            parse_config(f"[memguard.projects.p]\nlow_mb=1\nhigh_mb=3000\nagent_cwd={v}")
+            .memguard.projects["p"]
+            .agent_cwd
+        )
+
+    assert cwd("'/a'") == ("/a",) and cwd("['/a', '/b']") == ("/a", "/b")
+    assert GuardProject(1, 3000, None, 3, None, "/a").agent_cwd == ("/a",)
+    for bad in ("'rel'", "['/a', 'rel']", "[]", "5", "['/a', 5]", "[['/a']]", "true"):
+        with pytest.raises(ConfigError):
+            cwd(bad)
+
+
 # ---- status, REST, config, docs ---------------------------------------------------------------------
 
 

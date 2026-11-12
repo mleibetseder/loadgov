@@ -61,7 +61,7 @@ client shims in `compat/`, and Home Assistant (the integration's options and `se
 | Home Assistant webhook id | `tokens.env` `LOADGOV_HA_WEBHOOK_ID`; HA secret `loadgov_webhook_id` and the `webhook_id` of the alert automation | `LOADGOV_HA_WEBHOOK_ID=loadgov-alert-<random>` |
 | The projects that run governed work (one `build-work-<project>.slice` each, made by `packaging/install.sh`) | TOML `[projects.<name>]`, `[memguard.projects.<name>]`, or `install.sh --project <name>` | `[projects.web-app]` |
 | Headroom thresholds of a project, per kind (`impl`, `review`, `gate`, `compile`) | TOML `[projects.<name>.kinds.<kind>]` | `load1_max = "nproc"`, `poll_s = 120` |
-| Memory-guard rule of a project, its container names and the working directory of its agents | TOML `[memguard.projects.<name>]` | `low_mb = 2048`, `containers = '^(ci-|test-)'`, `agent_cwd = "/srv/work/web-app"` |
+| Memory-guard rule of a project, its container names and the working directory of its agents | TOML `[memguard.projects.<name>]` | `low_mb = 2048`, `containers = '^(ci-|test-)'`, `agent_cwd = "/srv/work/web-app"` (or a list of directories) |
 | Containers that are never paused | TOML `[memguard] deny_containers` | `["*-test-db*", "*-review-*"]` (the default) |
 | Implementer trees of a legacy dispatcher (a snapshot shell and its usage line) | TOML `[memguard] legacy_snapshot` | `{ prefix = "/tmp/dispatcher-snap.", marker = "# Usage: dispatch.sh", project = "web-app" }` |
 | A host-wide pause file that another tool reads (`loadctl wait` honours it) | TOML `[memguard] pause_marker` | `{ file = "web-app-guard.paused", project = "web-app" }` |

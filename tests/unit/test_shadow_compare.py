@@ -209,3 +209,9 @@ def test_install_script_installs_the_compat_shims():
     text = (Path(__file__).parents[2] / "packaging" / "install.sh").read_text()
     assert 'install_tree "$src/compat" "$prefix/compat"' in text
     assert 'chown -R root:root "$to.new"' in text and 'chmod -R u+rwX,go-w "$to.new"' in text
+
+
+def test_install_script_always_reinstalls_the_loadgov_package():
+    text = (Path(__file__).parents[2] / "packaging" / "install.sh").read_text()
+    sync = text.split("uv sync", 1)[1].split("\nln ", 1)[0]
+    assert "--reinstall-package loadgov" in sync

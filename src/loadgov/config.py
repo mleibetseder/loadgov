@@ -295,7 +295,15 @@ class GuardProject:
     swap_mb: int | None = None  # also pause when swap used exceeds this while avail < high_mb
     resume_samples: int = 3  # daemon ticks (5 s) at or above high_mb before the LIFO resume
     containers: str | None = None  # regex of container names this project allows to be docker-paused
-    agent_cwd: str | None = None  # `claude -p` sessions with their cwd below this path belong to it
+    # `claude -p` sessions with their cwd at or below one of these paths belong to it; a single string is
+    # accepted and normalized to a 1-tuple
+    agent_cwd: str | tuple[str, ...] | None = None
+
+    def __post_init__(self) -> None:
+        if isinstance(self.agent_cwd, str):
+            object.__setattr__(self, "agent_cwd", (self.agent_cwd,))
+        elif isinstance(self.agent_cwd, list):
+            object.__setattr__(self, "agent_cwd", tuple(self.agent_cwd))
 
 
 @dataclass(frozen=True)
@@ -542,16 +550,21 @@ def _parse_memguard(raw) -> MemguardConfig:
             raise ConfigError(f"{where}.swap_mb: expected an integer >= 1")
         if vals["high_mb"] - vals["low_mb"] < 2048:  # the resume level must clear the pause level
             raise ConfigError(f"{where}: high_mb must be at least 2048 MB above low_mb")
-        for k in ("containers", "agent_cwd"):
-            if vals.get(k) is not None and not isinstance(vals[k], str):
-                raise ConfigError(f"{where}.{k}: expected a string")
+        if vals.get("containers") is not None and not isinstance(vals["containers"], str):
+            raise ConfigError(f"{where}.containers: expected a string")
         if vals.get("containers") is not None:
             try:
                 re.compile(vals["containers"])
             except re.error as e:
                 raise ConfigError(f"{where}.containers: bad regex ({e})") from None
-        if vals.get("agent_cwd") is not None and not os.path.isabs(vals["agent_cwd"]):
-            raise ConfigError(f"{where}.agent_cwd: expected an absolute path")
+        cwd = vals.get("agent_cwd")
+        if cwd is not None:
+            if isinstance(cwd, str):
+                cwd = [cwd]
+            if not isinstance(cwd, list) or not cwd or not all(isinstance(c, str) for c in cwd):
+                raise ConfigError(f"{where}.agent_cwd: expected an absolute path or a non-empty list of them")
+            if not all(os.path.isabs(c) for c in cwd):
+                raise ConfigError(f"{where}.agent_cwd: expected an absolute path")
         projects[name] = GuardProject(**vals)
     deny = raw.get("deny_containers", list(DENY_CONTAINERS))
     if not isinstance(deny, list) or not all(isinstance(g, str) and g for g in deny):

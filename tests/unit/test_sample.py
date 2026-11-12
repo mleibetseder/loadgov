@@ -17,7 +17,14 @@ def take(host, now=NOW, mirrors=("loop-a",)):
     s = Sampler(host.fs, mirrors)
     s.prime(host.prev_stat)
     out = s.sample(now=now)
-    out["daemon"] = {"version": "t", "pid": 1, "started_at": "t", "mode": "observe", "tick_s": 5.0}
+    out["daemon"] = {
+        "version": "t",
+        "pid": 1,
+        "started_at": "t",
+        "mode": "observe",
+        "enforce": {"governor": False, "slots": False, "memguard": False, "reaper": False},
+        "tick_s": 5.0,
+    }
     out["limits"] = {  # added by the daemon, like "daemon"
         "profile": "balanced",
         "ceiling": None,

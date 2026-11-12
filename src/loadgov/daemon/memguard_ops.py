@@ -198,7 +198,7 @@ class MemGuardRuntime:
         for name, gp in self.cfg.projects.items():
             if not gp.agent_cwd:
                 continue
-            prefix = gp.agent_cwd.rstrip("/")
+            prefixes = [c.rstrip("/") for c in gp.agent_cwd]
             for c in tab.values():
                 if c.comm != AGENT_COMM or c.pid in claude_seen or c.pid in used:
                     continue
@@ -206,7 +206,7 @@ class MemGuardRuntime:
                 where = proctree.cwd(fs, c.pid)
                 if not (args and args[:2] == [AGENT_COMM, "-p"] and where):
                     continue
-                if where != prefix and not where.startswith(prefix + "/"):
+                if not any(where == x or where.startswith(x + "/") for x in prefixes):
                     continue
                 work = [p for p in proctree.descendants(tab, kids, c.pid) if p.comm != AGENT_COMM
                         and p.pid not in used]  # fmt: skip

@@ -24,7 +24,9 @@ git clone <this repository> /opt/loadgov-src && cd /opt/loadgov-src
 nice -n 10 packaging/install.sh --no-start        # /opt/loadgov venv, /usr/local/bin/loadctl, systemd units
 ```
 
-`install.sh` is idempotent and never turns on an enforce flag. It installs the daemon into `/opt/loadgov/.venv`
+`install.sh` is idempotent and never turns on an enforce flag. Re-running it always rebuilds the `loadgov`
+package from the checkout (even at an unchanged version); to check, `grep` a recent change in
+`/opt/loadgov/.venv/lib/python*/site-packages/loadgov`. It installs the daemon into `/opt/loadgov/.venv`
 (pinned interpreter, not editable), links `loadctl`, installs `loadgovd.service` and `build-work.slice`, and
 writes one `build-work-<project>.slice` for every project named in `/etc/loadgov/loadgov.toml`
 (`[projects.*]` and `[memguard.projects.*]`) and for every `--project NAME` you pass. Slices are generated
@@ -97,7 +99,7 @@ Route the work through the daemon while you observe, and check the headroom and 
 ```bash
 loadctl wait --kind impl --project <name> --timeout 600
 loadctl run --kind gate --project <name> --label nightly -- <your build command>
-loadctl slot status --json | jq '.slots | map_values(.state)'
+loadctl slot status --json | jq 'map_values(.state)'
 ```
 
 `loadctl run` always takes the real lock for a client (the one exception to "observe writes nothing", see

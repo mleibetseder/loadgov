@@ -93,6 +93,31 @@ def test_status_has_alerts_and_ha_push_and_validates(fake_host, tmp_path):
     assert call(d, "status")["status"]["alerts"] == s["alerts"]
 
 
+@pytest.mark.parametrize(
+    ("flags", "mode"),
+    [
+        ((False, False, False, False), "observe"),
+        ((True, False, False, True), "partial"),
+        ((False, False, True, False), "partial"),
+        ((True, True, True, True), "enforce"),
+    ],
+)
+def test_daemon_mode_and_enforce_follow_the_config_flags(fake_host, tmp_path, flags, mode):
+    d, _ = make(fake_host, tmp_path)
+    gov, slots, mem, reap = flags
+    d.config = replace(
+        d.config,
+        governor_enforce=gov,
+        slots_enforce=slots,
+        memguard=replace(d.config.memguard, enforce=mem),
+        reaper=replace(d.config.reaper, enforce=reap),
+    )
+    s = d.tick()
+    assert validate_status(s) == []
+    assert s["daemon"]["mode"] == mode
+    assert s["daemon"]["enforce"] == {"governor": gov, "slots": slots, "memguard": mem, "reaper": reap}
+
+
 def test_evaluation_runs_every_sixth_tick_and_alerts_on_three_busy_ones(fake_host, tmp_path):
     d, _ = make(fake_host, tmp_path, ha=True)
     base = d.sampler.sample()

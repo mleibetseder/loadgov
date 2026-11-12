@@ -25,8 +25,10 @@ done
 command -v uv >/dev/null || { echo "install.sh: uv not found" >&2; exit 1; }
 
 install -d -m 0755 "$prefix"
+# --reinstall-package: uv would reuse its cached wheel of the (unchanged) version and skip new source.
 # Pinned interpreter and a non-editable install, independent of the checkout and of apt's python3.
-UV_PROJECT_ENVIRONMENT="$prefix/.venv" nice -n 10 uv sync --project "$src" --locked --no-dev --no-editable --managed-python --python 3.14
+UV_PROJECT_ENVIRONMENT="$prefix/.venv" nice -n 10 uv sync --project "$src" --locked --no-dev --no-editable --managed-python --python 3.14 \
+  --reinstall-package loadgov
 ln -sf "$prefix/.venv/bin/loadctl" /usr/local/bin/loadctl
 
 # Copy a tree to $prefix/<name> as root-owned files no one else can write (root runs these), pruning files

@@ -173,16 +173,33 @@ class Daemon:
         s["headroom"] = self.headroom_status()
         s["backstop"] = self.backstop.status()
         s["capabilities"] = list(memguard_ops.CAPABILITIES)
+        enforce = self.enforce_flags()
         s["daemon"] = {
             "version": __version__,
             "pid": os.getpid(),
             "started_at": self.started_at,
-            "mode": "observe",
+            "mode": self.mode(),
+            "enforce": enforce,
             "tick_s": self.tick_s,
         }
         self.status = s
         atomic_write_json(self.status_path, s)
         return s
+
+    def mode(self) -> str:
+        """`enforce` when every engine enforces, `partial` when some do, else `observe`."""
+        flags = self.enforce_flags().values()
+        return "enforce" if all(flags) else "partial" if any(flags) else "observe"
+
+    def enforce_flags(self) -> dict:
+        """Which engines act for real (the config's enforce flags), for `daemon.enforce` and `daemon.mode`."""
+        c = self.config
+        return {
+            "governor": c.governor_enforce,
+            "slots": c.slots_enforce,
+            "memguard": c.memguard.enforce,
+            "reaper": c.reaper.enforce,
+        }
 
     def fast_tick(self) -> None:
         """Release slots and drop jobs whose holder or scope is gone (runs every second, see `run`)."""
@@ -638,7 +655,7 @@ class Daemon:
         for sig in (signal.SIGTERM, signal.SIGINT):
             loop.add_signal_handler(sig, self._stop.set)
         sd_notify("READY=1")
-        log.info("loadgovd %s ready (observe mode) on %s", __version__, self.socket_path)
+        log.info("loadgovd %s ready (%s mode) on %s", __version__, self.mode(), self.socket_path)
         async with server:
             step = min(self.tick_s, FAST_TICK_S)
             next_full = time.monotonic() + self.tick_s

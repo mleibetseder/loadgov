@@ -29,7 +29,8 @@ sudo bash packaging/install.sh
 What it does: installs Python and loadgov into `/opt/loadgov`, links `loadctl` into `/usr/local/bin`, installs
 the compat shims (root-owned) into `/opt/loadgov/compat`, writes the systemd units (`loadgovd.service`,
 `build-work.slice` and one slice per configured project) and starts `loadgovd`. It never overwrites an
-existing `/etc/loadgov/loadgov.toml`.
+existing `/etc/loadgov/loadgov.toml`. Re-running it always rebuilds the package from the checkout; check with `grep`
+for a recent change in `/opt/loadgov/.venv/lib/python*/site-packages/loadgov`.
 
 **Check:**
 

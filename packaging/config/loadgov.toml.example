@@ -36,7 +36,7 @@ enforce = false
 # swap_mb = 2048
 # resume_samples = 12
 # containers = '^(gates-[0-9]|review-)'
-# agent_cwd = "/srv/work/example-project"
+# agent_cwd = "/srv/work/example-project"   # or a list: ["/srv/work/example-project", "/srv/work/example-project-wt"]
 
 [backstop]
 # Hard kernel limit under build-work.slice (docs/protocol.md "Memory backstop"). OFF, and NO built-in

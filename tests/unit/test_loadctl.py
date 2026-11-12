@@ -8,8 +8,26 @@ def status(host):
     s = Sampler(host.fs)
     s.prime(host.prev_stat)
     out = s.sample(now=1_762_800_000.0)
-    out["daemon"] = {"version": "t", "pid": 1, "started_at": "t", "mode": "observe", "tick_s": 5.0}
+    out["daemon"] = {
+        "version": "t",
+        "pid": 1,
+        "started_at": "t",
+        "mode": "observe",
+        "enforce": {"governor": False, "slots": False, "memguard": False, "reaper": False},
+        "tick_s": 5.0,
+    }
     return out
+
+
+def test_status_daemon_line_lists_active_engines_only_when_partial(fake_host):
+    st = status(fake_host("calm"))
+    st["daemon"]["mode"] = "partial"
+    st["daemon"]["enforce"] = {"governor": True, "slots": True, "memguard": True, "reaper": False}
+    assert loadctl.format_status(st).splitlines()[-1].endswith("mode partial (governor, slots, memguard)")
+    for mode in ("observe", "enforce"):
+        st["daemon"]["mode"] = mode
+        line = loadctl.format_status(st).splitlines()[-1]
+        assert line.endswith(f"mode {mode}") and "(" not in line
 
 
 def test_hwmon_format_is_the_legacy_five_lines(fake_host):

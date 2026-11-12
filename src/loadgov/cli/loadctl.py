@@ -108,7 +108,9 @@ def format_status(s: dict) -> str:
         ceil = f", ceiling {lim['ceiling']}" if lim["ceiling"] else ""
         lines.append(f"  limits {lim['profile']}{ceil}: {_lim(lim['effective'])}")
     dmn = s["daemon"]
-    lines.append(f"  daemon {dmn['version']} pid {dmn['pid']} mode {dmn['mode']}")
+    on = [k for k, v in dmn.get("enforce", {}).items() if v]
+    detail = f" ({', '.join(on)})" if dmn["mode"] == "partial" else ""
+    lines.append(f"  daemon {dmn['version']} pid {dmn['pid']} mode {dmn['mode']}{detail}")
     return "\n".join(lines)
 
 

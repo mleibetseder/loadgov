@@ -167,6 +167,7 @@ STATUS_SCHEMA: dict[str, tuple] = {
     "daemon.pid": (int,),
     "daemon.started_at": (str,),
     "daemon.mode": (str,),
+    "daemon.enforce": (dict,),
     "daemon.tick_s": NUM,
 }
 
