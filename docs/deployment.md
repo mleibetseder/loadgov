@@ -12,6 +12,9 @@ on enforcement one flag at a time. Every command runs as root on the host. Proto
 - Run heavy commands with `nice -n 10` and never while a heavy job holds `/run/lock/host-heavy-slot.lock`.
 - Nothing is changed on a Home Assistant instance without its owner's approval.
 
+For a hands-on checklist of the same first steps (daemon, REST, Home Assistant), see
+[howto-setup.md](howto-setup.md).
+
 ## 1. Install
 
 Requirements: Linux with cgroup v2 and systemd, [`uv`](https://docs.astral.sh/uv/), root.
@@ -27,7 +30,8 @@ writes one `build-work-<project>.slice` for every project named in `/etc/loadgov
 (`[projects.*]` and `[memguard.projects.*]`) and for every `--project NAME` you pass. Slices are generated
 because systemd cannot template slice units. If a `site/loadgov.toml` exists in the checkout and
 `/etc/loadgov/loadgov.toml` does not, it is installed once and never overwritten. If the checkout carries a
-`legacy/` folder, it is copied to `/opt/loadgov/legacy` as an optional fallback for the shims in `compat/`;
+`legacy/` folder, it is copied to `/opt/loadgov/legacy` as an optional fallback for the shims in `compat/`
+(the shims themselves are installed to `/opt/loadgov/compat`, e.g. `RUSTC_WRAPPER=/opt/loadgov/compat/rustc-slot.sh`);
 without it the shims degrade as described in their headers.
 
 Create the state and log directories and the secrets file:

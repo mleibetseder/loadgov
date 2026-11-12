@@ -117,7 +117,7 @@ def test_install_script_syntax_and_legacy_copy():
     script = Path(__file__).parents[2] / "packaging" / "install.sh"
     assert subprocess.run(["bash", "-n", str(script)]).returncode == 0
     text = script.read_text()
-    assert 'cp -a "$src/legacy/." "$prefix/legacy/"' in text
+    assert 'install_tree "$src/legacy" "$prefix/legacy"' in text
 
 
 def test_orphan_reap_is_informational_not_a_failure():
@@ -203,3 +203,9 @@ def test_new_reaped_reasons_also_close_an_open_proj_b_pause():
             audit("memguard", "2026-11-10T10:05:00Z", "WOULD PAUSE agent 6 10MB", a),
         ]
         assert [k for k, _, _ in sc.parse_audit(lines, EP)] == ["PAUSE episode"] * 2
+
+
+def test_install_script_installs_the_compat_shims():
+    text = (Path(__file__).parents[2] / "packaging" / "install.sh").read_text()
+    assert 'install_tree "$src/compat" "$prefix/compat"' in text
+    assert 'chown -R root:root "$to.new"' in text and 'chmod -R u+rwX,go-w "$to.new"' in text

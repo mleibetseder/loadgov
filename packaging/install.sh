@@ -29,11 +29,27 @@ install -d -m 0755 "$prefix"
 UV_PROJECT_ENVIRONMENT="$prefix/.venv" nice -n 10 uv sync --project "$src" --locked --no-dev --no-editable --managed-python --python 3.14
 ln -sf "$prefix/.venv/bin/loadctl" /usr/local/bin/loadctl
 
+# Copy a tree to $prefix/<name> as root-owned files no one else can write (root runs these), pruning files
+# that no longer exist in the checkout. The copy is built next to the target and swapped in.
+install_tree() {
+  local from=$1 to=$2
+  rm -rf "$to.new"
+  install -d -m 0755 "$to.new"
+  cp -a "$from/." "$to.new/"
+  chown -R root:root "$to.new"
+  chmod -R u+rwX,go-w "$to.new"
+  rm -rf "$to"
+  mv "$to.new" "$to"
+}
+
+# The compat shims (drop-in replacements for older wait/slot/compile wrappers) go to $prefix/compat; clients
+# point at them (e.g. RUSTC_WRAPPER=$prefix/compat/rustc-slot.sh). Rebuilt on every install.
+install_tree "$src/compat" "$prefix/compat"
+
 # Optional fallback copies for the compat shims (they exec these when the daemon is down). Only when this
-# checkout carries legacy scripts; modes preserved, the originals are never touched.
+# checkout carries legacy scripts; the originals are never touched.
 if [ -d "$src/legacy" ]; then
-  install -d -m 0755 "$prefix/legacy"
-  cp -a "$src/legacy/." "$prefix/legacy/"
+  install_tree "$src/legacy" "$prefix/legacy"
 fi
 
 # The config: a site-specific file (site/loadgov.toml, private) is installed once, never over an existing one.

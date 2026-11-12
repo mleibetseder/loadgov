@@ -23,6 +23,8 @@ uv run ruff check && uv run ruff format --check
 
 See [AGENTS.md](AGENTS.md) for the rules that apply when changing this repo.
 
+Setting it up by hand, step by step with a check after each step: [docs/howto-setup.md](docs/howto-setup.md).
+
 ## Install the Home Assistant integration
 
 The integration lives in `custom_components/loadgov/` at the repository root, so HACS can install it. It needs
