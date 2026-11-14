@@ -37,7 +37,7 @@ from loadgov.config import (
     load_config,
     thresholds,
 )
-from loadgov.daemon import backstop_ops, job_ops, memguard_ops, recover, slot_ops
+from loadgov.daemon import backstop_ops, job_ops, memguard_ops, recover, slot_ops, stray_ops
 from loadgov.daemon.audit import AuditLog
 from loadgov.daemon.compat import render_env, write_env
 from loadgov.daemon.ha_push import HaPush
@@ -103,6 +103,7 @@ class Daemon:
         rest_options: dict | None = None,  # test-only RestServer arguments
         memguard_options: dict | None = None,  # test-only MemGuardRuntime arguments (fake signals, docker)
         backstop_options: dict | None = None,  # test-only BackstopRuntime arguments (target slice)
+        stray_options: dict | None = None,  # test-only StrayRuntime arguments (fake signals)
     ):
         self.fs = fs
         self.clock = clock
@@ -129,6 +130,7 @@ class Daemon:
             lambda: self.jobs.jobs, **(backstop_options or {}),
         )  # fmt: skip
         self.history = History(os.path.join(state_dir, "history.csv"), clock)
+        self.strays = stray_ops.StrayRuntime(self, **(stray_options or {}))
         if self.slots.owner_hold_reason() and not self.limits.state.hold:
             self.limits.set_flag("hold", self.slots.owner_hold_reason())  # the flag follows the saved hold
         self._env_key: str | None = None
@@ -161,6 +163,7 @@ class Daemon:
         self._governor_step(self.sampler.cpu_times)
         self._memguard_step(s)
         self._backstop_step()
+        self._strays_step()
         self._history_step(s)
         s["limits"] = self.limits_summary()
         s["rest"] = self.rest.status()
@@ -172,6 +175,7 @@ class Daemon:
         s["memguard"] = self.memguard.status()
         s["headroom"] = self.headroom_status()
         s["backstop"] = self.backstop.status()
+        s["strays"] = self.strays.status()
         s["capabilities"] = list(memguard_ops.CAPABILITIES)
         enforce = self.enforce_flags()
         s["daemon"] = {
@@ -276,6 +280,12 @@ class Daemon:
         except Exception:  # the backstop must never stop sampling; the next tick decides again
             log.exception("backstop step failed")
 
+    def _strays_step(self) -> None:
+        try:
+            self.strays.tick()
+        except Exception:  # the guard must never stop sampling; the next tick decides again
+            log.exception("stray guard step failed")
+
     def _history_step(self, s: dict) -> None:
         try:
             files = {"mem": "memory.current", "swap": "memory.swap.current", "peak": "memory.peak"}
@@ -317,6 +327,17 @@ class Daemon:
     def emit_event(self, kind: str, payload: dict | None = None) -> dict:
         """Hook of the memory guard: `pause`, `abort`, `low_memory`, `resume` or `reap`."""
         ev = self.watch.emit_event(kind, payload)
+        self._publish([ev])
+        return ev
+
+    def emit_resolved(self, key: str, title: str) -> dict:
+        """A `resolved` event for a key the stray guard raised."""
+        ev = self.watch.resolved(key, title)
+        self._publish([ev])
+        return ev
+
+    def emit_info(self, key: str, title: str, message: str) -> dict:
+        ev = self.watch.info(key, title, message)
         self._publish([ev])
         return ev
 
@@ -445,6 +466,7 @@ class Daemon:
                     "memguard": self.memguard.status(),
                     "headroom": self.headroom_status(),
                     "backstop": self.backstop.status(),
+                    "strays": self.strays.status(),
                     "capabilities": list(memguard_ops.CAPABILITIES),
                 },
             }
@@ -463,6 +485,11 @@ class Daemon:
             if args is not None and not isinstance(args, dict):
                 return {"ok": False, "error": "bad_request", "message": "args must be an object"}
             return memguard_ops.handle(self, op, args or {}, peer_pid)
+        if op == "stray_kill":
+            args = req.get("args")
+            if args is not None and not isinstance(args, dict):
+                return {"ok": False, "error": "bad_request", "message": "args must be an object"}
+            return stray_ops.handle(self, args or {}, peer_pid)
         if op in ("set", "ceiling_set", "ceiling_clear", "reset"):
             args = req.get("args")
             if args is not None and not isinstance(args, dict):
@@ -574,6 +601,8 @@ class Daemon:
             return slot_ops.rest_hold(self, args, peer)
         if op in ("freeze", "unfreeze", "reap"):
             return memguard_ops.rest(self, op, args, peer)
+        if op == "stray_kill":
+            return stray_ops.rest(self, args, peer)
         return self._mutate(op, args, None, rest_peer=peer)
 
     def _mutate(self, op: str, args: dict, peer_pid: int | None, rest_peer: str | None = None) -> dict:

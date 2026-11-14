@@ -118,6 +118,7 @@ async def async_setup_entry(
             *(LoadgovSensor(entry.runtime_data, d) for d in SENSORS),
             LoadgovFeaturesSensor(entry.runtime_data),
             LoadgovTriggersSensor(entry.runtime_data),
+            LoadgovStraysSensor(entry.runtime_data),
         ]
     )
 
@@ -185,3 +186,44 @@ class LoadgovTriggersSensor(LoadgovEntity, SensorEntity):
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
         return self._info
+
+
+STRAY_ATTRS = ("pid", "start_time", "comm", "project", "cwd", "cpu_pct", "age_s")
+STRAY_MAX_ITEMS = 10
+
+
+class LoadgovStraysSensor(LoadgovEntity, SensorEntity):
+    """Stray processes the daemon reports: the state is their number. Unavailable when the daemon is older
+    and has no `strays` in its status."""
+
+    _domain = "sensor"
+    _attr_icon = "mdi:ghost"
+    _attr_state_class = SensorStateClass.MEASUREMENT
+
+    def __init__(self, coordinator: LoadgovCoordinator) -> None:
+        super().__init__(coordinator, "strays", "Stray processes")
+
+    @property
+    def _strays(self) -> dict[str, Any] | None:
+        strays = self.status.get("strays")
+        return strays if isinstance(strays, dict) else None
+
+    @property
+    def available(self) -> bool:
+        return super().available and self._strays is not None
+
+    @property
+    def native_value(self) -> int | None:
+        strays = self._strays
+        return None if strays is None else len(strays.get("items") or [])
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any] | None:
+        strays = self._strays
+        if strays is None:
+            return None
+        items = [
+            {**{k: i.get(k) for k in STRAY_ATTRS}, "session_id": (i.get("session") or {}).get("session_id")}
+            for i in (strays.get("items") or [])[:STRAY_MAX_ITEMS]
+        ]
+        return {"items": items, "enforce": strays.get("enforce")}

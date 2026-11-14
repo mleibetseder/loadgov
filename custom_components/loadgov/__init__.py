@@ -36,6 +36,14 @@ SET_PROFILE_SCHEMA = vol.Schema(
 )
 SET_CEILING_SCHEMA = SET_PROFILE_SCHEMA
 CLEAR_CEILING_SCHEMA = vol.Schema(_BASE)
+KILL_STRAY_SCHEMA = vol.Schema(
+    {
+        vol.Optional(ATTR_ENTRY): cv.string,
+        vol.Required("pid"): vol.All(vol.Coerce(int), vol.Range(min=1)),
+        vol.Required("start_time"): vol.All(vol.Coerce(int), vol.Range(min=0)),
+        vol.Optional("reason"): cv.string,
+    }
+)
 
 
 def _coordinator(hass: HomeAssistant, call: ServiceCall) -> LoadgovCoordinator:
@@ -61,9 +69,14 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     async def clear_ceiling(call: ServiceCall) -> None:
         await _coordinator(hass, call).async_post("/v1/ceiling", {**_body(call), "clear": True})
 
+    async def kill_stray(call: ServiceCall) -> None:
+        body = {k: call.data[k] for k in ("pid", "start_time", "reason") if k in call.data}
+        await _coordinator(hass, call).async_post("/v1/stray/kill", body)
+
     hass.services.async_register(DOMAIN, "set_profile", set_profile, SET_PROFILE_SCHEMA)
     hass.services.async_register(DOMAIN, "set_ceiling", set_ceiling, SET_CEILING_SCHEMA)
     hass.services.async_register(DOMAIN, "clear_ceiling", clear_ceiling, CLEAR_CEILING_SCHEMA)
+    hass.services.async_register(DOMAIN, "kill_stray", kill_stray, KILL_STRAY_SCHEMA)
     return True
 
 

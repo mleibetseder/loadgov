@@ -39,6 +39,7 @@
         passthrough: []  # later: ['freeze', 'unfreeze', 'prune_caches'] (sent to /v1/action as the action id)
         label: >-
           {% if cmd == 'cancel_holder' %}cancel_holder {{ slot }}{% else %}{{ sub }}{% endif %}
+        stray_ok: "{{ cmd == 'kill_stray' and sub is match('^kill_stray:[0-9]+:[0-9]+$') }}"
     # Route first (choose), so unknown ids stop here. A response_variable is scoped to its branch, so
     # the branches only pick the service; the one shared call below keeps the response in scope.
     - choose:
@@ -60,6 +61,15 @@
                 call_data:
                   slot: "{{ slot }}"
                   reason: "{{ reason }}"
+        - conditions:
+            - condition: template
+              value_template: "{{ stray_ok }}"
+          sequence:
+            - variables:
+                svc: rest_command.loadgov_kill_stray
+                call_data:
+                  pid: "{{ parts[1] | int }}"
+                  start_time: "{{ parts[2] | int }}"
       default:
         - stop: "Unknown LOADGOV action {{ trigger.event.data.action }}"
           error: true
@@ -72,7 +82,7 @@
         ok: "{{ 200 <= status < 300 }}"
         detail: >-
           {% set c = (resp | default({}, true)).get('content') %}
-          {{ (c.get('error') if c is mapping else c) | default('', true) | string | truncate(160) }}
+          {{ ((c.get('error') or c.get('message') or c.get('reason')) if c is mapping else c) | default('', true) | string | truncate(160) }}
         out_title: "{{ '✅' if ok else '⚠️' }} loadgov: {{ label }}"
         out_msg: >-
           {% if ok %}Accepted (HTTP {{ status }}).{% elif status == 0 %}No reply from loadgovd (down, unreachable or timeout).{% else %}Refused or failed: HTTP {{ status }} {{ detail }}{% endif %}

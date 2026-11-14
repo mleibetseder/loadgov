@@ -71,6 +71,7 @@ client shims in `compat/`, and Home Assistant (the integration's options and `se
 | Who may not claim `--owner`: extra cgroups and dispatcher command lines (build-work cgroups are always refused) | TOML `[principal] deny_cgroups`, `ancestor_deny` | `deny_cgroups = ["/legacy-loop"]`, `ancestor_deny = ['dispatch-.*\.sh']` |
 | Other cgroups that follow the governor's cap | TOML `[compat] mirror_cgroups` | `mirror_cgroups = ["legacy-loop"]` |
 | Log files that keep the lines of loops being replaced | TOML `[compat] alert_log_paths`, `governor_log_path`, `[memguard] log_path` | `alert_log_paths = ["/var/log/loadgov/host-alerts.log"]` |
+| Stray-process guard: how long and how hot before an orphaned process is reported, and cgroups that are never strays | TOML `[strays]` | `min_age_s = 1800`, `min_cpu_pct = 50`, `exclude_cgroups = ["/user.slice/user-1000.slice/*"]` |
 | Profiles, ceilings, the hard memory backstop | TOML `[profiles.*]`, `[backstop]` | `memory_max_mb = 12288` |
 | HA integration: daemon host, port and token (no defaults) | the integration's config flow | `192.0.2.10`, `7420`, the token |
 | HA integration: presence zone, TV media players, quiet-hours switch, sensors and thresholds of a remote host's load, notify targets, and an on/off per trigger | the integration's options (all triggers off; only `zone.home` is preset) | `remote_load_sensor = sensor.other_host_load`, `remote_load_threshold = 6.0` |

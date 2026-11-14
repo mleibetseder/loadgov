@@ -5,6 +5,7 @@ Every path the daemon reads goes through HostFS so unit tests can point it at a 
 
 from __future__ import annotations
 
+import errno
 import ipaddress
 import os
 from collections.abc import Callable, Iterator
@@ -70,13 +71,18 @@ class HostFS:
             return None
 
     def scope_procs(self, cgroup: str) -> str | None:
-        """`cgroup.procs` of a job scope: None when the cgroup is gone; any other read error raises OSError
-        (the caller must not read an unreadable scope as an empty one)."""
+        """`cgroup.procs` of a job scope: None when the cgroup is gone, including one removed between open and
+        read (ENODEV: the kernel refuses rmdir of a populated cgroup, so a removed scope has no processes);
+        any other read error raises OSError (the caller must not read an unreadable scope as an empty one)."""
         try:
             with open(os.path.join(self.cgroup_root, cgroup.lstrip("/"), "cgroup.procs")) as f:
                 return f.read()
         except (FileNotFoundError, NotADirectoryError):
             return None
+        except OSError as e:
+            if e.errno == errno.ENODEV:
+                return None
+            raise
 
     def lock_path(self, name: str) -> str:
         return os.path.join(self.lock_root, name)

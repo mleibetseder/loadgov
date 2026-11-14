@@ -55,3 +55,29 @@ clear_ceiling:
       selector:
         config_entry:
           integration: loadgov
+
+kill_stray:
+  fields:
+    pid:
+      required: true
+      example: 12345
+      selector:
+        number:
+          min: 1
+          max: 4194304
+          mode: box
+    start_time:
+      required: true
+      example: 987654321
+      selector:
+        number:
+          min: 0
+          max: 9007199254740991
+          mode: box
+    reason:
+      selector:
+        text:
+    config_entry_id:
+      selector:
+        config_entry:
+          integration: loadgov

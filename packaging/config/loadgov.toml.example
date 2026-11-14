@@ -51,6 +51,20 @@ enabled = false
 # memory_max_mb = 12288
 # memory_swap_max_mb = 2048
 
+[strays]
+# Stray-process guard (docs/protocol.md "Stray guard"): finds orphaned CPU hogs (the agent that started them
+# is gone) that run outside every job scope, service and container. `enabled` only reads /proc; nothing is
+# ever signalled automatically. `enforce = true` lets the OWNER kill (loadctl stray --kill PID --owner,
+# POST /v1/stray/kill, the phone button) send SIGTERM, then SIGKILL after 30 s; off = audit WOULD KILL only.
+enabled = true
+enforce = false
+# check_s = 300             # seconds between checks (at least 60)
+# min_age_s = 1800          # hot continuously this long before a process counts as a stray
+# min_cpu_pct = 50          # percent of one core over the last interval that makes a process "hot"
+# Extra cgroups that are never strays (fnmatch globs on the cgroup path); /system.slice, /init.scope and
+# docker/containerd/libpod scopes are always excluded:
+# exclude_cgroups = ["/user.slice/user-1000.slice/*"]
+
 [reaper]
 # false: only log WOULD REAP; true: thaw and terminate paused trees whose agent session is gone.
 enforce = false

@@ -25,7 +25,7 @@ Errors have `ok: false` with `error` and `message`:
 
 ## Operations
 
-Nothing is enforced unless the matching `enforce` flag is on (`[slots]`, `[governor]`, `[memguard]`, `[reaper]`, `[backstop] enabled`, all default off): no cgroup writes, signals, container pauses or `/run/lock` locks without it (AGENTS.md rule 2).
+Nothing is enforced unless the matching `enforce` flag is on (`[slots]`, `[governor]`, `[memguard]`, `[reaper]`, `[backstop] enabled`, `[strays]`, all default off; `[strays] enabled` is detection only and reads `/proc`): no cgroup writes, signals, container pauses or `/run/lock` locks without it (AGENTS.md rule 2).
 
 | `op` | Args | Reply |
 |---|---|---|
@@ -46,6 +46,7 @@ Nothing is enforced unless the matching `enforce` flag is on (`[slots]`, `[gover
 | `freeze` | `reason` (required), `project`, `ttl` (`90s`, `15m`, `2h`; default none: until `unfreeze`), `owner: true` | `{"ok": true, "frozen": [entry ids], "failed": [what], "would": bool, "expires_at", "project"}`; owner only (`owner_denied` otherwise); see Memory guard |
 | `unfreeze` | `project`, `reason`, `owner: true` | `{"ok": true, "thawed": [ids], "flag_cleared": bool, "still_paused": [ids], "restrictedBy"?: "system"}`, or `{"ok": false, "refused": true, "restrictedBy": "system", "reason", "still_paused"}` when only memory-guard pauses remain and memory is below their resume threshold; owner only |
 | `reap` | `reason`, `owner` (bool), `pre_gate` (bool) | `{"ok": true, "reaped": [{pid, start, in_scope, result}], "would": bool}`; any caller (it only frees memory), audited with the caller's principal; `pre_gate: true` is `loadctl run --kind gate`'s call and reaps only with enforce on and `MemAvailable` below `[memguard] pre_gate_reap_gb`, else `{"reaped": [], "skipped": "<why>"}` |
+| `stray_kill` | `pid` (required), `start_time` (optional: the stray's field 22; default the one current stray with that pid), `reason`, `owner: true` | `{"ok": true, "killed": true, "signal": "SIGTERM", "message"}`; owner only (`owner_denied` otherwise). Refused with `{"ok": false, "refused": true, "reason"}` when the process is not in the current stray list, is gone, changed (start time or command name), is `claude`, no longer meets the stray conditions, or `[strays] enforce` is off (audited `WOULD KILL`). See Stray guard. `loadctl stray --kill PID [--start-time T] --owner [--reason R]` |
 | `history` | `n` (default 40, capped at 5760 = one day, so the daemon never builds a huge reply) | `{"ok": true, "columns": [...], "rows": [[...]]}`: the newest `n` rows of the sample history, oldest first, every cell a string exactly as in `history.csv` (see Sample history) |
 | `log` | `n` (default 20, max 1000) | `{"ok": true, "lines": [audit entries, oldest first]}` |
 
@@ -160,6 +161,7 @@ Every REST caller is the **owner** with `source=rest`; requests go through the s
 | `POST /v1/freeze` | `{"project"?, "ttl"?, "reason"?}` | `freeze` as owner; default reason `REST freeze from <peer>`; no owner-change notification |
 | `POST /v1/unfreeze` | `{"project"?, "reason"?}` | `unfreeze` as owner; a memory-guard pause below its resume threshold is refused (`409`, `restrictedBy: "system"`) |
 | `POST /v1/reap` | `{"reason"?}` | `reap` as owner (audit `source=rest`) |
+| `POST /v1/stray/kill` | `{"pid", "start_time"?, "reason"?}` | `stray_kill` as owner (audit `source=rest`; refusals are `409`); default reason `REST stray kill from <peer>`; see Stray guard |
 | `POST /v1/hold` | `{"on": bool, "slot": "heavy"\|"compile"\|"all" (default all), "reason"?}` | `hold` as owner; default reason (on) `REST hold from <peer>`; no owner-change notification |
 
 `reason` is optional on `set`, `ceiling` and `reset` over REST (the socket still requires it); when omitted the audit reason is `REST <set|ceiling|reset> from <peer>`. Replies are the socket replies as JSON. HTTP status: `200` ok, `400` bad JSON, wrong types, unknown fields or `invalid_args`, `409` refused (`refused: true`), `503` `not_ready`, `500` internal. Unknown path `404`, wrong method `405`.
@@ -187,6 +189,7 @@ The alert engine (`loadgov.engines.watch`) evaluates the host every 30 s (every 
 | `stuck_holder:heavy`, `stuck_holder:compile` | a `loadgov` or legacy holder (not an owner hold) has held the slot for more than 45 min | `warning` | `cancel_holder` |
 | `disk` | free space below 25 GB (BUSY) / below 10 GB (LIMIT) | `warning` / `critical` | `prune_caches` |
 | `pause`, `abort`, `low_memory`, `resume`, `reap`, `stuck_paused` | raised by the memory guard through `Daemon.emit_event(kind, payload)` (enforce mode only; the shadow writes audit lines, not pushes). `resume` (info) also covers `RELEASED`, `reap` (warning) the JVM reaper, `stuck_paused` (critical, once per entry) an orphaned entry whose tree could not be thawed after 10 rounds (the entry is kept and thawed again every 60 s). Not deduped (the guard rate-limits itself). `payload` may carry `title`, `message`, `actions`, `top3`, `avail_mb`, `swap_mb` | `warning` (`pause`), `critical` | `unfreeze` for `pause` (label "Resume paused workers") |
+| `stray:<pid>` | a stray process (see Stray guard); raised once per (pid, start time) through `Daemon.emit_event("stray", payload)` with `payload.key = "stray:<pid>"`. `resolved` follows when it is gone or no longer a stray. After an owner kill: an `info` event `stray_killed:<pid>` (title "Stray process killed", `message` names command, project, signal, result and who asked) and `resolved` for `stray:<pid>`. Not deduped (once per process) | `warning` | `kill_stray:<pid>:<start_time>` (label "Kill stray process") |
 
 Dedupe: each key alerts at most once every 10 min while its condition holds; a rise in level (`warning` to `critical`) alerts at once. Only a level above the highest one already sent in the window alerts early, so level flapping cannot bypass the dedupe. A condition must stay clear for 2 evaluations (60 s) before one `resolved` event follows (only if an alert was sent for it); after a `resolved`, a returning condition alerts at once. The Home Assistant side raises the daemon-down alert and the 45-min hold reminders.
 
@@ -259,6 +262,17 @@ Config (`packaging/config/loadgov.toml.example`): `[memguard] enforce`, `pre_gat
 - **Detection and the `BACKSTOP` alert.** Each tick compares `oom_kill` and `oom_group_kill` of the slice's `memory.events` (hierarchical: includes every scope below) with the previous reading. An increase emits one critical `backstop` alert (`key: backstop`, fields `scope` = the job unit(s) whose own counter rose or that disappeared since the last tick, `memory_peak_mb` = that scope's `memory.peak`, or the slice's when the killed scope is already gone, `message`), an audit line (`op=backstop`, `result=event`) and updates `backstop.oom_kills` / `last_event`. It is pushed to Home Assistant like the other guard alerts. A kill can only be seen after it happened: the first reading after a daemon start is the baseline.
 - **Rollback.** Remove (or `enabled = false`) the `[backstop]` table and restart: the daemon sees its marker, writes `max` to `memory.max` and `memory.swap.max` (the only case `max` is ever written), audits `rollback` and removes the marker. If the limits are also set statically in `packaging/systemd/build-work.slice`, remove the two properties there and `systemctl daemon-reload` too (the commented lines are the template). Job scopes keep `memory.oom.group` until they end.
 - **Status and test.** `backstop` object in the status (below); `loadctl status` prints a `backstop` line when enabled. The balloon acceptance runs as `tests/integration/test_backstop.py` on `loadgov-test.slice` only (a test-only target override; the host's `build-work.slice` is never named).
+
+## Stray guard
+
+`engines/strays.py` (detection) and `daemon/stray_ops.py` (events, the kill) find processes that outlived their agent and burn CPU outside every governed scope. Config `[strays]` (`packaging/config/loadgov.toml.example`): `enabled` (true; detection only, read-only), `enforce` (false; lets the owner kill send signals, AGENTS.md rule 2), `check_s` (300, at least 60), `min_age_s` (1800, at least 0), `min_cpu_pct` (50, percent of one core, above 0), `exclude_cgroups` (`[]`, `fnmatch` globs on the cgroup path, each starting with `/` or `*`). `[strays] enforce` is not one of the four `daemon.enforce` flags and does not change `daemon.mode`; it is `strays.enforce`.
+
+- **Check.** On the daemon tick, once `check_s` has passed since the last check (the first tick takes the baseline), the guard reads `/proc` through the existing helpers (`Sampler.proc_ticks`, `host/proctree.py`). A process's CPU % over the interval since the previous check is `100 * (utime + stime delta) / CLK_TCK / seconds`, keyed by (pid, start time = stat field 22), so a reused pid is a new process and a process first seen at this check has no interval yet. A process is **hot** while that share is at least `min_cpu_pct`. `hot_since` is the start of the unbroken run of hot intervals it is in (the previous check, for a process that became hot at this one); a cool interval, or a missing process, resets it. The state is not saved: a daemon restart starts the runs again.
+- **Stray.** A process hot for at least `min_age_s` is a stray when all of these hold: it is in no registered job scope (`jobs[].cgroup`, nested cgroups included); its cgroup is not under `/system.slice/`, not under `/init.scope`, not a docker, containerd or libpod scope (a path segment `docker`, `containerd`, `cri-containerd`, `crio` or `libpod`, alone or followed by `-<id>`, with or without `.scope`) and matches no `exclude_cgroups` glob; it is not a kernel thread (empty cmdline or ppid 2); its command name is not `claude` and it is not `loadgovd`; and it is **orphaned**: no live `claude` among its ancestors, and (its ppid is 1, or `CLAUDE_PID` in its environment names a pid that is dead or is not a `claude`). `/proc/<pid>/environ` is read as root; an unreadable one counts as empty. An unreadable cgroup is not a stray (it cannot be checked).
+- **Record.** Each stray is `{pid, start_time, comm, cmdline (200 characters), cwd, cgroup, project, cpu_pct, hot_since, age_s, orphan, session}`. `project` is the `[memguard.projects.<name>]` whose `agent_cwd` holds the cwd (null when none does); `session` is `{claude_pid, session_id}` from the environment variables `CLAUDE_PID` and `CLAUDE_CODE_SESSION_ID` (null when absent). The list is the result of the last check (`strays.last_check`).
+- **Events.** A new stray (pid, start time) raises one `stray:<pid>` alert with the action `kill_stray:<pid>:<start_time>`; it is resolved when it is gone or no longer a stray. Both are audited (`op=stray`, `principal=system`, `result` `detected` / `resolved`). A check signals nothing.
+- **The kill (owner only, never automatic).** `stray_kill` / `POST /v1/stray/kill` (the REST caller is the owner). The daemon re-verifies the target at that moment: (pid, start time) is in the current list, `/proc/<pid>/stat` still has that start time and command name, it is not `claude`, and the stray conditions hold again. Then, with `[strays] enforce = true`, it sends `SIGTERM` through a pidfd opened before the start-time re-check (`host/signals.py`; pid 1, the daemon and `claude` are refused there too) and, on the tick 30 s later, `SIGKILL` if the process is still alive. With enforce off nothing is signalled: the reply is `refused` and the audit line `WOULD KILL stray ...`. Every request is audited (`op=stray`, `principal=owner`, `result` `applied`, `refused`, `would` or `failed`; the 30 s follow-up `applied` or `terminated`). The phone gets the `stray_killed:<pid>` info event at the `SIGTERM` and a second one with the end result after the 30 s.
+- **Status and clients.** The `strays` object in the status (below); `loadctl stray [--json]` lists the strays (`no stray processes` when none), `loadctl status` prints `strays: N` only when N > 0. The MCP server shows `strays` in `load_get_status` and has no kill tool: agents must not kill.
 
 ## Sample history
 
@@ -424,6 +438,24 @@ Every field below is present in every status (checked by `loadgov.protocol.valid
 | `backstop.oom_kills` | int | OOM kills seen in `build-work.slice` since the daemon started |
 | `backstop.last_event` | string or null | `<UTC time> <scope> peak <n> MB` of the last `BACKSTOP` alert |
 | `backstop.note` | string or null | Why the limits are not applied (`deferred: usage ... is not below memory.max`, a failed write, ...) |
+| `strays.enabled` | bool | `[strays] enabled` (detection) |
+| `strays.enforce` | bool | `[strays] enforce` (the owner kill may send signals) |
+| `strays.check_s` | int | `[strays] check_s`, seconds between checks |
+| `strays.last_check` | string or null | UTC time of the last check (null before the first) |
+| `strays.items` | list | The current strays (empty when disabled) |
+| `strays.items[].pid` | int | Pid |
+| `strays.items[].start_time` | int | Process start time in clock ticks (stat field 22): with the pid it identifies the process |
+| `strays.items[].comm` | string | Command name |
+| `strays.items[].cmdline` | string | Command line, truncated to 200 characters |
+| `strays.items[].cwd` | string or null | Working directory (null when unreadable) |
+| `strays.items[].cgroup` | string | cgroup v2 path |
+| `strays.items[].project` | string or null | The project whose `agent_cwd` holds the cwd, else null |
+| `strays.items[].cpu_pct` | number | CPU % of one core over the last interval |
+| `strays.items[].hot_since` | string | UTC time its current hot run began |
+| `strays.items[].age_s` | int | Seconds hot at the last check |
+| `strays.items[].orphan` | bool | Always true for a listed stray |
+| `strays.items[].session.claude_pid` | int or null | `CLAUDE_PID` from its environment |
+| `strays.items[].session.session_id` | string or null | `CLAUDE_CODE_SESSION_ID` from its environment |
 | `capabilities` | list | What this daemon can do: `freeze` (the `freeze`/`unfreeze` ops and endpoints) and `reap`; the Home Assistant integration enables its freeze, resume and kill-daemons entities from it |
 | `daemon.version` | string | loadgov version |
 | `daemon.pid` | int | Daemon pid |

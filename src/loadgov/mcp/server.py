@@ -25,7 +25,7 @@ from loadgov.protocol import DEFAULT_SOCKET
 MAX_WAIT_S = 1800.0
 OPTIONAL_TOOLS = {"load_reap_idle_daemons": "reap", "load_freeze": "freeze", "load_unfreeze": "freeze"}
 # top-level status sections copied as they are when present
-OPTIONAL_STATUS_KEYS = ("memguard",)
+OPTIONAL_STATUS_KEYS = ("memguard", "strays")  # strays: read-only; there is deliberately no kill tool
 
 
 class ToolFailure(Exception):

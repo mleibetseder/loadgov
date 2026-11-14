@@ -122,3 +122,47 @@ def test_reset_truncated_and_invalid_replies_exit_3_without_traceback(tmp_path, 
         _serve_once(sock, payload)
         assert loadctl.main(["--socket", str(sock), "status"]) == 3
         assert "loadctl:" in capsys.readouterr().err
+
+
+def stray_item(**kw):
+    return {
+        "pid": 7, "start_time": 99, "comm": "yes", "cmdline": "yes", "cwd": "/srv/work/x", "cgroup": "/user.slice/s",
+        "project": "proj-b", "cpu_pct": 100.0, "hot_since": "2025-11-10T18:41:00Z", "age_s": 3600,
+        "orphan": True, "session": {"claude_pid": None, "session_id": None}, **kw,
+    }  # fmt: skip
+
+
+def test_stray_lists_and_status_counts_them(monkeypatch, capsys, fake_host):
+    st = status(fake_host("calm"))
+    st["strays"] = {"enabled": True, "enforce": False, "check_s": 300, "last_check": None, "items": []}
+    monkeypatch.setattr(loadctl, "request", lambda *_a, **_k: {"ok": True, "status": st})
+    assert loadctl.main(["stray"]) == 0
+    assert capsys.readouterr().out.strip() == "no stray processes"
+    assert "strays:" not in loadctl.format_status(st)  # only when N > 0
+    st["strays"]["items"] = [stray_item(), stray_item(pid=8)]
+    assert loadctl.main(["stray"]) == 0
+    out = capsys.readouterr().out
+    assert "pid 7 start 99  yes  100% CPU for 60 min  proj-b" in out and "pid 8" in out
+    assert loadctl.main(["stray", "--json"]) == 0
+    assert [i["pid"] for i in json.loads(capsys.readouterr().out)] == [7, 8]
+    assert "  strays: 2" in loadctl.format_status(st).splitlines()
+
+
+def test_stray_kill_sends_the_op_and_reports_a_refusal(monkeypatch, capsys):
+    sent = []
+
+    def fake(_sock, op, args=None, **_k):
+        sent.append((op, args))
+        if args["pid"] == 7:
+            return {"ok": True, "killed": True, "signal": "SIGTERM", "message": "sent SIGTERM to yes (pid 7)"}
+        return {"ok": False, "refused": True, "reason": "not a current stray"}
+
+    monkeypatch.setattr(loadctl, "request", fake)
+    assert loadctl.main(["stray", "--kill", "7", "--start-time", "99", "--owner", "--reason", "leak"]) == 0
+    assert capsys.readouterr().out.strip() == "sent SIGTERM to yes (pid 7)"
+    assert loadctl.main(["stray", "--kill", "8", "--owner"]) == 4
+    assert capsys.readouterr().err.strip() == "refused: not a current stray"
+    assert sent == [
+        ("stray_kill", {"pid": 7, "start_time": 99, "owner": True, "reason": "leak"}),
+        ("stray_kill", {"pid": 8, "owner": True}),
+    ]

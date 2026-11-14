@@ -52,6 +52,7 @@
           # here are skipped, so no button ever answers an error by design.
           profile=silent: "Throttle to Silent (2.0 cores)"
           cancel_holder: "Cancel hung gate"
+          kill_stray: "Kill stray process"
           # Enable one line each when the daemon supports it (freeze/unfreeze with freeze support, prune_caches when
           # it lands), and enable the matching route in loadgov_notification_actions.yaml:
           # freeze: "Freeze heavy builds"
@@ -62,7 +63,9 @@
           {% if not is_info %}
           {% for a in p.get('actions', []) %}
           {% set aid = 'LOADGOV:' ~ a ~ ((':' ~ slot) if a == 'cancel_holder' and slot else '') %}
-          {% if a == 'cancel_holder' and not slot %}{% elif a in labels %}
+          {% if a == 'cancel_holder' and not slot %}{% elif a.startswith('kill_stray:') %}
+          {% set ns.items = ns.items + [{'action': 'LOADGOV:' ~ a, 'title': labels['kill_stray']}] %}
+          {% elif a in labels %}
           {% set ns.items = ns.items + [{'action': aid, 'title': labels[a]}] %}
           {% elif a.startswith('profile=') %}
           {% set ns.items = ns.items + [{'action': aid, 'title': 'Switch to ' ~ a[8:]}] %}

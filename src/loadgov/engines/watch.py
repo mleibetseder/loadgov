@@ -34,13 +34,14 @@ HOOK_KINDS = {  # emit_event kind -> (level, title, actions)
     "reap": ("warning", "Build daemons stopped by the memory guard", []),
     "stuck_paused": ("critical", "Orphaned paused work cannot be thawed", []),
     "backstop": ("critical", "Memory backstop killed a build job", []),
+    "stray": ("warning", "Stray process", []),  # key `stray:<pid>` (payload `key`), actions from the payload
 }
 ACTIONS = {
     "cpu": ["profile=silent", "freeze"],
     "stuck_holder": ["cancel_holder"],
     "disk": ["prune_caches"],
 }
-ACTION_LABELS = {"unfreeze": "Resume paused workers"}  # for the Home Assistant side (documented)
+ACTION_LABELS = {"unfreeze": "Resume paused workers", "kill_stray": "Kill stray process"}  # for HA
 
 
 def interval_top3(prev: dict, cur: dict, dt_s: float, clk_tck: int) -> list[dict]:
@@ -218,8 +219,9 @@ class Watch:
     # ---- events from elsewhere -------------------------------------------------------------------
 
     def emit_event(self, kind: str, payload: dict | None = None) -> dict:
-        """The memory guard's hook (`pause`, `abort`, `low_memory`, `resume`, `reap`); `payload` may carry
-        `title`, `message`, `actions`, `top3`, `avail_mb`, `swap_mb`. Not deduped: the guard limits itself."""
+        """The memory guard's hook (`pause`, `abort`, `low_memory`, `resume`, `reap`) and the stray guard's
+        (`stray`); `payload` may carry `key` (default: the kind), `title`, `message`, `actions`, `top3`,
+        `avail_mb`, `swap_mb`. Not deduped: the callers limit themselves."""
         if kind not in HOOK_KINDS:
             raise ValueError(f"unknown event kind {kind!r} (one of {', '.join(HOOK_KINDS)})")
         payload = payload or {}
@@ -228,11 +230,20 @@ class Watch:
         for k in ctx:
             if k in payload:
                 ctx[k] = payload[k]
-        ev = {"type": "alert", "key": kind, "level": level, "title": payload.get("title", title),
-              "message": payload.get("message", title), **ctx,
+        ev = {"type": "alert", "key": payload.get("key", kind), "level": level,
+              "title": payload.get("title", title), "message": payload.get("message", title), **ctx,
               "actions": payload.get("actions", actions), "at": iso(self.clock())}  # fmt: skip
         ev.update({k: payload[k] for k in ("scope", "memory_peak_mb") if k in payload})  # BACKSTOP
         return self._record(ev)
+
+    def resolved(self, key: str, title: str) -> dict:
+        """A `resolved` event for a key raised outside `evaluate` (the stray guard)."""
+        return self._record({"type": "resolved", "key": key, "title": title, "at": iso(self.clock())})
+
+    def info(self, key: str, title: str, message: str) -> dict:
+        """An informational event (`type` and `level` `info`), e.g. the result of an owner kill."""
+        return self._record({"type": "info", "key": key, "level": "info", "title": title, "message": message,
+                             "at": iso(self.clock())})  # fmt: skip
 
     def owner_change(self, who: dict, what: str, reason: str | None) -> dict:
         """An owner-level change made on the host (not over REST), for the phone."""

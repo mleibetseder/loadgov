@@ -35,6 +35,12 @@ def _local_time(at: str) -> str:
     return t.astimezone().strftime("%Y-%m-%d %H:%M:%S")
 
 
+def format_stray(it: dict) -> str:
+    where = it["project"] or it["cwd"] or it["cgroup"]
+    return (f"pid {it['pid']} start {it['start_time']}  {it['comm']}  {it['cpu_pct']:g}% CPU for "
+            f"{it['age_s'] // 60} min  {where}  {it['cmdline'][:60]}")  # fmt: skip
+
+
 def format_hwmon(s: dict) -> str:
     """The five-line format of legacy `hwmon status`, so scripts and people reading it keep working."""
     lv, c, m, w, d = s["levels"], s["cpu"], s["memory"], s["swap"], s["disk"]
@@ -99,6 +105,9 @@ def format_status(s: dict) -> str:
             f"{state}, {bs['oom_kills']} OOM kill(s)"
             + (f", last {bs['last_event']}" if bs["last_event"] else "")
         )
+    strays = (s.get("strays") or {}).get("items") or []
+    if strays:
+        lines.append(f"  strays: {len(strays)}")
     for name, sl in s.get("slots", {}).items():
         lines.append(f"  slot  {format_slot(name, sl)}")
     lines.append(f"  jvm   {s['jvm_daemons']} Gradle/Kotlin daemon(s)")
@@ -141,6 +150,8 @@ def format_limits(lim: dict) -> str:
 
 
 def format_reply(op: str, reply: dict) -> str:
+    if op == "stray_kill":
+        return f"refused: {reply['reason']}"
     if reply.get("restrictedBy") == "system":
         return f"refused: the memory guard holds the pause ({reply['reason']})"
     if reply.get("refused"):
@@ -234,6 +245,14 @@ def _parser() -> argparse.ArgumentParser:
     uf.add_argument("--owner", action="store_true", help="act as the human owner (required)")
     uf.add_argument("--reason")
     sub.add_parser("reap-daemons", help="stop idle Gradle/Kotlin build daemons (frees memory)")
+    sy = sub.add_parser("stray", help="list stray processes (orphaned CPU hogs); --kill PID: owner kill")
+    sy.add_argument("--json", action="store_true")
+    sy.add_argument("--kill", type=int, metavar="PID", help="owner: SIGTERM (then SIGKILL) this stray")
+    sy.add_argument(
+        "--start-time", type=int, dest="start_time", help="its start time (status field), checked"
+    )
+    sy.add_argument("--owner", action="store_true", help="act as the human owner (required with --kill)")
+    sy.add_argument("--reason", help="why (audit)")
     ho = sub.add_parser("hold", help="owner: hold the slots (drain) until turned off")
     ho.add_argument("state", choices=["on", "off"])
     ho.add_argument("--slot", choices=["heavy", "compile", "all"], default="all")
@@ -589,6 +608,12 @@ def main(argv: list[str] | None = None, sleep=time.sleep) -> int:
     elif a.cmd == "reap-daemons":
         op = "reap"
         args = {"reason": "loadctl reap-daemons"}
+    elif a.cmd == "stray" and a.kill is not None:
+        op = "stray_kill"
+        args = {"pid": a.kill, "start_time": a.start_time, "owner": a.owner, "reason": a.reason}
+    elif a.cmd == "stray":
+        op = "status"
+        args = {}
     elif a.cmd == "hold":
         op = "hold"
         args = {"state": a.state, "slot": a.slot, "owner": a.owner, "reason": a.reason}
@@ -616,7 +641,17 @@ def main(argv: list[str] | None = None, sleep=time.sleep) -> int:
     if not reply.get("ok"):
         print(f"loadctl: {reply.get('error')}: {reply.get('message')}", file=sys.stderr)
         return EXIT_ERROR
-    if op == "status":
+    if a.cmd == "stray" and op == "status":
+        items = (reply["status"].get("strays") or {}).get("items") or []
+        if a.json:
+            print(json.dumps(items, indent=2))
+        elif not items:
+            print("no stray processes")
+        for it in items if not a.json else ():
+            print(format_stray(it))
+    elif op == "stray_kill":
+        print(reply["message"])
+    elif op == "status":
         s = reply["status"]
         if a.json:
             print(json.dumps(s, indent=2))

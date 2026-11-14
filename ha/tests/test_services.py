@@ -52,6 +52,30 @@ async def test_service_refusal_raises_the_daemons_reason(hass, aioclient_mock, m
         await hass.services.async_call("loadgov", "set_profile", {"profile": "boost"}, blocking=True)
 
 
+async def test_kill_stray_posts_the_body(hass, aioclient_mock, mock_entry, status):
+    await setup(hass, mock_entry, aioclient_mock, status)
+    aioclient_mock.post(
+        f"{BASE}/v1/stray/kill", json={"ok": True, "killed": True, "signal": "SIGTERM", "message": "ok"}
+    )
+    await hass.services.async_call(
+        "loadgov", "kill_stray", {"pid": 4242, "start_time": 99, "reason": "runaway"}, blocking=True
+    )
+    assert posts(aioclient_mock) == [("/v1/stray/kill", {"reason": "runaway", "pid": 4242, "start_time": 99})]
+
+
+async def test_kill_stray_refusal_raises_the_daemons_message(hass, aioclient_mock, mock_entry, status):
+    await setup(hass, mock_entry, aioclient_mock, status)
+    aioclient_mock.post(
+        f"{BASE}/v1/stray/kill",
+        status=409,
+        json={"ok": False, "refused": True, "message": "not a current stray"},
+    )
+    with pytest.raises(HomeAssistantError, match="not a current stray"):
+        await hass.services.async_call(
+            "loadgov", "kill_stray", {"pid": 4242, "start_time": 99}, blocking=True
+        )
+
+
 async def test_service_without_loaded_entry(hass):
     from custom_components.loadgov import async_setup
 

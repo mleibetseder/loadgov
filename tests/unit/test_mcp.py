@@ -324,3 +324,17 @@ def test_server_tool_call_and_unreachable(daemon, tmp_path):
     down = build_server(Tools(str(tmp_path / "none.sock")))
     with pytest.raises(ToolError, match="loadgovd not reachable"):
         asyncio.run(down.call_tool("load_get_status", {}))
+
+
+def test_status_shows_strays_and_there_is_no_kill_tool(daemon):
+    st = status_reply()
+    st["status"]["strays"] = {
+        "enabled": True,
+        "enforce": False,
+        "check_s": 300,
+        "last_check": None,
+        "items": [],
+    }
+    d = daemon(status=lambda a: st)
+    assert Tools(d.path).get_status()["strays"]["check_s"] == 300
+    assert not [n for n in dir(Tools) if "stray" in n or "kill" in n]

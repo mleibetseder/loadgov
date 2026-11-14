@@ -1,6 +1,8 @@
 """loadctl run, the job_start/job_end ops and scope-bound slot lifetime. No systemd involved:
 the launcher, systemctl and pkill are injected fakes; processes are real short `sleep`s we started."""
 
+import builtins
+import errno
 import json
 import os
 import signal
@@ -901,3 +903,56 @@ def test_the_job_runs_in_its_own_session(monkeypatch):
     monkeypatch.setattr(run.subprocess, "Popen", lambda argv, **kw: seen.update(kw))
     run._spawn(["true"], {})
     assert seen["start_new_session"] is True
+
+
+# ---- a scope removed mid-read (ENODEV) counts as gone; other read errors still raise -----------------
+
+
+def fail_procs_read(monkeypatch, code):
+    """open() works, reading `cgroup.procs` raises OSError(code): what the kernel does for a cgroup removed meanwhile."""
+    real_open = builtins.open
+
+    class Broken:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self):
+            raise OSError(code, os.strerror(code))
+
+    def fake_open(path, *a, **k):
+        return Broken() if str(path).endswith("cgroup.procs") else real_open(path, *a, **k)
+
+    monkeypatch.setattr("loadgov.host.procfs.open", fake_open, raising=False)
+
+
+def test_scope_procs_enodev_means_gone(fake_host, monkeypatch):
+    host = fake_host("calm")
+    set_procs(host, CG, [1])
+    fail_procs_read(monkeypatch, errno.ENODEV)
+    assert host.fs.scope_procs(CG) is None
+
+
+def test_scope_procs_eacces_still_raises(fake_host, monkeypatch):
+    host = fake_host("calm")
+    set_procs(host, CG, [1])
+    fail_procs_read(monkeypatch, errno.EACCES)
+    with pytest.raises(OSError) as e:
+        host.fs.scope_procs(CG)
+    assert e.value.errno == errno.EACCES
+
+
+def test_job_end_with_a_scope_removed_mid_read_releases_the_slot(fake_host, tmp_path, procs, monkeypatch):
+    host = fake_host("calm")
+    d = make_daemon(host, tmp_path)
+    client, job = procs(), procs()
+    grant_gate(d, client.pid)
+    start(d, job.pid, client.pid)
+    set_procs(host, CG, [])
+    fail_procs_read(monkeypatch, errno.ENODEV)
+    r = call(d, "job_end", unit=UNIT)
+    assert r["ok"] is True
+    assert (r["ended"], r["released"]) == (True, True)
+    assert d.slots.slots["heavy"].holder is None

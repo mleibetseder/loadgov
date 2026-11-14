@@ -104,7 +104,7 @@ curl -s -o /dev/null -w '%{http_code}\n' http://<build host LAN IP>:7420/v1/stat
    - Port: `7420`
    - Token: the value after `LOADGOV_REST_TOKEN=` (`sudo cat /etc/loadgov/tokens.env`)
 
-**Check:** a device "Build Host Load Governor" with about 27 entities: `sensor.host_busy_pct`,
+**Check:** a device "Build Host Load Governor" with about 28 entities: `sensor.host_busy_pct`,
 `select.host_load_profile`, `number.host_max_cores`, … with live values. `sensor.host_daemon_features` lists
 `freeze, reap`. Smart triggers stay off until you turn them on under the integration's *Configure*.
 

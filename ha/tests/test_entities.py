@@ -58,6 +58,38 @@ async def test_state_follows_restriction_hold_and_paused(hass, aioclient_mock, m
     assert hass.states.get("sensor.host_owner_ceiling").state == "Silent (Fan Off)"
 
 
+def _stray(pid: int) -> dict:
+    return {
+        "pid": pid, "start_time": 1000 + pid, "comm": "node", "cmdline": "node x.js", "cwd": "/w/p",
+        "cgroup": "/user.slice", "project": "p", "cpu_pct": 91.5, "hot_since": "2026-01-01T00:00:00+00:00",
+        "age_s": 600, "orphan": True, "session": {"claude_pid": None, "session_id": "abc"},
+    }  # fmt: skip
+
+
+async def test_strays_sensor_state_and_attributes(hass, aioclient_mock, mock_entry, status):
+    status["strays"] = {
+        "enabled": True, "enforce": False, "check_s": 60, "last_check": None,
+        "items": [_stray(p) for p in range(1, 13)],
+    }  # fmt: skip
+    await setup(hass, mock_entry, aioclient_mock, status)
+    st = hass.states.get("sensor.host_strays")
+    assert st.state == "12"
+    assert st.attributes["enforce"] is False
+    assert st.attributes["friendly_name"].endswith("Stray processes")
+    assert st.attributes["icon"] == "mdi:ghost"
+    assert len(st.attributes["items"]) == 10
+    assert st.attributes["items"][0] == {
+        "pid": 1, "start_time": 1001, "comm": "node", "project": "p", "cwd": "/w/p",
+        "cpu_pct": 91.5, "age_s": 600, "session_id": "abc",
+    }  # fmt: skip
+
+
+async def test_strays_sensor_unavailable_on_an_older_daemon(hass, aioclient_mock, mock_entry, status):
+    assert "strays" not in status
+    await setup(hass, mock_entry, aioclient_mock, status)
+    assert hass.states.get("sensor.host_strays").state == STATE_UNAVAILABLE
+
+
 async def test_coordinator_failure_makes_entities_unavailable(hass, aioclient_mock, mock_entry, status):
     await setup(hass, mock_entry, aioclient_mock, status)
     assert hass.states.get("sensor.host_busy_pct").state == "42.5"

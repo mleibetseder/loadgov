@@ -187,7 +187,7 @@ def test_status_carries_limits_and_validates(daemon, fake_host):
     s["governor"] = daemon.governor.status()
     s["memguard"], s["capabilities"] = daemon.memguard.status(), ["freeze", "reap"]
     s["headroom"] = daemon.headroom_status()
-    s["backstop"] = daemon.backstop.status()
+    s["backstop"], s["strays"] = daemon.backstop.status(), daemon.strays.status()
     assert validate_status(s) == []
     assert s["limits"]["effective"]["load_hold"] == 5.0
 

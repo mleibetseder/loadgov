@@ -123,7 +123,12 @@ Order, each with a day of watching and its rollback (set the flag back to `false
 4. **`[rest]` and `[ha]`**, the Home Assistant side ([ha/README.md](../ha/README.md)): set `[rest] bind` to the host's
    LAN address (required, never `0.0.0.0`), fill `[rest] allow` with the Home Assistant address, put the token
    and the webhook id into `tokens.env`, then `enabled = true`.
-5. **`[backstop]`** (optional, after at least seven days of history): a hard `memory.max` under
+5. **`[strays] enforce = true`** (optional): detection (`[strays] enabled`, on by default) only reads `/proc` and
+   lists orphaned CPU hogs in `loadctl stray` and on the phone. `enforce` only lets the owner's kill (`loadctl stray
+   --kill PID --owner`, the phone's Kill button) send `SIGTERM`, then `SIGKILL` 30 s later; the daemon never
+   kills a stray on its own. Watch `loadctl stray` for a few days first and add `exclude_cgroups` for anything
+   that is a legitimate long runner.
+6. **`[backstop]`** (optional, after at least seven days of history): a hard `memory.max` under
    `build-work.slice`, sized from the history with `loadctl history --all --csv | python3 tools/backstop_sizing.py -`.
 
 ## 5. Panic and rollback

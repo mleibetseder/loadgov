@@ -1,5 +1,7 @@
 """The drafted automations parse, and the daemon-down one clears its alert whenever the sensor is healthy."""
 
+import ast
+import re
 from pathlib import Path
 
 import jinja2
@@ -17,8 +19,12 @@ def test_every_automation_parses():
         assert yaml.safe_load(path.read_text()), path.name
 
 
+ENV = jinja2.Environment()
+ENV.tests["match"] = lambda s, pat: re.match(pat, s) is not None  # Home Assistant's `match` test
+
+
 def render(text, ctx):
-    return jinja2.Environment().from_string(text).render(**ctx) if isinstance(text, str) else text
+    return ENV.from_string(text).render(**ctx) if isinstance(text, str) else text
 
 
 def holds(cond, trigger_id, states, ctx):
@@ -118,3 +124,63 @@ def test_daemon_down_clears_when_the_sensor_is_healthy():
     assert "clear" in done
     back = next(t for t in load("loadgov_daemon_down.yaml")[0]["triggers"] if t["id"] == "back")
     assert back["from"] == ["unavailable", "unknown"] and back["not_to"] == ["unavailable", "unknown"]
+
+
+class _AttrDict(dict):
+    def __getattr__(self, k):
+        v = self[k]
+        return _AttrDict(v) if isinstance(v, dict) else v
+
+
+def _variables(step, ctx):
+    """Render a `variables:` step in order, like Home Assistant: literals stay, strings are templates."""
+    env = ENV
+    out = dict(ctx)
+    for name, val in step["variables"].items():
+        if not isinstance(val, str):
+            out[name] = val
+            continue
+        text = env.from_string(val).render(**out).strip()
+        try:
+            out[name] = ast.literal_eval(text)
+        except (ValueError, SyntaxError):
+            out[name] = text
+    return out
+
+
+def test_alert_offers_a_kill_button_for_a_stray_and_keeps_three_at_most():
+    (auto,) = load("loadgov_alerts.yaml")
+    step = next(s for s in auto["actions"] if "variables" in s)
+    payload = {"type": "alert", "key": "stray:123", "actions": ["kill_stray:123:456", "profile=silent", "x"]}
+    v = _variables(step, {"trigger": _AttrDict({"json": payload})})
+    assert {"action": "LOADGOV:kill_stray:123:456", "title": "Kill stray process"} in v["buttons"]
+    assert len(v["buttons"]) == 2  # the unknown id gets none
+    payload["actions"] = ["kill_stray:1:2", "kill_stray:3:4", "profile=silent", "profile=balanced"]
+    assert len(_variables(step, {"trigger": _AttrDict({"json": payload})})["buttons"]) == 3
+
+
+def _route(action):
+    (auto,) = load("loadgov_notification_actions.yaml")
+    ctx = {"trigger": _AttrDict({"event": {"data": {"action": action}}})}
+    v = _variables(next(s for s in auto["actions"] if "variables" in s), ctx)
+    for opt in next(s for s in auto["actions"] if "choose" in s)["choose"]:
+        if all(holds(c, "", {}, v) for c in opt["conditions"]):
+            return _variables(opt["sequence"][0], v)
+    return None
+
+
+def test_kill_stray_tap_parses_pid_and_start_time_as_integers():
+    v = _route("LOADGOV:kill_stray:123:9876543210")
+    assert v["svc"] == "rest_command.loadgov_kill_stray"
+    data = {k: ast.literal_eval(render(t, v).strip()) for k, t in v["call_data"].items()}
+    assert data == {"pid": 123, "start_time": 9876543210}
+
+
+def test_malformed_kill_stray_ids_are_not_routed():
+    for bad in (
+        "LOADGOV:kill_stray",
+        "LOADGOV:kill_stray:1",
+        "LOADGOV:kill_stray:a:2",
+        "LOADGOV:kill_stray:1:2:3",
+    ):
+        assert _route(bad) is None, bad

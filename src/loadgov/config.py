@@ -351,6 +351,19 @@ class ReaperConfig:
     enforce: bool = False  # [reaper] enforce: terminate trees whose agent session is gone
 
 
+@dataclass(frozen=True)
+class StraysConfig:
+    """Stray-process guard: orphaned CPU hogs outside every governed scope (docs/protocol.md)."""
+
+    enabled: bool = True  # detection only, read-only
+    enforce: bool = False  # [strays] enforce: the owner kill may send signals; off = WOULD KILL audit only
+    check_s: int = 300
+    min_age_s: int = 1800  # hot continuously for this long before a process counts as a stray
+    min_cpu_pct: float = 50  # CPU % of one core over the last interval that makes a process "hot"
+    exclude_cgroups: tuple[str, ...] = ()  # fnmatch globs on the cgroup path
+
+
+STRAYS_MIN_CHECK_S = 60
 BACKSTOP_MIN_MB = 4096  # memory.max below 4 GB is refused: it would kill ordinary builds
 
 
@@ -378,6 +391,7 @@ class Config:
     reaper: ReaperConfig = field(default_factory=ReaperConfig)
     backstop: BackstopConfig = field(default_factory=BackstopConfig)
     principal: PrincipalConfig = field(default_factory=PrincipalConfig)
+    strays: StraysConfig = field(default_factory=StraysConfig)
 
 
 def eval_nproc(value, nproc: int) -> float:
@@ -639,6 +653,31 @@ def _parse_backstop(raw) -> BackstopConfig:
     return BackstopConfig(enabled, mem, swap)
 
 
+def _parse_strays(raw) -> StraysConfig:
+    keys = ("enabled", "enforce", "check_s", "min_age_s", "min_cpu_pct", "exclude_cgroups")
+    if not isinstance(raw, dict) or set(raw) - set(keys):
+        raise ConfigError(f"strays: allowed keys are {', '.join(keys)}")
+    d = StraysConfig()
+    for k in ("enabled", "enforce"):
+        if not isinstance(raw.get(k, getattr(d, k)), bool):
+            raise ConfigError(f"strays.{k}: expected a boolean")
+    check_s = raw.get("check_s", d.check_s)
+    if not _is_int(check_s) or check_s < STRAYS_MIN_CHECK_S:
+        raise ConfigError(f"strays.check_s: expected an integer >= {STRAYS_MIN_CHECK_S} (seconds)")
+    min_age = raw.get("min_age_s", d.min_age_s)
+    if not _is_int(min_age) or min_age < 0:
+        raise ConfigError("strays.min_age_s: expected an integer >= 0 (seconds)")
+    cpu = raw.get("min_cpu_pct", d.min_cpu_pct)
+    if isinstance(cpu, bool) or not isinstance(cpu, int | float) or not 0 < cpu <= 10000:
+        raise ConfigError("strays.min_cpu_pct: expected a number > 0 (percent of one core)")
+    ex = raw.get("exclude_cgroups", [])
+    if not isinstance(ex, list) or not all(isinstance(g, str) and g[:1] in ("/", "*") for g in ex):
+        raise ConfigError("strays.exclude_cgroups: expected a list of cgroup globs starting with '/' or '*'")
+    return StraysConfig(
+        raw.get("enabled", d.enabled), raw.get("enforce", d.enforce), check_s, min_age, cpu, tuple(ex)
+    )
+
+
 def parse_config(text: str) -> Config:
     try:
         raw = tomllib.loads(text)
@@ -659,6 +698,7 @@ def parse_config(text: str) -> Config:
             "reaper",
             "backstop",
             "principal",
+            "strays",
         ):
             raise ConfigError(f"unknown key {key!r}")
     profiles = dict(BUILTIN_PROFILES)
@@ -691,6 +731,7 @@ def parse_config(text: str) -> Config:
         _parse_ha(raw.get("ha", {})), _parse_compat(raw.get("compat", {})), governor.get("enforce", False),
         _parse_memguard(raw.get("memguard", {})), _parse_reaper(raw.get("reaper", {})),
         _parse_backstop(raw.get("backstop", {})), _parse_principal(raw.get("principal", {})),
+        _parse_strays(raw.get("strays", {})),
     )  # fmt: skip
 
 

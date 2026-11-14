@@ -35,6 +35,18 @@ rest_command:
       {{ {'slot': slot, 'confirm': true, 'reason': reason | default('Home Assistant: cancel hung gate')} | tojson }}
     timeout: 10
 
+  # POST /v1/stray/kill {"pid": int, "start_time": int, "reason": "..."}
+  # pid and start_time come from the tapped button id (kill_stray:<pid>:<start_time>); 409 = refused.
+  loadgov_kill_stray:
+    url: "http://YOUR_LOADGOV_HOST:7420/v1/stray/kill"
+    method: post
+    headers:
+      Authorization: !secret loadgov_auth_header
+    content_type: "application/json"
+    payload: >-
+      {{ {'pid': pid | int, 'start_time': start_time | int, 'reason': 'phone button'} | tojson }}
+    timeout: 10
+
   # POST /v1/set: profile and/or limits (daemon requires at least one of profile, max_cores,
   # target_cpu_pct, load_max, max_implementers, ram_floor_gb). Optional: ttl ("90s", "15m", "2h") or
   # until ("HH:MM Europe/Berlin"), reason.

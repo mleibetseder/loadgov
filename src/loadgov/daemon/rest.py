@@ -50,6 +50,7 @@ POST_KEYS = {
     "/v1/freeze": {"project", "reason", "ttl"},
     "/v1/unfreeze": {"project", "reason"},
     "/v1/reap": {"reason"},
+    "/v1/stray/kill": {"pid", "start_time", "reason"},
 }
 ACTION_RE = re.compile(r"^profile=([a-z][a-z0-9_-]*)$")
 
@@ -376,6 +377,8 @@ class RestServer:
             return path.rsplit("/", 1)[1], args
         if path == "/v1/cancel-holder":
             return "cancel_holder", args
+        if path == "/v1/stray/kill":
+            return "stray_kill", args
         if path == "/v1/hold":
             on = args.pop("on", None)
             if not isinstance(on, bool):

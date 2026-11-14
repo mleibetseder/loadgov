@@ -45,6 +45,7 @@ def take(host, now=NOW, mirrors=("loop-a",)):
     }  # fmt: skip
     out["backstop"] = {"enabled": False, "applied": False, "memory_max_mb": None, "memory_swap_max_mb": None,
                        "oom_kills": 0, "last_event": None, "note": None}  # fmt: skip
+    out["strays"] = {"enabled": True, "enforce": False, "check_s": 300, "last_check": None, "items": []}
     out["rest"] = {"enabled": False, "state": "disabled", "error": None, "bind": "192.0.2.10", "port": 7420}
     out["slots"] = SlotManager(host.fs).summary()  # added by the daemon too
     out["jobs"] = []  # likewise
