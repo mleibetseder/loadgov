@@ -17,7 +17,7 @@ loadctl = "loadgov.cli.loadctl:main"
 loadgov-mcp = "loadgov.mcp.server:main"
 
 [project.optional-dependencies]
-mcp = ["mcp>=1.12,<2"]
+mcp = ["mcp>=2.3,<3"]
 
 [dependency-groups]
 dev = ["pytest>=8", "ruff>=0.8"]
