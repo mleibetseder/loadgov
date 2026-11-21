@@ -45,8 +45,14 @@ def set_sample(d, host):
     d.status = s.sample(now=d.t)
 
 
-def hr(d, kind="impl", project=None):
-    args = {"kind": kind, **({"project": project} if project else {})}
+def hr(d, kind="impl", project=None, swap_in=0.0, overrides=None):
+    if d.status:
+        d.status["swap"]["in_rate"] = swap_in  # pages/s, as the sampler reports it
+    args = {
+        "kind": kind,
+        **({"project": project} if project else {}),
+        **({"overrides": overrides} if overrides else {}),
+    }
     return d.dispatch({"v": VERSION, "op": "headroom", "args": args})
 
 
@@ -63,12 +69,28 @@ def test_calm_passes_busy_fails(fake_host, tmp_path):
 
 def test_swap_rule_both_branches(fake_host, tmp_path):
     # 2000 MB swap used; mem_min 4 GB -> needs 8 GB available to ignore the swap
-    low = hr(make_daemon(fake_host("calm", avail_mb=7 * GB, swap_used_mb=2000), tmp_path))["decision"]
-    assert low["pass"] is False and low["reasons"] == ["swap used 2000 MB > 1024 MB"]
-    high = hr(make_daemon(fake_host("calm", avail_mb=8 * GB, swap_used_mb=2000), tmp_path))["decision"]
-    assert high["pass"] is True
+    low = hr(make_daemon(fake_host("calm", avail_mb=7 * GB, swap_used_mb=2000), tmp_path), swap_in=120)
+    low = low["decision"]
+    assert low["pass"] is False
+    assert low["reasons"] == ["swap used 2000 MB > 1024 MB and swapping in 120 pages/s > 50 pages/s"]
+    high = hr(make_daemon(fake_host("calm", avail_mb=8 * GB, swap_used_mb=2000), tmp_path), swap_in=120)
+    assert high["decision"]["pass"] is True  # 2 x mem_min_gb escape
     ok = hr(make_daemon(fake_host("calm", avail_mb=5 * GB, swap_used_mb=1024), tmp_path))["decision"]
     assert ok["pass"] is True  # swap <= max is allowed (not strict)
+
+
+def test_old_idle_swap_passes_and_the_rate_threshold_is_strict(fake_host, tmp_path):
+    d = make_daemon(fake_host("calm", avail_mb=7 * GB, swap_used_mb=6000), tmp_path)
+    assert hr(d)["decision"]["pass"] is True  # swap in rate 0: not swapping
+    assert hr(d, swap_in=50)["decision"]["pass"] is True  # strict: 50 is not above 50
+    r = hr(d, swap_in=51)["decision"]
+    assert r["pass"] is False and r["values"]["swap_in_rate"] == 51
+    assert hr(d, swap_in=51, overrides={"swap_in_max": 100})["decision"]["pass"] is True
+    assert hr(d, swap_in=101, overrides={"swap_in_max": 100})["decision"]["pass"] is False
+    assert hr(d, swap_in=51, overrides={"swap_max_mb": 8000})["decision"]["pass"] is True
+    assert hr(d, swap_in=51, overrides={"swap_in_max": -1})["error"] == "bad_request"
+    r = hr(d, swap_in=51, kind="review")["decision"]  # the review lane ignores swap
+    assert r["pass"] is True
 
 
 def test_mem_and_mem_psi_and_strict_boundaries(fake_host, tmp_path):
@@ -82,7 +104,7 @@ def test_mem_and_mem_psi_and_strict_boundaries(fake_host, tmp_path):
 
 
 def test_proj_a_impl_thresholds_differ_from_proj_b(fake_host, tmp_path):
-    host = fake_host("calm", load1=5.5, load5=5.9, cpu_psi=(0.0, 45.0), avail_mb=int(6.5 * GB))
+    host = fake_host("calm", load1=5.5, load5=5.9, busy_pct=85.0, cpu_psi=(0.0, 45.0), avail_mb=int(6.5 * GB))
     d = make_daemon(host, tmp_path)
     assert hr(d, "impl", "proj-a")["decision"]["pass"] is True
     r = hr(d, "impl", "proj-b")["decision"]
@@ -167,7 +189,7 @@ def test_headroom_bad_args(fake_host, tmp_path, args):
 def test_headroom_not_ready(fake_host, tmp_path):
     d = make_daemon(fake_host("calm"), tmp_path)
     d.status = None
-    assert hr(d)["error"] == "not_ready"
+    assert hr(d)["error"] == "starting"
 
 
 def test_stale_sample_is_not_ready(fake_host, tmp_path):
@@ -192,6 +214,7 @@ def test_thresholds_defaults_and_nproc_expressions():
     assert (b.load1_max, b.load5_max, b.psi_max, b.mem_min_gb) == (6, None, 50, 6)
     assert thresholds(h, "review", "proj-a", 8).load1_max == 8
     assert thresholds(h, "compile", "proj-a", 8) == thresholds(h, "compile", None, 8)
+    assert (t.swap_max_mb, t.swap_in_max) == (1024, 50)
 
 
 def test_config_overrides_and_validation():
@@ -215,12 +238,16 @@ psi_max = 35
     assert (g.confirm_s, g.load1_max, g.mem_min_gb, g.psi_max) == (30, 8, 5, 50)  # project beats kind
     assert thresholds(cfg.headroom, "gate", None, 8).load1_max == 4
     assert thresholds(cfg.headroom, "impl", "other", 8).psi_max == 35
+    cfg = parse_config("[headroom.kinds.impl]\nswap_in_max = 200\n")
+    assert thresholds(cfg.headroom, "impl", None, 8).swap_in_max == 200
     for bad in (
         "[headroom]\nx = 1",
         "[headroom.kinds.nope]\npsi_max = 1",
         '[headroom.kinds.impl]\nload1_max = "cores-2"',
         '[headroom.kinds.impl]\npsi_max = "nproc"',
         "[projects.p.kinds.impl]\npsi_max = -1",
+        "[headroom.kinds.impl]\nswap_in_max = -1",
+        '[headroom.kinds.impl]\nswap_in_max = "fast"',
         "[projects.p.kinds.impl]\nbogus = 1",
         '[headroom]\nio_psi_gate = "yes"',
     ):
@@ -262,7 +289,7 @@ def test_nonpositive_load_limit_fails_the_decision_with_a_reason(fake_host, tmp_
 def wire(monkeypatch, d):
     """A fake daemon whose clock and sample time advance 1 s per request (a new sample every query)."""
 
-    def req(_sock, op, args):
+    def req(_sock, op, args, **_k):
         d.t += 1
         d.status["at"] = stamp(d.t)
         d.status["at_ms"] = int(d.t * 1000)
@@ -349,7 +376,7 @@ def test_wait_succeeds_when_host_calms_down(fake_host, tmp_path, monkeypatch, ca
 def test_wait_same_sample_twice_is_never_ok(monkeypatch, fake_host, tmp_path, capsys):
     d = make_daemon(fake_host("calm"), tmp_path)
     monkeypatch.setattr(
-        loadctl, "request", lambda _s, op, args: d.dispatch({"v": VERSION, "op": op, "args": args})
+        loadctl, "request", lambda _s, op, args, **_k: d.dispatch({"v": VERSION, "op": op, "args": args})
     )  # the daemon never takes a new sample
     assert loadctl.main(["wait", "--kind", "impl", "--timeout", "100"], sleep=Sleeper()) == 1
     c = capsys.readouterr()
@@ -395,7 +422,9 @@ def test_wait_daemon_unreachable_exits_3(tmp_path, capsys):
 
 
 def test_wait_daemon_error_exits_5(monkeypatch, capsys):
-    monkeypatch.setattr(loadctl, "request", lambda *_a: {"ok": False, "error": "internal", "message": "x"})
+    monkeypatch.setattr(
+        loadctl, "request", lambda *_a, **_k: {"ok": False, "error": "internal", "message": "x"}
+    )
     assert loadctl.main(["wait", "--kind", "gate"], sleep=Sleeper()) == 5
 
 
@@ -410,7 +439,7 @@ def test_wait_retries_not_ready_inside_the_budget(fake_host, tmp_path, monkeypat
     wire(monkeypatch, d)
     real, left = loadctl.request, [3]
 
-    def flaky(sock, op, args):
+    def flaky(sock, op, args, **_k):
         if left[0] > 0:
             left[0] -= 1
             return {"ok": False, "error": "not_ready", "message": "no sample yet"}
@@ -424,7 +453,9 @@ def test_wait_retries_not_ready_inside_the_budget(fake_host, tmp_path, monkeypat
 
 
 def test_wait_not_ready_forever_times_out_with_exit_1_not_5(monkeypatch, capsys):
-    monkeypatch.setattr(loadctl, "request", lambda *_a: {"ok": False, "error": "not_ready", "message": "x"})
+    monkeypatch.setattr(
+        loadctl, "request", lambda *_a, **_k: {"ok": False, "error": "not_ready", "message": "x"}
+    )
     sl = Sleeper()
     assert loadctl.main(["wait", "--kind", "gate", "--timeout", "12"], sleep=sl) == 1
     assert sl.calls == [5, 5, 2]  # the last nap is cut to the budget
@@ -436,7 +467,7 @@ def test_wait_goes_not_ready_mid_wait_and_recovers(fake_host, tmp_path, monkeypa
     wire(monkeypatch, d)
     real, state = loadctl.request, {"n": 0}
 
-    def flaky(sock, op, args):
+    def flaky(sock, op, args, **_k):
         state["n"] += 1
         if state["n"] == 2:  # the daemon restarts between two polls
             return {"ok": False, "error": "not_ready", "message": "no sample yet"}
@@ -451,7 +482,7 @@ def test_wait_compares_samples_at_sub_second_resolution(fake_host, tmp_path, mon
     d = make_daemon(fake_host("calm"), tmp_path)
     box = {"ms": 1_000}
 
-    def req(_s, op, args):
+    def req(_s, op, args, **_k):
         box["ms"] += 400  # two samples inside one second: the same `sample_at`
         d.status["at"] = "2025-11-10T20:00:00Z"
         d.status["at_ms"] = box["ms"]
@@ -468,7 +499,7 @@ def test_wait_failed_confirm_rechecks_before_sleeping_a_poll(fake_host, tmp_path
     wire(monkeypatch, d)
     real, seen = loadctl.request, []
 
-    def spy(sock, op, args):
+    def spy(sock, op, args, **_k):
         r = real(sock, op, args)
         seen.append(("q", r["decision"]["pass"]))
         return r
@@ -509,3 +540,19 @@ def test_sample_key_compares_replies_of_different_daemon_versions():
     assert loadctl.sample_key(
         {"sample_at": "2025-11-10T20:00:00Z", "sample_at_ms": None}
     ) == loadctl.sample_key(old)
+
+
+def test_wait_startup_budget_outlasts_the_clients_30_s_retry(monkeypatch, capsys):
+    """No --timeout: a starting daemon is waited for 120 s (own budget), and the client never retries."""
+    seen = []
+
+    def starting(_s, op, args=None, **kw):
+        seen.append(kw)
+        return {"ok": False, "error": "starting", "message": "no sample yet"}
+
+    monkeypatch.setattr(loadctl, "request", starting)
+    sl = Sleeper()
+    assert loadctl.main(["wait", "--kind", "gate"], sleep=sl) == 1
+    assert sum(sl.calls) == 120 and sum(sl.calls) > 30
+    assert all(kw == {"ready_wait": 0} for kw in seen)
+    assert "HEADROOM_TIMEOUT job daemon not ready after 120s" in capsys.readouterr().err

@@ -108,6 +108,21 @@ def read_int(fs: HostFS, cgroup: str, name: str) -> int | None:
         return None
 
 
+def effective_memory_min(fs: HostFS, pid: str = "self") -> int:
+    """Bytes of memory protection the process's cgroup really has: the least `memory.min` from its
+    cgroup up to (not including) the root, since cgroup v2 caps a child's protection at its parents'.
+    0 when any level is 0 or its file is missing, or when the cgroup cannot be read."""
+    try:
+        line = next(ln for ln in fs.proc(f"{pid}/cgroup").splitlines() if ln.startswith("0::"))
+    except (OSError, StopIteration):
+        return 0
+    parts = [p for p in line[3:].strip().split("/") if p]
+    if not parts:
+        return 0
+    mins = [read_int(fs, "/" + "/".join(parts[:i]), "memory.min") for i in range(len(parts), 0, -1)]
+    return min(m if m is not None else 0 for m in mins)
+
+
 def read_events(fs: HostFS, cgroup: str, name: str = "memory.events") -> dict[str, int] | None:
     """A flat-keyed file (`memory.events`): `{"oom_kill": 3, ...}`; None when the file is gone."""
     try:

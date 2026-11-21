@@ -11,9 +11,11 @@ import re
 import signal
 import subprocess
 
+from loadgov.config import KINDS
 from loadgov.daemon.principal import caller_info, cgroup_of, is_self_or_descendant, owner_denial
 from loadgov.engines.limits import iso
 from loadgov.engines.slots import OWNER_ORIGIN, SLOT_FILES, parse_stat, pid_alive
+from loadgov.keys import key_error
 from loadgov.sample import _holder_has_lock_open, _kernel_lockers, _lock_identity
 
 _BAD_TEXT = re.compile(r"[\x00-\x1f\x7f]")
@@ -97,13 +99,21 @@ def handle(d, op: str, args: dict, peer_pid: int | None) -> dict:
         return _err("bad_request", "timeout_s must be a number")
     if t is not None and t <= 0:
         return _err("invalid_args", "timeout_s must be > 0")
+    key = args.get("key")
+    if key is not None and (why := key_error(key)):
+        return _err("bad_request" if not isinstance(key, str) else "invalid_args", why)
+    kind = args.get("kind")
+    if kind is not None and kind not in KINDS:
+        return _err("invalid_args", f"kind must be one of: {', '.join(KINDS)}")
     if not isinstance(args.get("client_lock", False), bool):
         return _err("bad_request", "client_lock must be a boolean")
     if d.slots.enforce and not args.get("client_lock"):
         return _err("invalid_args", "enforce mode requires --fd N or loadctl run: the client holds the lock")
     if not pid_alive(pid):
         return _err("invalid_args", f"holder pid {pid} is not running")
-    reply = d.slots.acquire(names[0], project, label, pid, wait, t, args.get("client_lock") is True)
+    reply = d.slots.acquire(
+        names[0], project, label, pid, wait, t, args.get("client_lock") is True, peer_pid, kind, key
+    )
     d._after_change({**ctx, "project": project})
     return reply
 

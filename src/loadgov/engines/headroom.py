@@ -19,6 +19,7 @@ class Decision:
     paused: list[str] = field(default_factory=list)
     thresholds: dict = field(default_factory=dict)  # the applied (profile-scaled) thresholds
     factor: dict = field(default_factory=dict)
+    reason: str = ""  # one line naming the lane that decided (review lane only; "" for the load lane)
 
     def to_dict(self) -> dict:
         d = asdict(self)
@@ -79,9 +80,10 @@ def decide(
     v = {
         "load1": sample["cpu"]["load1"],
         "load5": sample["cpu"]["load5"],
-        "cpu_psi": sample["cpu"]["psi_some_avg60"],
+        "cpu_psi": sample["cpu"]["psi_effective"],
         "mem_gb": sample["memory"]["avail_mb"] / 1024,
         "swap_mb": sample["swap"]["used_mb"],
+        "swap_in_rate": sample["swap"].get("in_rate", 0.0),
         "mem_psi": sample["memory"]["psi_some_avg60"],
         "io_psi": sample["io"]["psi_some_avg60"],
         "cpus": sample["host"]["cores"],
@@ -95,8 +97,16 @@ def decide(
         why.append(f"cpu psi {v['cpu_psi']:.1f}% >= {th.psi_max:g}%")
     if not v["mem_gb"] >= th.mem_min_gb:
         why.append(f"mem available {v['mem_gb']:.1f} GB < {th.mem_min_gb:g} GB")
-    if not (v["swap_mb"] <= th.swap_max_mb or v["mem_gb"] >= 2 * th.mem_min_gb):
-        why.append(f"swap used {v['swap_mb']} MB > {th.swap_max_mb:g} MB")
+    # Old swap alone is no reason to wait: it blocks only while pages are actively swapped back in.
+    if (
+        v["swap_mb"] > th.swap_max_mb
+        and v["swap_in_rate"] > th.swap_in_max
+        and v["mem_gb"] < 2 * th.mem_min_gb
+    ):
+        why.append(
+            f"swap used {v['swap_mb']} MB > {th.swap_max_mb:g} MB and swapping in "
+            f"{v['swap_in_rate']:.0f} pages/s > {th.swap_in_max:g} pages/s"
+        )
     if not v["mem_psi"] < th.mem_psi_max:
         why.append(f"mem psi {v['mem_psi']:.1f}% >= {th.mem_psi_max:g}%")
     why += [f"paused: {p}" for p in paused]
@@ -111,4 +121,59 @@ def decide(
         paused,
         asdict(th) | {"io_psi_max": io_psi_max, "io_psi_gate": io_psi_gate},
         {k: round(x, 4) for k, x in factor.items()},
+    )
+
+
+def decide_review(
+    sample: dict,
+    th: Thresholds,
+    *,
+    running: int,
+    max_reviewers: int,
+    ram_floor_gb: float = 0.0,
+    guard_paused: bool = False,
+    factor: dict | None = None,
+    io_psi_gate: bool = False,
+    io_psi_max: float = 25.0,
+    paused: list[str] | None = None,
+) -> Decision:
+    """The review lane: a review reads code and makes little CPU load, so load, PSI and swap do not apply.
+    Only the memory floor and the parallel cap (`running` registered review jobs < `max_reviewers`) do.
+    The floor is at least the profile's `ram_floor_gb` (the memory guard's low level), and no review starts
+    while the memory guard is pausing work (`guard_paused`)."""
+    factor = factor or {"load": 1.0, "mem_add_gb": 0.0}
+    th = scale(th, factor)
+    th = replace(th, mem_min_gb=max(th.mem_min_gb, ram_floor_gb))
+    paused = paused or []
+    mem_gb = sample["memory"]["avail_mb"] / 1024
+    v = {
+        "load1": sample["cpu"]["load1"],
+        "load5": sample["cpu"]["load5"],
+        "cpu_psi": sample["cpu"]["psi_some_avg60"],
+        "mem_gb": mem_gb,
+        "swap_mb": sample["swap"]["used_mb"],
+        "mem_psi": sample["memory"]["psi_some_avg60"],
+        "io_psi": sample["io"]["psi_some_avg60"],
+        "cpus": sample["host"]["cores"],
+        "reviewers": running,
+        "max_reviewers": max_reviewers,
+    }
+    why = []
+    if not running < max_reviewers:
+        why.append(f"review lane: {running} of {max_reviewers} reviewers running")
+    if not mem_gb >= th.mem_min_gb:
+        why.append(f"mem available {mem_gb:.1f} GB < {th.mem_min_gb:g} GB")
+    if guard_paused:
+        why.append("memory guard is pausing work")
+    why += [f"paused: {p}" for p in paused]
+    over_io = not v["io_psi"] < io_psi_max
+    return Decision(
+        not why,
+        why,
+        over_io,
+        {k: round(x, 2) if isinstance(x, float) else x for k, x in v.items()},
+        paused,
+        asdict(th) | {"io_psi_max": io_psi_max, "io_psi_gate": io_psi_gate},
+        {k: round(x, 4) for k, x in factor.items()},
+        f"review lane: {running} of {max_reviewers} reviewers running, {mem_gb:.1f} GB free",
     )

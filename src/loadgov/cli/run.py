@@ -164,6 +164,7 @@ def add_run_parser(sub) -> None:
     r.add_argument("--kind", required=True, choices=KINDS)
     r.add_argument("--project", required=True)
     r.add_argument("--label", required=True)
+    r.add_argument("--key", help="issue key of this work, e.g. PROJ-42 (default: $LOADGOV_KEY)")
     r.add_argument("--floor-mb", type=int, help="kill the job when MemAvailable falls below this (MB)")
     r.add_argument("--on-floor", choices=["kill"], default="kill")
     r.add_argument(
@@ -260,6 +261,10 @@ def run_command(a, deps: Deps | None = None) -> int:
     if a.floor_mb is not None and a.floor_mb <= 0:
         print("loadctl run: --floor-mb must be > 0", file=sys.stderr)
         return 2
+    key, why = loadctl.resolve_key(a)
+    if why:
+        print(f"loadctl run: {why}", file=sys.stderr)
+        return 2
     slot = KIND_SLOT.get(a.kind)
     try:
         r = loadctl.request(a.socket, "status")
@@ -270,6 +275,7 @@ def run_command(a, deps: Deps | None = None) -> int:
             ns = argparse.Namespace(
                 socket=a.socket, slot=slot, project=a.project, label=a.label, pid=d.pid,
                 wait=not a.no_wait, fd=None, open_lock=True, timeout_s=None,
+                kind=a.kind, key=key,
             )  # fmt: skip
             rc = loadctl.slot_acquire(ns, out=sys.stderr, sleep=d.sleep)
             if rc:
@@ -278,7 +284,7 @@ def run_command(a, deps: Deps | None = None) -> int:
         lock_fd = ns.lock_fd if slot else None
         bound = {}
         try:
-            return _run_held(a, d, cmd, slot, lock_fd, bound)
+            return _run_held(a, d, cmd, slot, lock_fd, bound, key)
         finally:
             if held and not bound.get("slot"):  # a bound slot is released when the scope empties
                 _release(a, slot, d.pid)
@@ -291,7 +297,9 @@ def run_command(a, deps: Deps | None = None) -> int:
         return 130
 
 
-def _run_held(a, d: Deps, cmd: list[str], slot: str | None, lock_fd: int | None, bound: dict) -> int:
+def _run_held(
+    a, d: Deps, cmd: list[str], slot: str | None, lock_fd: int | None, bound: dict, key: str | None = None
+) -> int:
     rc = _headroom(a, d, slot)
     if rc:
         return rc
@@ -338,11 +346,13 @@ def _run_held(a, d: Deps, cmd: list[str], slot: str | None, lock_fd: int | None,
             cgroup = d.find_cgroup(proc.pid, scope_unit, slice_)
             for signum in dict.fromkeys(caught):  # one that came before the scope existed
                 kill_scope(signum)
-            reply = loadctl.request(
-                a.socket, "job_start",
-                {"kind": a.kind, "project": a.project, "label": a.label, "unit": scope_unit,
-                 "cgroup": cgroup, "pid": proc.pid, "owner_pid": d.pid, **({"slot": slot} if slot else {})},
-            )  # fmt: skip
+            job = {"kind": a.kind, "project": a.project, "label": a.label, "unit": scope_unit,
+                   "cgroup": cgroup, "pid": proc.pid, "owner_pid": d.pid}  # fmt: skip
+            if slot:
+                job["slot"] = slot
+            if key:
+                job["key"] = key
+            reply = loadctl.request(a.socket, "job_start", job)
             registered = bool(reply.get("ok"))
             if registered and slot:
                 bound["slot"] = bool(reply.get("bound"))

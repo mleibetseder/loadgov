@@ -273,6 +273,31 @@ def test_disabled_runtime_does_not_detect(tmp_path):
     assert r.events == []
 
 
+def test_max_and_swap_fail_counters_track_deltas_since_baseline_and_render_in_status(rig, fake_host):
+    from test_loadctl import status as base_status
+
+    from loadgov.cli import loadctl
+
+    rig.put(rig.slice, "memory.events", "max 10\noom_kill 0\noom_group_kill 0")
+    rig.put(rig.slice, "memory.swap.events", "max 20\nfail 20")
+    rig.rt.tick()  # first tick takes the baseline
+    assert rig.rt.status()["max_events"] == 0 and rig.rt.status()["swap_fail_events"] == 0
+    st = base_status(fake_host("calm"))
+    st["backstop"] = rig.rt.status()
+    assert "max hit" not in loadctl.format_status(st) and "swap fail" not in loadctl.format_status(st)
+    rig.put(rig.slice, "memory.events", "max 17\noom_kill 0\noom_group_kill 0")
+    rig.put(rig.slice, "memory.swap.events", "max 32\nfail 32")
+    rig.rt.tick()
+    assert rig.rt.status()["max_events"] == 7 and rig.rt.status()["swap_fail_events"] == 12
+    st["backstop"] = rig.rt.status()
+    line = [ln for ln in loadctl.format_status(st).splitlines() if ln.startswith("  backstop ")][0]
+    assert "7 max hit(s), 12 swap fail(s)" in line
+    rig.put(rig.slice, "memory.events", "max 2\noom_kill 0\noom_group_kill 0")  # counter reset: new baseline
+    rig.put(rig.slice, "memory.swap.events", "max 3\nfail 3")
+    rig.rt.tick()
+    assert rig.rt.status()["max_events"] == 7 and rig.rt.status()["swap_fail_events"] == 12
+
+
 # ---- through the daemon ---------------------------------------------------------------------------
 
 

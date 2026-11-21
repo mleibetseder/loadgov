@@ -64,6 +64,20 @@ fi
 install -m 0644 "$src/packaging/systemd/loadgovd.service" /etc/systemd/system/loadgovd.service
 install -m 0644 "$src/packaging/systemd/build-work.slice" /etc/systemd/system/build-work.slice
 
+# loadgovd.service's MemoryMin only protects as far as system.slice's (cgroup v2 caps a child at its parents').
+# Install the drop-in unless system.slice already reserves at least as much through another file (never lower
+# an admin's value); once ours is installed it is refreshed in place.
+dropin_dir=/etc/systemd/system/system.slice.d
+dropin="$dropin_dir/50-loadgov-memorymin.conf"
+want=$((96 * 1024 * 1024))
+have=$(systemctl show system.slice -p MemoryMin --value 2>/dev/null || true)
+if [ -e "$dropin" ] || ! [[ "$have" =~ ^[0-9]+$ ]] || [ "$have" -lt "$want" ]; then
+  install -d -m 0755 "$dropin_dir"
+  install -m 0644 "$src/packaging/systemd/system.slice.d/50-loadgov-memorymin.conf" "$dropin"
+else
+  echo "install.sh: system.slice already has MemoryMin=$have; left alone"
+fi
+
 # One child slice per configured project; the names come from the same function `loadctl run` uses.
 if [ -f "$conf" ]; then
   while IFS= read -r name; do projects+=("$name"); done < <(

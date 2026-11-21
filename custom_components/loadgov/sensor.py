@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 
 from homeassistant.components.sensor import (
@@ -15,8 +17,9 @@ from homeassistant.components.sensor import (
 from homeassistant.const import PERCENTAGE, EntityCategory, UnitOfInformation
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
+from homeassistant.util import dt as dt_util
 
-from .const import FEATURE_FREEZE, FEATURE_REAP, PROFILE_LABELS, REQUIRES_FREEZE
+from .const import FEATURE_FREEZE, FEATURE_REAP, LEVELS, PROFILE_LABELS, REQUIRES_FREEZE
 from .coordinator import LoadgovConfigEntry, LoadgovCoordinator
 from .entity import LoadgovEntity, dig
 
@@ -104,6 +107,22 @@ SENSORS = (
         icon="mdi:lock",
     ),
     LoadgovSensorDescription(
+        key="load_1min", name_text="Host Load 1 min", value_fn=lambda s: dig(s, "cpu.load1"),
+        icon="mdi:gauge", state_class=SensorStateClass.MEASUREMENT, suggested_display_precision=2,
+    ),
+    LoadgovSensorDescription(
+        key="load_5min", name_text="Host Load 5 min", value_fn=lambda s: dig(s, "cpu.load5"),
+        icon="mdi:gauge", state_class=SensorStateClass.MEASUREMENT, suggested_display_precision=2,
+    ),
+    LoadgovSensorDescription(
+        key="load_per_core", name_text="Host Load per Core", value_fn=lambda s: dig(s, "cpu.load1_per_core"),
+        icon="mdi:gauge", state_class=SensorStateClass.MEASUREMENT, suggested_display_precision=2,
+    ),
+    LoadgovSensorDescription(
+        key="level", name_text="Host Level", value_fn=lambda s: dig(s, "level"),
+        icon="mdi:traffic-light", device_class=SensorDeviceClass.ENUM, options=list(LEVELS),
+    ),
+    LoadgovSensorDescription(
         key="paused_workers", name_text="Host Paused Workers", value_fn=lambda s: len(dig(s, "stopped", [])),
         icon="mdi:pause-circle", state_class=SensorStateClass.MEASUREMENT,
     ),
@@ -119,8 +138,32 @@ async def async_setup_entry(
             LoadgovFeaturesSensor(entry.runtime_data),
             LoadgovTriggersSensor(entry.runtime_data),
             LoadgovStraysSensor(entry.runtime_data),
+            *(LoadgovSlotNextSensor(entry.runtime_data, slot) for slot in SLOTS),
+            *(LoadgovSlotHolderEtaSensor(entry.runtime_data, slot) for slot in SLOTS),
+            LoadgovRunningJobsSensor(entry.runtime_data),
         ]
     )
+
+    # Per-project compute: one CPU and one memory sensor per project name the status has ever shown,
+    # created when the project first appears. A project that leaves the status goes unavailable.
+    coordinator = entry.runtime_data
+    known: set[str] = set()
+
+    def _add_projects() -> None:
+        new = [n for n in _projects(coordinator.data or {}) if n not in known]
+        if not new:
+            return
+        known.update(new)
+        async_add_entities(
+            [
+                cls(coordinator, n)
+                for n in new
+                for cls in (LoadgovProjectCpuSensor, LoadgovProjectMemorySensor)
+            ]
+        )
+
+    _add_projects()
+    entry.async_on_unload(coordinator.async_add_listener(_add_projects))
 
 
 class LoadgovFeaturesSensor(LoadgovEntity, SensorEntity):
@@ -227,3 +270,185 @@ class LoadgovStraysSensor(LoadgovEntity, SensorEntity):
             for i in (strays.get("items") or [])[:STRAY_MAX_ITEMS]
         ]
         return {"items": items, "enforce": strays.get("enforce")}
+
+
+QUEUE_MAX_ITEMS = 10
+JOBS_MAX_ITEMS = 10
+SLOTS = ("heavy", "compile")
+QUEUE_ATTRS = ("position", "project", "label", "kind", "key", "url", "wait_s", "eta")
+JOB_ATTRS = ("kind", "project", "label", "key", "url", "slot", "since", "eta", "overdue")
+
+
+def _timestamp(value: Any) -> datetime | None:
+    """A UTC time string of the status as an aware datetime; None when absent or malformed."""
+    if not isinstance(value, str):
+        return None
+    parsed = dt_util.parse_datetime(value)
+    if parsed is None:
+        return None
+    return dt_util.as_utc(parsed) if parsed.tzinfo else parsed.replace(tzinfo=dt_util.UTC)
+
+
+def _list(value: Any) -> list[dict[str, Any]]:
+    return [i for i in value if isinstance(i, dict)] if isinstance(value, list) else []
+
+
+class LoadgovSlotNextSensor(LoadgovEntity, SensorEntity):
+    """Head of a slot's queue: `<key or label>`, or `none` when nobody waits. Unavailable when the daemon
+    is older and publishes no `waiters`. The list attribute is kept out of the recorder."""
+
+    _domain = "sensor"
+    _attr_icon = "mdi:format-list-numbered"
+    _unrecorded_attributes = frozenset({"queue"})
+
+    def __init__(self, coordinator: LoadgovCoordinator, slot: str) -> None:
+        super().__init__(coordinator, f"{slot}_slot_next", f"Host {slot.capitalize()} Slot Next")
+        self._slot = slot
+
+    @property
+    def _waiters(self) -> list[dict[str, Any]] | None:
+        waiters = dig(self.status, f"slots.{self._slot}.waiters")
+        if not isinstance(waiters, list):
+            return None
+        return sorted(_list(waiters), key=lambda w: w.get("position") or 0)
+
+    @property
+    def available(self) -> bool:
+        return super().available and self._waiters is not None
+
+    @property
+    def native_value(self) -> str | None:
+        waiters = self._waiters
+        if waiters is None:
+            return None
+        return (waiters[0].get("key") or waiters[0].get("label") or "none") if waiters else "none"
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any] | None:
+        waiters = self._waiters
+        if waiters is None:
+            return None
+        attrs: dict[str, Any] = {
+            "count": len(waiters),
+            "queue": [{k: w.get(k) for k in QUEUE_ATTRS} for w in waiters[:QUEUE_MAX_ITEMS]],
+        }
+        if waiters:
+            attrs["project"] = waiters[0].get("project")
+        return attrs
+
+
+class LoadgovSlotHolderEtaSensor(LoadgovEntity, SensorEntity):
+    """Expected finish of the job that holds a slot (`jobs[].eta`); no state while the slot is free or the
+    daemon has no estimate. A past value together with `overdue` means the job runs longer than usual."""
+
+    _domain = "sensor"
+    _attr_icon = "mdi:timer-sand"
+    _attr_device_class = SensorDeviceClass.TIMESTAMP
+
+    def __init__(self, coordinator: LoadgovCoordinator, slot: str) -> None:
+        super().__init__(coordinator, f"{slot}_slot_holder_eta", f"Host {slot.capitalize()} Slot Holder ETA")
+        self._slot = slot
+
+    @property
+    def _job(self) -> dict[str, Any] | None:
+        return next((j for j in _list(self.status.get("jobs")) if j.get("slot") == self._slot), None)
+
+    @property
+    def native_value(self) -> datetime | None:
+        job = self._job
+        return _timestamp(job.get("eta")) if job else None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any] | None:
+        job = self._job
+        if job is None:
+            return None
+        return {k: job.get(k) for k in ("key", "url", "project", "label", "kind", "expected_s", "overdue")}
+
+
+class LoadgovRunningJobsSensor(LoadgovEntity, SensorEntity):
+    """Jobs `loadctl run` has started and that still run: the state is their number."""
+
+    _domain = "sensor"
+    _attr_icon = "mdi:run-fast"
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _unrecorded_attributes = frozenset({"jobs"})
+
+    def __init__(self, coordinator: LoadgovCoordinator) -> None:
+        super().__init__(coordinator, "running_jobs", "Host Running Jobs")
+
+    @property
+    def native_value(self) -> int:
+        return len(_list(self.status.get("jobs")))
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        jobs = _list(self.status.get("jobs"))
+        return {"jobs": [{k: j.get(k) for k in JOB_ATTRS} for j in jobs[:JOBS_MAX_ITEMS]]}
+
+
+def _projects(status: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    projects = status.get("projects")
+    if not isinstance(projects, dict):
+        return {}
+    return {str(n): (b if isinstance(b, dict) else {}) for n, b in projects.items()}
+
+
+class _LoadgovProjectSensor(LoadgovEntity, SensorEntity):
+    """Base of the per-project sensors. The unique id carries the project name, so it survives restarts;
+    the entity id is a slug of it. Unavailable while the status has no such project."""
+
+    _domain = "sensor"
+    _suffix: str
+    _label: str
+
+    def __init__(self, coordinator: LoadgovCoordinator, project: str) -> None:
+        slug = re.sub(r"[^a-z0-9]+", "_", project.lower()).strip("_") or "project"
+        super().__init__(
+            coordinator, f"project_{slug}_{self._suffix}", f"Host Project {project} {self._label}"
+        )
+        self._project = project
+        self._attr_unique_id = f"{coordinator.config_entry.entry_id}_project_{project}_{self._suffix}"
+
+    @property
+    def _body(self) -> dict[str, Any] | None:
+        return _projects(self.status).get(self._project)
+
+    @property
+    def available(self) -> bool:
+        return super().available and self._body is not None
+
+
+class LoadgovProjectCpuSensor(_LoadgovProjectSensor):
+    _suffix = "cpu"
+    _label = "CPU"
+    _attr_icon = "mdi:cpu-64-bit"
+    _attr_native_unit_of_measurement = "cores"
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_suggested_display_precision = 2
+
+    @property
+    def native_value(self) -> float | None:
+        cores = (self._body or {}).get("cores")
+        return round(cores, 2) if isinstance(cores, int | float) else None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any] | None:
+        body = self._body
+        if body is None:
+            return None
+        return {k: body.get(k) for k in ("cpu_pct", "docker_cpu_pct", "jobs", "waiting")}
+
+
+class LoadgovProjectMemorySensor(_LoadgovProjectSensor):
+    _suffix = "memory"
+    _label = "Memory"
+    _attr_icon = "mdi:memory"
+    _attr_device_class = SensorDeviceClass.DATA_SIZE
+    _attr_native_unit_of_measurement = UnitOfInformation.MEGABYTES
+    _attr_state_class = SensorStateClass.MEASUREMENT
+
+    @property
+    def native_value(self) -> int | float | None:
+        mem = (self._body or {}).get("mem_mb")
+        return mem if isinstance(mem, int | float) else None

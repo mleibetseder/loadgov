@@ -143,7 +143,7 @@ def _variables(step, ctx):
         text = env.from_string(val).render(**out).strip()
         try:
             out[name] = ast.literal_eval(text)
-        except (ValueError, SyntaxError):
+        except ValueError, SyntaxError:
             out[name] = text
     return out
 

@@ -15,6 +15,7 @@ def status(host):
         "mode": "observe",
         "enforce": {"governor": False, "slots": False, "memguard": False, "reaper": False},
         "tick_s": 5.0,
+        "memory_protection_mb": 96,
     }
     return out
 
@@ -166,3 +167,12 @@ def test_stray_kill_sends_the_op_and_reports_a_refusal(monkeypatch, capsys):
         ("stray_kill", {"pid": 7, "start_time": 99, "owner": True, "reason": "leak"}),
         ("stray_kill", {"pid": 8, "owner": True}),
     ]
+
+
+def test_status_warns_only_when_memory_protection_is_zero(fake_host):
+    st = status(fake_host("calm"))
+    assert "warn" not in loadctl.format_status(st)
+    st["daemon"]["memory_protection_mb"] = 0
+    assert loadctl.format_status(st).splitlines()[-1] == (
+        "  warn  memory protection 0 MB: set MemoryMin on system.slice (docs/deployment.md)"
+    )

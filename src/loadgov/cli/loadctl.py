@@ -19,7 +19,8 @@ import time
 from loadgov.cli.client import DaemonUnavailable, request
 from loadgov.cli.history import add_history_parser, from_file, render, wants_file
 from loadgov.config import KINDS
-from loadgov.protocol import DEFAULT_SOCKET
+from loadgov.keys import KEY_ENV, key_error
+from loadgov.protocol import DEFAULT_SOCKET, STARTING
 
 EXIT_UNAVAILABLE = 3
 EXIT_DENIED = 4
@@ -33,6 +34,27 @@ def _local_time(at: str) -> str:
     except ValueError:
         return at.replace("T", " ").rstrip("Z")
     return t.astimezone().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _hm(at: str | None) -> str:
+    """Local HH:MM of a status timestamp."""
+    try:
+        t = datetime.datetime.fromisoformat((at or "").replace("Z", "+00:00"))
+    except ValueError:
+        return at or "?"
+    return t.astimezone().strftime("%H:%M")
+
+
+def _span(seconds: int) -> str:
+    return f"{seconds // 60}m" if seconds >= 60 else f"{seconds}s"
+
+
+def resolve_key(a: argparse.Namespace, env=None) -> tuple[str | None, str | None]:
+    """(key, error): `--key`, else $LOADGOV_KEY; empty counts as unset. The shape is checked here too, so
+    a bad key stops the command before anything is queued or started."""
+    key = getattr(a, "key", None) or (os.environ if env is None else env).get(KEY_ENV) or None
+    why = key_error(key) if key is not None else None
+    return (None, why) if why else (key, None)
 
 
 def format_stray(it: dict) -> str:
@@ -60,15 +82,70 @@ def format_hwmon(s: dict) -> str:
 def _lim(e: dict) -> str:
     return (
         f"cores {e['max_cores']:g}, cpu {e['target_cpu_pct']:g} %, load {e['load_max']:g}, "
-        f"impl {e['max_implementers']}, ram floor {e['ram_floor_gb']:g} GB"
+        f"impl {e['max_implementers']}, reviewers {e['max_reviewers']}, ram floor {e['ram_floor_gb']:g} GB"
     )
+
+
+def _n(v, fmt: str = "g") -> str:
+    return "-" if v is None else format(v, fmt)
+
+
+def format_job_eta(r: dict) -> str:
+    if r.get("overdue"):
+        return " overdue"
+    return f" eta {_hm(r['eta'])}" if r.get("eta") else ""
+
+
+def format_jobs(rows: list) -> str:
+    if not rows:
+        return "no jobs running"
+    return "\n".join(
+        f"{r['project']} {r['kind']} {r.get('key') or r['label']} pid {r['pid']} since {r['since']}"
+        + format_job_eta(r)
+        for r in rows
+    )
+
+
+def format_waiters(sl: dict) -> list[str]:
+    """One line per waiter: `next: 1. project kind KEY waiting 3m eta 18:40` (eta = expected start)."""
+    lines = []
+    for w in sl.get("waiters") or []:
+        what = " ".join(x for x in (w["project"], w.get("kind"), w.get("key") or w["label"]) if x)
+        eta = f" eta {_hm(w['eta'])}" if w.get("eta") else ""
+        lines.append(
+            f"{'next:' if w['position'] == 1 else '     '} {w['position']}. {what} "
+            f"waiting {_span(w['wait_s'])}{eta}"
+        )
+    return lines
+
+
+def format_job_stats(rows: list) -> str:
+    """A table per project and kind; seconds and MB, p50/p95 over the last 200 jobs, '-' = unknown."""
+    if not rows:
+        return "no finished jobs recorded"
+    head = ("project", "kind", "jobs", "dur p50 s", "own cpu p50/p95 s", "docker cpu p50/p95 s",
+            "total cpu p50/p95 s", "host cpu p50 s", "mem peak p50/p95/max MB")  # fmt: skip
+    body = [
+        (r["project"], r["kind"], str(r["count"]), _n(r["duration_p50_s"], ".0f"),
+         f"{_n(r['cpu_p50_s'], '.1f')}/{_n(r['cpu_p95_s'], '.1f')}",
+         f"{_n(r['docker_cpu_p50_s'], '.1f')}/{_n(r['docker_cpu_p95_s'], '.1f')}",
+         f"{_n(r['total_cpu_p50_s'], '.1f')}/{_n(r['total_cpu_p95_s'], '.1f')}",
+         _n(r["host_cpu_p50_s"], ".1f"),
+         "/".join(_n(r[k], ".0f") for k in ("mem_peak_p50_mb", "mem_peak_p95_mb", "mem_peak_max_mb")))
+        for r in rows
+    ]  # fmt: skip
+    w = [max(len(x[i]) for x in (head, *body)) for i in range(len(head))]
+    return "\n".join("  ".join(c.ljust(w[i]) for i, c in enumerate(row)).rstrip() for row in (head, *body))
 
 
 def format_status(s: dict) -> str:
     lines = [format_hwmon(s).replace("hwmon ", "loadgov ", 1)]
     c, m, io = s["cpu"], s["memory"], s["io"]
+    cpu_psi = f"cpu {c['psi_some_avg10']:.0f}/{c['psi_some_avg60']:.0f}"
+    if c.get("psi_effective", c["psi_some_avg60"]) != c["psi_some_avg60"]:
+        cpu_psi += f" (throttling only, counts {c['psi_effective']:.0f})"
     lines.append(
-        f"  psi   cpu {c['psi_some_avg10']:.0f}/{c['psi_some_avg60']:.0f}  "
+        f"  psi   {cpu_psi}  "
         f"mem {m['psi_some_avg10']:.0f}/{m['psi_some_avg60']:.0f}  "
         f"io {io['psi_some_avg10']:.0f}/{io['psi_some_avg60']:.0f} % (avg10/avg60)"
     )
@@ -103,6 +180,8 @@ def format_status(s: dict) -> str:
         lines.append(
             f"  backstop memory.max {bs['memory_max_mb']} MB, swap.max {bs['memory_swap_max_mb']} MB: "
             f"{state}, {bs['oom_kills']} OOM kill(s)"
+            + (f", {bs['max_events']} max hit(s)" if bs.get("max_events") else "")
+            + (f", {bs['swap_fail_events']} swap fail(s)" if bs.get("swap_fail_events") else "")
             + (f", last {bs['last_event']}" if bs["last_event"] else "")
         )
     strays = (s.get("strays") or {}).get("items") or []
@@ -110,6 +189,15 @@ def format_status(s: dict) -> str:
         lines.append(f"  strays: {len(strays)}")
     for name, sl in s.get("slots", {}).items():
         lines.append(f"  slot  {format_slot(name, sl)}")
+        lines.extend(f"        {w}" for w in format_waiters(sl))
+    for j in s.get("jobs") or []:
+        slot = f" [{j['slot']}]" if j.get("slot") else ""
+        lines.append(
+            f"  job   {j['project']} {j['kind']} {j.get('key') or j['label']}{slot}{format_job_eta(j)}"
+        )
+    pj = format_projects(s.get("projects"))
+    if pj:
+        lines.append(f"  projects {pj}")
     lines.append(f"  jvm   {s['jvm_daemons']} Gradle/Kotlin daemon(s)")
     lines.append("  top   " + ", ".join(f"{p['comm']}({p['pcpu']:.0f}%,{p['rss_mb']}MB)" for p in s["top"]))
     if "limits" in s:
@@ -120,7 +208,24 @@ def format_status(s: dict) -> str:
     on = [k for k, v in dmn.get("enforce", {}).items() if v]
     detail = f" ({', '.join(on)})" if dmn["mode"] == "partial" else ""
     lines.append(f"  daemon {dmn['version']} pid {dmn['pid']} mode {dmn['mode']}{detail}")
+    if dmn.get("memory_protection_mb") == 0:
+        lines.append("  warn  memory protection 0 MB: set MemoryMin on system.slice (docs/deployment.md)")
     return "\n".join(lines)
+
+
+def format_projects(projects: dict | None) -> str:
+    """Busy projects by CPU: `web 2.4 cores 6.1 GB (1 job, 2 waiting)`. Idle ones are skipped."""
+    rows = []
+    for name, p in (projects or {}).items():
+        if not (p.get("jobs") or p.get("waiting") or p.get("cpu_pct")):
+            continue
+        mem = p.get("mem_mb")
+        text = f"{name} " + ("? cores" if p.get("cores") is None else f"{p['cores']:g} cores")
+        text += "" if mem is None else f" {mem / 1024:.1f} GB"
+        bits = [f"{p['jobs']} job{'s' * (p['jobs'] != 1)}"] if p.get("jobs") else []
+        bits += [f"{p['waiting']} waiting"] if p.get("waiting") else []
+        rows.append((p.get("cpu_pct") or 0, text + (f" ({', '.join(bits)})" if bits else "")))
+    return ", ".join(t for _, t in sorted(rows, key=lambda r: -r[0]))
 
 
 def format_slot(name: str, sl: dict) -> str:
@@ -129,7 +234,9 @@ def format_slot(name: str, sl: dict) -> str:
     else:
         who = sl["holder"] or "unknown"
         out = f"{name}: {sl['state']} by {who} [{sl['source']}] since {sl['held_since'] or '?'}"
+        out += f" key {sl['key']}" if sl.get("key") else ""
     out += f", {sl['queue']} waiting" if sl["queue"] else ""
+    out += f", nested: {sl['nested']}" if sl.get("nested") else ""
     out += f", hold pending ({sl['hold']})" if sl["hold"] and sl["state"] != "held-by-hold" else ""
     return out + ("  STUCK" if sl["stuck"] else "")
 
@@ -184,12 +291,16 @@ def _parser() -> argparse.ArgumentParser:
     fmt = st.add_mutually_exclusive_group()
     fmt.add_argument("--json", action="store_true", help="print the raw status JSON")
     fmt.add_argument("--hwmon", action="store_true", help="print legacy hwmon's five-line format")
+    jb = sub.add_parser("jobs", help="running `loadctl run` jobs, or with --stats what finished jobs used")
+    jb.add_argument("--stats", action="store_true", help="per project and kind: count, duration, CPU, memory")
+    jb.add_argument("--json", action="store_true")
     se = sub.add_parser("set", help="change the profile or single limits")
     se.add_argument("--profile")
     se.add_argument("--max-cores", type=float, dest="max_cores")
     se.add_argument("--target-cpu", type=float, dest="target_cpu_pct")
     se.add_argument("--load-max", type=float, dest="load_max")
     se.add_argument("--max-impl", type=int, dest="max_implementers")
+    se.add_argument("--max-reviewers", type=int, dest="max_reviewers")
     se.add_argument("--ram-floor-gb", type=float, dest="ram_floor_gb")
     se.add_argument("--owner", action="store_true", help="act as the human owner (checked by the daemon)")
     se.add_argument("--project")
@@ -226,6 +337,7 @@ def _parser() -> argparse.ArgumentParser:
         help="arbitration only, no real flock (tests); never use in a script",
     )
     sa.add_argument("--timeout", type=float, dest="timeout_s", help="give up after this many seconds")
+    sa.add_argument("--key", help=f"issue key of this work, e.g. PROJ-42 (default: ${KEY_ENV})")
     sr = ss.add_parser("release", help="release the slot held for --pid")
     sr.add_argument("slot", choices=["heavy", "compile"])
     sr.add_argument("--pid", type=int, help="holder pid, default: the parent shell of loadctl")
@@ -284,7 +396,15 @@ def _parser() -> argparse.ArgumentParser:
     return ap
 
 
-OVERRIDE_KEYS = ("load1_max", "load5_max", "psi_max", "mem_min_gb", "swap_max_mb", "mem_psi_max")
+OVERRIDE_KEYS = (
+    "load1_max",
+    "load5_max",
+    "psi_max",
+    "mem_min_gb",
+    "swap_max_mb",
+    "swap_in_max",
+    "mem_psi_max",
+)
 
 
 def run_args(sub) -> None:
@@ -348,6 +468,14 @@ def slot_acquire(a: argparse.Namespace, out=None, sleep=None) -> int:
         args["client_lock"] = True
     if a.timeout_s:
         args["timeout_s"] = a.timeout_s
+    key, why = resolve_key(a)
+    if why:
+        print(f"loadctl: {why}", file=sys.stderr)
+        return 2
+    if key:
+        args["key"] = key
+    if getattr(a, "kind", None):
+        args["kind"] = a.kind
     while True:
         try:
             reply = request(a.socket, "slot_acquire", args)
@@ -383,6 +511,8 @@ def slot_acquire(a: argparse.Namespace, out=None, sleep=None) -> int:
                 reply = {**reply, "status": "queued", "holder": "unknown (lock taken by another process)"}
         if reply["status"] == "granted":
             note = " (no lock: arbitration only)" if getattr(a, "no_lock", False) else ""
+            if reply.get("nested"):
+                note = f" (nested under {reply.get('holder')}: no new lock)"
             print(f"{tag}_SLOT_OK {who} waited={waited}s{note}", file=out)
             return 0
         if reply["status"] == "timeout" or not a.wait or (a.timeout_s and waited >= a.timeout_s):
@@ -407,6 +537,8 @@ def headroom_state(reply: dict) -> str:
     """The state text of wait-headroom.sh's HEADROOM_* lines."""
     d, th = reply["decision"], reply["thresholds"]
     v = d["values"]
+    if d.get("reason"):  # the review lane: no load or PSI in its decision
+        return d["reason"] + "".join(f" {r}" for r in d["reasons"] if r.startswith("paused:"))
     l5max = "-" if th["load5_max"] is None else f"{th['load5_max']:.2f}"
     out = (
         f"load={v['load1']:g}/{v['load5']:g} (max {th['load1_max']:.2f}/{l5max}, {v['cpus']} CPUs) "
@@ -443,8 +575,9 @@ def wait_headroom(a, sleep=time.sleep, out=None, last: dict | None = None, err=N
 
     def query() -> dict | None:
         args = {"kind": a.kind, **({"project": a.project} if a.project else {})}
-        r = request(a.socket, "headroom", {**args, **({"overrides": over} if over else {})})
-        if r.get("error") == "not_ready":
+        # ready_wait=0: the start-up wait is this function's own budget, not the client's 30 s
+        r = request(a.socket, "headroom", {**args, **({"overrides": over} if over else {})}, ready_wait=0)
+        if r.get("error") in (STARTING, "not_ready"):
             return None
         if not r.get("ok"):
             raise RuntimeError(f"{r.get('error')}: {r.get('message')}")
@@ -589,7 +722,15 @@ def main(argv: list[str] | None = None, sleep=time.sleep) -> int:
         return slot_acquire(a)
     if a.cmd == "set":
         op = "set"
-        keys = ("profile", "max_cores", "target_cpu_pct", "load_max", "max_implementers", "ram_floor_gb")
+        keys = (
+            "profile",
+            "max_cores",
+            "target_cpu_pct",
+            "load_max",
+            "max_implementers",
+            "max_reviewers",
+            "ram_floor_gb",
+        )
         args = {k: getattr(a, k) for k in (*keys, "ttl", "until", "reason", "project")}
         args["owner"] = a.owner
     elif a.cmd == "reset":
@@ -611,7 +752,7 @@ def main(argv: list[str] | None = None, sleep=time.sleep) -> int:
     elif a.cmd == "stray" and a.kill is not None:
         op = "stray_kill"
         args = {"pid": a.kill, "start_time": a.start_time, "owner": a.owner, "reason": a.reason}
-    elif a.cmd == "stray":
+    elif a.cmd == "stray" or a.cmd == "jobs":
         op = "status"
         args = {}
     elif a.cmd == "hold":
@@ -651,6 +792,12 @@ def main(argv: list[str] | None = None, sleep=time.sleep) -> int:
             print(format_stray(it))
     elif op == "stray_kill":
         print(reply["message"])
+    elif a.cmd == "jobs":
+        rows = reply["status"].get("job_stats" if a.stats else "jobs") or []
+        if a.json:
+            print(json.dumps(rows, indent=2))
+        else:
+            print(format_job_stats(rows) if a.stats else format_jobs(rows))
     elif op == "status":
         s = reply["status"]
         if a.json:
@@ -667,8 +814,10 @@ def main(argv: list[str] | None = None, sleep=time.sleep) -> int:
         else:
             for name, sl in reply["slots"].items():
                 print(format_slot(name, sl))
+                for w in format_waiters(sl):
+                    print(f"  {w}")
     elif op == "slot_release":
-        if reply["released"] and a.fd is not None:
+        if reply["released"] and a.fd is not None and not reply.get("nested"):  # the fd may be the holder's
             with contextlib.suppress(OSError):
                 fcntl.flock(a.fd, fcntl.LOCK_UN)
         print(

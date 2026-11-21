@@ -6,9 +6,10 @@ import calendar
 import os
 import re
 import time
+from collections import deque
 from dataclasses import dataclass
 
-from loadgov.engines.levels import evaluate
+from loadgov.engines.levels import effective_psi, evaluate
 from loadgov.host.procfs import HostFS
 
 JVM_DAEMONS = ("GradleDaemon", "KotlinCompileDaemon")
@@ -188,20 +189,57 @@ def _holder_has_lock_open(fs: HostFS, pid: int, ident: tuple[int, int]) -> bool:
     return False
 
 
+SWAP_RATE_WINDOW_S = 60.0
+
+
+def parse_vmstat_swap(text: str) -> tuple[int, int] | None:
+    """(pswpin, pswpout) page counters from /proc/vmstat, or None when either is missing."""
+    vals = {}
+    for line in text.splitlines():
+        k, _, v = line.partition(" ")
+        if k in ("pswpin", "pswpout") and v.strip().isdigit():
+            vals[k] = int(v)
+    return (vals["pswpin"], vals["pswpout"]) if len(vals) == 2 else None
+
+
 class Sampler:
     """Keeps the previous /proc/stat reading so each sample reports busy % over the last interval."""
 
-    def __init__(self, fs: HostFS | None = None, mirrors: tuple[str, ...] = ()):
+    def __init__(
+        self, fs: HostFS | None = None, mirrors: tuple[str, ...] = (), psi_busy_gate_pct: float = 80.0
+    ):
+        self.psi_busy_gate_pct = psi_busy_gate_pct
         self.fs = fs or HostFS()
         self.watched = {**{m: m for m in mirrors}, **WATCHED_CGROUPS}
         self.stopped_under = tuple(f"/{m}" for m in mirrors) + STOPPED_UNDER
         self._prev_cpu: tuple[int, int] | None = None
+        self._swap_hist: deque[tuple[float, int, int]] = deque()  # (time, pswpin, pswpout)
         self.cpu_times: tuple[int, int] | None = None  # (total, idle) jiffies of the latest sample
         # pid -> (start, cpu ticks, comm, rss_mb) of the latest sample; the alert engine diffs two of them
         self.proc_ticks: dict[int, tuple[int, int, str, int]] = {}
 
     def prime(self, stat_text: str | None = None) -> None:
         self._prev_cpu = parse_cpu_times(stat_text if stat_text is not None else self.fs.proc("stat"))
+
+    def _swap_rates(self, now: float) -> tuple[float, float]:
+        """Swap-in and swap-out pages/s over about the last 60 s. 0 while unknown (the first sample, an
+        unreadable /proc/vmstat, a counter reset that restarts the history), so missing data never blocks."""
+        try:
+            cur = parse_vmstat_swap(self.fs.proc("vmstat"))
+        except OSError:
+            cur = None
+        hist = self._swap_hist
+        if cur is None or (hist and (now <= hist[-1][0] or cur[0] < hist[-1][1] or cur[1] < hist[-1][2])):
+            hist.clear()
+        if cur is None:
+            return 0.0, 0.0
+        hist.append((now, *cur))
+        while len(hist) > 2 and hist[1][0] <= now - SWAP_RATE_WINDOW_S:
+            hist.popleft()
+        t0, in0, out0 = hist[0]
+        if now <= t0:
+            return 0.0, 0.0
+        return round((cur[0] - in0) / (now - t0), 1), round((cur[1] - out0) / (now - t0), 1)
 
     def sample(self, now: float | None = None) -> dict:
         fs = self.fs
@@ -214,6 +252,7 @@ class Sampler:
         psi = {k: _safe_pressure(fs, k) for k in ("cpu", "memory", "io")}
         swap_total = mem.get("SwapTotal", 0)
         swap_used = swap_total - mem.get("SwapFree", 0)
+        swap_in, swap_out = self._swap_rates(now)
         disk_free = min(round(v.f_bavail * v.f_frsize / 2**30, 1) for v in (fs.statvfs(d) for d in fs.disks))
         uptime = float(fs.proc("uptime").split()[0])
         procs = [p for p in (_read_proc(fs, pid, uptime) for pid in fs.pids()) if p]
@@ -228,6 +267,9 @@ class Sampler:
                 "busy_pct": busy,
                 "psi_some_avg10": psi["cpu"].get("some_avg10", 0.0),
                 "psi_some_avg60": psi["cpu"].get("some_avg60", 0.0),
+                "psi_effective": effective_psi(
+                    psi["cpu"].get("some_avg60", 0.0), busy, self.psi_busy_gate_pct
+                ),
                 "load1": load1,
                 "load5": load5,
                 "load1_per_core": round(load1 / fs.cpu_count, 2),
@@ -243,6 +285,8 @@ class Sampler:
                 "total_mb": swap_total,
                 "used_mb": swap_used,
                 "used_pct": round(100.0 * swap_used / swap_total, 1) if swap_total else 0.0,
+                "in_rate": swap_in,
+                "out_rate": swap_out,
             },
             "io": {
                 "psi_some_avg10": psi["io"].get("some_avg10", 0.0),

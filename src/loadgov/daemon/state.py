@@ -38,9 +38,16 @@ class StateStore:
         slots: dict | None = None,
         jobs: list | None = None,
         memguard: dict | None = None,
+        job_stats: list | None = None,
     ) -> None:
         os.makedirs(os.path.dirname(self.path), exist_ok=True)
-        body = {**asdict(state), "slots": slots or {}, "jobs": jobs or [], "memguard": memguard or {}}
+        body = {
+            **asdict(state),
+            "slots": slots or {},
+            "jobs": jobs or [],
+            "memguard": memguard or {},
+            "job_stats": job_stats or [],
+        }
         atomic_write_text(self.path, json.dumps(body, indent=1))
 
     def load_jobs(self) -> list:
@@ -48,6 +55,15 @@ class StateStore:
         try:
             with open(self.path) as f:
                 raw = json.load(f).get("jobs")
+        except (OSError, ValueError, AttributeError):
+            return []
+        return raw if isinstance(raw, list) else []
+
+    def load_job_stats(self) -> list:
+        """The saved per-(project, kind) job summaries (empty when missing or unreadable)."""
+        try:
+            with open(self.path) as f:
+                raw = json.load(f).get("job_stats")
         except (OSError, ValueError, AttributeError):
             return []
         return raw if isinstance(raw, list) else []

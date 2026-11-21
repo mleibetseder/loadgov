@@ -3,7 +3,7 @@
 # see README.md "Configure for your site".
 # Only the four profiles below exist; a table overrides just the keys it names.
 # Ranges: max_cores 1.0-6.0 step 0.5, target_cpu_pct 35-90 step 5, load_max 1.0-6.0 step 0.5,
-# max_implementers 0-4, ram_floor_gb 2.0-6.0 step 0.5.
+# max_implementers 0-4, max_reviewers 0-8, ram_floor_gb 2.0-6.0 step 0.5.
 
 default_profile = "balanced"
 
@@ -43,7 +43,7 @@ enforce = false
 # values: enabled = true without both numbers below is a config error. Fill them from the trial-run history:
 #   loadctl history --all --csv | python3 tools/backstop_sizing.py -      (after a week of history, see docs/deployment.md)
 # and state the source next to the numbers, for example:
-#   # source: backstop_sizing.py over 2026-11-14..2026-11-21, peak build-work memory.current 10240 MB, +20 %
+#   # source: backstop_sizing.py over one week of history, peak build-work memory.current 10240 MB, +20 %
 # memory_max_mb must be >= 4096; memory_swap_max_mb >= 0. With enabled = true the daemon also sets
 # memory.oom.group = 1 on every `loadctl run` job scope, so an OOM kill takes that one scope down as a group.
 # Rollback: remove this table (or enabled = false) and restart; the daemon writes `max` back (the only case).
@@ -77,11 +77,17 @@ enforce = false
 # LOADGOV_COMPILE_LOCK sets the same when this key is absent.
 # compile_lock = "host-compile-slot.lock"
 
+[keys]
+# Link template for the issue key of a queue item or job (`loadctl run --key`, LOADGOV_KEY). It must
+# contain {key}; the status field `url` is this with {key} replaced by the URL-quoted key. Empty: no links.
+# url = "https://tracker.example/issues/{key}"
+
 [profiles.silent]
 max_cores = 2.0
 target_cpu_pct = 50
 load_max = 2.0
 max_implementers = 1
+max_reviewers = 1
 cargo_build_jobs = 1
 
 [profiles.balanced]
@@ -89,6 +95,7 @@ max_cores = 3.5
 target_cpu_pct = 65
 load_max = 3.0
 max_implementers = 2
+max_reviewers = 3
 cargo_build_jobs = 2
 # Per profile, with these defaults when omitted:
 # load_hold = 5.0          # its own key, never derived from load_max
@@ -102,6 +109,7 @@ max_cores = 5.5
 target_cpu_pct = 85
 load_max = 5.0
 max_implementers = 3
+max_reviewers = 4
 cargo_build_jobs = 3
 
 [profiles.drain]
@@ -109,6 +117,7 @@ max_cores = 2.0
 target_cpu_pct = 50
 load_max = 2.0
 max_implementers = 0
+max_reviewers = 0
 cargo_build_jobs = 1
 hold_heavy_slot = true   # stored only; the hold itself is taken through the slots
 
@@ -117,11 +126,16 @@ hold_heavy_slot = true   # stored only; the hold itself is taken through the slo
 # load1_max / load5_max may be numbers or "nproc" expressions ("nproc", "nproc-2", "nproc*0.5"),
 # resolved against the host's core count when a decision is made (a result <= 0 makes every decision
 # fail with a "misconfigured" reason); load5_max = false disables it. max_wait_s = 0 waits forever.
+# Kind `review` uses the review lane: only mem_min_gb (default 2 for reviews) and the profile's
+# max_reviewers apply; load1_max, load5_max, psi_max, swap_max_mb, swap_in_max and mem_psi_max are ignored for it.
 # Load thresholds scale with the active profile (load_max / default profile's load_max) and
 # mem_min_gb rises by the profile's ram_floor_gb above the default profile's.
 [headroom]
 io_psi_gate = false      # io PSI some avg60 < 25 blocks only when true; otherwise only recorded (would_block_io)
 # io_psi_max = 25
+# CPU PSI counts as contention only while the CPU is busy: below this busy % the effective CPU PSI is 0, because a
+# throttled cgroup (docker --cpus, loadgov's own cap) raises PSI on idle cores. 0 = always use the raw value.
+# psi_busy_gate_pct = 80
 
 # Defaults for every project, per kind (all keys optional):
 # [headroom.kinds.impl]
@@ -130,6 +144,7 @@ io_psi_gate = false      # io PSI some avg60 < 25 blocks only when true; otherwi
 # psi_max = 20
 # mem_min_gb = 4
 # swap_max_mb = 1024
+# swap_in_max = 50        # pages/s swapped in (avg of ~60 s, ~200 KB/s): swap blocks only above both limits
 # mem_psi_max = 5
 # confirm_s = 60
 # poll_s = 30

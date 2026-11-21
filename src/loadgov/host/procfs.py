@@ -70,6 +70,13 @@ class HostFS:
         except OSError:
             return None
 
+    def list_cgroup(self, cgroup: str) -> list[str]:
+        """Entry names of a cgroup directory ([] when it is gone or unreadable)."""
+        try:
+            return os.listdir(os.path.join(self.cgroup_root, cgroup.lstrip("/")))
+        except OSError:
+            return []
+
     def scope_procs(self, cgroup: str) -> str | None:
         """`cgroup.procs` of a job scope: None when the cgroup is gone, including one removed between open and
         read (ENODEV: the kernel refuses rmdir of a populated cgroup, so a removed scope has no processes);

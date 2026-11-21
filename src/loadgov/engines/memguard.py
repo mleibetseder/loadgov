@@ -17,6 +17,9 @@ Every sample (a daemon tick, 5 s):
   legacy implementer trees, then project containers), skipping trees whose largest rustc is >= 2048 MB
   (a stopped rustc keeps its memory); only compiling trees left and avail < 1500 MB: abort (SIGTERM) the
   largest rustc, never anything else; above 1500 MB: HOLD;
+- the abort is also taken in the same sample as the system reap (avail < 1536 MB) when nothing else can be
+  paused, and when avail fell by at least 512 MB since the last sample so that the same fall again would
+  cross 1500 MB before the next sample (a compile of several GB kills the host faster than 5 s);
 - one action per sample; 15 s of quiet after a pause or abort, 30 s after a resume;
 - LIFO resume after `resume_samples` (3) samples with avail >= HIGH and no pressure;
 - the swap baseline only moves down, or follows swap after 120 calm samples (10 min), and is reset to the
@@ -35,6 +38,9 @@ from loadgov.engines.jvm import REAP_ALL_MB, Jvm
 from loadgov.engines.limits import iso
 
 CRIT_MB = 1500
+FALL_MIN_MB = 512  # a fall of at least this much since the last sample counts as a fast fall
+FALL_WINDOW_S = 15.0  # the last sample is no older than this
+SAMPLE_S = 5.0  # the next evaluation (the daemon tick) is this far away
 COMPILE_MB = 2048
 HIGH_MIN_MB = 6144
 SWAP_SURGE_MB = 768
@@ -168,6 +174,8 @@ class MemGuard:
         self.last: dict | None = None  # {"decision", "reason", "at"}
         self._hold_n = 0
         self._low_memory_at: float | None = None
+        self._prev: tuple[float, int] | None = None  # (monotonic, avail) of the last sample
+        self._projected: int | None = None  # avail one sample from now at the current fall, if falling fast
 
     # ---- rules -----------------------------------------------------------------------------------
 
@@ -193,6 +201,12 @@ class MemGuard:
         jvm: Callable[[], list[Jvm]],
     ) -> list[Action]:
         mono = self.monotonic()
+        self._projected = None
+        prev = self._prev
+        if prev and 0 < mono - prev[0] <= FALL_WINDOW_S and prev[1] - avail_mb >= FALL_MIN_MB:
+            rate = (prev[1] - avail_mb) / (mono - prev[0])
+            self._projected = round(avail_mb - rate * SAMPLE_S)
+        self._prev = (mono, avail_mb)
         self.avail, self.swap, self.floor = avail_mb, swap_mb, floor_gb
         self.rule_map = self.rules(floor_gb)
         self.reaped = {k: t for k, t in self.reaped.items() if mono - t < REAPED_KEEP_S}
@@ -210,6 +224,7 @@ class MemGuard:
         if mono < self.cooldown_until:
             return actions
         acted, pressured = bool(actions), False
+        reaped_only, abort_done = bool(actions), False  # after the system reap only an abort may follow
         for name, rule in self.rule_map.items():
             st = self.state.setdefault(name, RuleState())
             if st.baseline is None:
@@ -218,10 +233,11 @@ class MemGuard:
             if why:
                 pressured = True
                 st.good = 0
-                if not acted:
-                    got = self._pressure(rule, st, why, enforce, trees, fresh_jvms)
+                if not acted or (reaped_only and not abort_done):
+                    got = self._pressure(rule, st, why, enforce, trees, fresh_jvms, reaped_only)
                     actions += got
-                    acted = bool(got)
+                    acted = acted or bool(got)
+                    abort_done = any(a.op == "abort" for a in got)
             elif rule.calm(avail_mb):
                 st.good += 1
                 mine = [e for e in self.paused if e.kind == "guard" and e.rule == name]
@@ -255,9 +271,17 @@ class MemGuard:
         self._line("REAP", text, not enforce, reap=[j.pid for j in targets])
         return Action("reap", text, not enforce, jvm=targets)
 
-    def _pressure(self, rule, st, why, enforce, trees, jvms) -> list[Action]:
+    def _critical(self) -> str | None:
+        """Why memory is critical: below CRIT, or falling so fast that it crosses CRIT by the next sample."""
+        if self.avail < CRIT_MB:
+            return f"below {CRIT_MB}MB"
+        if self._projected is not None and self._projected < CRIT_MB:
+            return f"falling fast, {self._projected}MB projected below {CRIT_MB}MB within {SAMPLE_S:g}s"
+        return None
+
+    def _pressure(self, rule, st, why, enforce, trees, jvms, reaped=False) -> list[Action]:
         mono = self.monotonic()
-        out = [j for j in jvms() if not j.in_scope]  # daemons outside every job scope go first
+        out = [] if reaped else [j for j in jvms() if not j.in_scope]  # daemons outside every job scope first
         if out:
             return [self._reap(out, enforce, f"{why}; outside every job scope")]
         held = {e.key for e in self.paused}
@@ -271,7 +295,7 @@ class MemGuard:
             key=lambda t: (CLASS_ORDER.get(t.cls, 9), -t.rss_mb, t.key),
         )
         compiling = [t for t in mine if t.big_rustc_mb >= COMPILE_MB and t.rustc]
-        if pausable:
+        if pausable and not reaped:
             t = pausable[0]
             e = Entry(
                 f"g{self.next_id}", "guard", rule.name, t.key, t.how, t.what, t.project, t.targets,
@@ -284,25 +308,32 @@ class MemGuard:
             self.cooldown_until = mono + PAUSE_QUIET_S
             self._line("PAUSE", text, not enforce, t.project, entry=e.id)
             return [Action("pause", text, not enforce, entry=e)]
+        if pausable:  # the system reap took this sample; the pause waits for the next one
+            return []
         if compiling:
-            if self.avail < CRIT_MB:
+            crit = self._critical()
+            if crit:
                 t = max(compiling, key=lambda c: c.big_rustc_mb)
                 text = (
                     f"ABORT compile rustc {t.rustc[0]} ({t.big_rustc_mb}MB) of {t.what}; {self._tail()}"
-                    f" - below {CRIT_MB}MB, nothing else to pause"
+                    f" - {crit}, nothing else to pause"
                 )
                 st.baseline = self.swap
                 self.cooldown_until = mono + PAUSE_QUIET_S
                 self._line("ABORT", text, not enforce, t.project)
                 return [Action("abort", text, not enforce, tree=t)]
+            if reaped:
+                return []
             if self._hold_n % HOLD_EVERY == 0:
                 names = ", ".join(t.what for t in compiling)
                 self._line("HOLD", f"HOLD only a compile is large ({names}); not pausing it; {self._tail()}",
                            not enforce)  # fmt: skip
             self._hold_n += 1
             return []
-        if self.avail < CRIT_MB and (
-            self._low_memory_at is None or mono - self._low_memory_at >= LOW_MEMORY_EVERY_S
+        if (
+            not reaped
+            and self.avail < CRIT_MB
+            and (self._low_memory_at is None or mono - self._low_memory_at >= LOW_MEMORY_EVERY_S)
         ):
             self._low_memory_at = mono
             self._line("LOW_MEMORY", f"LOW_MEMORY nothing left to pause or abort; {self._tail()}; {why}",

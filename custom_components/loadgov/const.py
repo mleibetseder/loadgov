@@ -54,3 +54,6 @@ OPTION_DEFAULTS = {
 FEATURE_FREEZE = "freeze"
 FEATURE_REAP = "reap"
 REQUIRES_FREEZE = "requires a loadgovd with freeze support"
+
+# hwmon levels of the status `level` field, best to worst.
+LEVELS = ("OK", "BUSY", "LIMIT")

@@ -6,9 +6,15 @@ nothing outside its run, state and log directories and the compat env file witho
 `loadgovd --recover --force` is the one thaw-all: it releases everything the paused registry
 holds; it runs with the daemon stopped. Stopping or killing the daemon never thaws anything.
 
-Watchdog: `WATCHDOG=1` goes to systemd only after a tick that completed without an exception. A
-persistently failing tick therefore stops the keep-alive and systemd restarts the daemon after
-`WatchdogSec` (60 s) by design; one failing tick alone is logged and the loop carries on.
+Start: `READY=1` goes out as soon as the socket listens and the saved state is restored; the first
+sample and tick run after it (`status` answers `not_ready` until then), so a slow first tick (a full
+/proc scan, `docker ps`, page faults under memory pressure) cannot hit `TimeoutStartSec`.
+
+Watchdog: a small thread (`Heartbeat`) sends `WATCHDOG=1` every quarter of `WATCHDOG_USEC`, but only
+while the last tick that completed without an exception is younger than `WATCHDOG_STALL_S`. A tick
+that is merely slow (a pressure stall, a slow `docker ps`) therefore keeps the daemon alive, while a
+hung loop or a persistently failing tick stops the keep-alive and systemd restarts the daemon;
+one failing tick alone is logged and the loop carries on.
 """
 
 from __future__ import annotations
@@ -24,6 +30,7 @@ import signal
 import socket
 import struct
 import sys
+import threading
 import time
 from dataclasses import asdict, replace
 
@@ -34,6 +41,7 @@ from loadgov.config import (
     KINDS,
     Config,
     ConfigError,
+    changed_keys,
     load_config,
     thresholds,
 )
@@ -46,25 +54,34 @@ from loadgov.daemon.rest import DEFAULT_TOKENS_FILE, RestServer
 from loadgov.daemon.state import StateStore
 from loadgov.engines import slots as slots_engine
 from loadgov.engines.governor import PRIMARY, Governor, event_line
-from loadgov.engines.headroom import decide, paused_reasons, profile_factor
+from loadgov.engines.headroom import decide, decide_review, paused_reasons, profile_factor
 from loadgov.engines.history import COLUMNS, SOCKET_MAX, History, row_for
 from loadgov.engines.jobs import JobTable
 from loadgov.engines.limits import Limits, iso
+from loadgov.engines.projects import ProjectMeter
 from loadgov.engines.slots import SlotManager
 from loadgov.engines.timers import parse_ttl, parse_until
 from loadgov.engines.watch import LegacyTee, Watch, interval_top3, legacy_line
 from loadgov.host import cgroup
 from loadgov.host.procfs import HostFS
-from loadgov.protocol import DEFAULT_SOCKET, VERSION, decode, encode
+from loadgov.protocol import DEFAULT_SOCKET, STARTING, VERSION, decode, encode
 from loadgov.sample import Sampler
 
 DEFAULT_ENV_FILE = "/run/lock/load-governor.env"
 
 log = logging.getLogger("loadgovd")
 FAST_TICK_S = 1.0
-HEADROOM_OVERRIDES = ("load1_max", "load5_max", "psi_max", "mem_min_gb", "swap_max_mb", "mem_psi_max")
+HEADROOM_OVERRIDES = (
+    "load1_max",
+    "load5_max",
+    "psi_max",
+    "mem_min_gb",
+    "swap_max_mb",
+    "swap_in_max",
+    "mem_psi_max",
+)
 WATCH_EVERY_S = 30  # alert evaluation interval
-PARAM_ARGS = ("max_cores", "target_cpu_pct", "load_max", "max_implementers", "ram_floor_gb")
+PARAM_ARGS = ("max_cores", "target_cpu_pct", "load_max", "max_implementers", "max_reviewers", "ram_floor_gb")
 
 
 def atomic_write_json(path: str, obj: dict) -> None:
@@ -86,6 +103,49 @@ def sd_notify(msg: str) -> None:
         s.sendall(msg.encode())
 
 
+WATCHDOG_STALL_S = 300.0  # no good tick for this long = a real hang or a persistent failure
+
+
+class Heartbeat(threading.Thread):
+    """Sends `WATCHDOG=1` from its own thread while the tick loop made progress recently.
+
+    Under memory thrash the loop can stall for minutes on page faults; keeping the keep-alive on the
+    loop itself would get the guard killed exactly when it is needed. The thread only vouches for the
+    loop while `beat()` (called after each good tick) is at most `stall_s` old."""
+
+    def __init__(self, interval_s: float, stall_s: float = WATCHDOG_STALL_S, clock=time.monotonic):
+        super().__init__(name="loadgov-heartbeat", daemon=True)
+        self.interval_s, self.stall_s, self.clock = interval_s, stall_s, clock
+        self.last = clock()
+        self._done = threading.Event()
+
+    def beat(self) -> None:
+        self.last = self.clock()
+
+    def alive(self) -> bool:
+        return self.clock() - self.last <= self.stall_s
+
+    def ping(self) -> None:
+        if self.alive():
+            sd_notify("WATCHDOG=1")
+
+    def run(self) -> None:
+        while not self._done.wait(self.interval_s):
+            self.ping()
+
+    def stop(self) -> None:
+        self._done.set()
+
+
+def watchdog_interval_s(environ=os.environ) -> float:
+    """A quarter of the unit's WatchdogSec (systemd passes it as WATCHDOG_USEC); 15 s when unknown."""
+    try:
+        usec = int(environ.get("WATCHDOG_USEC", ""))
+    except ValueError:
+        return 15.0
+    return max(1.0, usec / 4e6) if usec > 0 else 15.0
+
+
 class Daemon:
     def __init__(
         self,
@@ -104,11 +164,12 @@ class Daemon:
         memguard_options: dict | None = None,  # test-only MemGuardRuntime arguments (fake signals, docker)
         backstop_options: dict | None = None,  # test-only BackstopRuntime arguments (target slice)
         stray_options: dict | None = None,  # test-only StrayRuntime arguments (fake signals)
+        config_path: str | None = None,  # re-read on SIGHUP
     ):
         self.fs = fs
         self.clock = clock
         config = config or Config()
-        self.config = config
+        self.config, self.config_path, self._reload = config, config_path, False
         self.store, self.audit, self.env_file = StateStore(state_dir), AuditLog(log_dir), env_file
         self.limits = Limits(
             config.profiles,
@@ -119,10 +180,17 @@ class Daemon:
         slots_engine.set_compile_lock(config.compile_lock)
         self.slots = SlotManager(fs, clock, config.slots_enforce)
         self.slots.restore(self.store.load_slots())
-        self.jobs = JobTable(fs, clock)
+        self.jobs = JobTable(fs, clock, pattern=self._project_containers)
+        self.slots.docker_cpu = self.jobs.docker_cpu
+        self.slots.expected_s = self.jobs.stats.expected_s
+        self.slots.url_template = self.jobs.url_template = config.keys.url
+        self.projects = ProjectMeter(
+            fs, lambda: self.jobs.jobs, self._waiting_projects, self._configured_projects, clock
+        )
         self.governor = Governor(fs, clock, config.governor_enforce, config.compat.mirror_cgroups)
         self.runner = slot_ops.run_argv
         self.jobs.restore(self.store.load_jobs())
+        self.jobs.stats.restore(self.store.load_job_stats())
         self.memguard = memguard_ops.MemGuardRuntime(self, **(memguard_options or {}))
         self.memguard.restore(self.store.load_memguard())  # paused work stays paused: re-adopt
         self.backstop = backstop_ops.BackstopRuntime(
@@ -134,7 +202,7 @@ class Daemon:
         if self.slots.owner_hold_reason() and not self.limits.state.hold:
             self.limits.set_flag("hold", self.slots.owner_hold_reason())  # the flag follows the saved hold
         self._env_key: str | None = None
-        self.sampler = Sampler(fs, config.compat.mirror_cgroups)
+        self.sampler = Sampler(fs, config.compat.mirror_cgroups, config.headroom.psi_busy_gate_pct)
         self.socket_path = socket_path
         self.run_dir = run_dir
         self.status_path = os.path.join(run_dir, "status.json")
@@ -151,24 +219,95 @@ class Daemon:
         self._prev_procs: tuple[float, dict] | None = None
         self._io_blocks, self._io_block_last = 0, None  # headroom decisions with would_block_io (since start)
 
+    def request_reload(self) -> None:
+        """SIGHUP: only note it; `reload_config` runs in the main loop between ticks."""
+        self._reload = True
+
+    def reload_config(self) -> None:
+        """Re-read the config file; on any error keep the running config. Restart-only settings keep their
+        running value and are audited as `needs restart`."""
+        self._reload = False
+        try:
+            if not self.config_path or not os.path.exists(self.config_path):
+                raise ConfigError(f"config file {self.config_path!r} not found")  # never reload to defaults
+            new = load_config(self.config_path)
+        except (ConfigError, OSError, ValueError) as e:  # ValueError: not UTF-8
+            self._audit_reload("reload refused", str(e))
+            log.error("reload refused: %s", e)
+            return
+        old = self.config
+        pinned = replace(
+            new,
+            default_profile=old.default_profile, profiles=old.profiles, compile_lock=old.compile_lock,
+            rest=old.rest, ha=old.ha,
+            compat=replace(new.compat, mirror_cgroups=old.compat.mirror_cgroups),
+            memguard=replace(new.memguard, projects=old.memguard.projects),
+        )  # fmt: skip
+        restart = [k for k in changed_keys(old, new) if k not in changed_keys(old, pinned)]
+        changed = changed_keys(old, pinned)
+        self._apply_config(pinned)
+        if changed or not restart:  # audit first: the new config is live even if the step below fails
+            self._audit_reload("reload", ", ".join(changed) or "no changes")
+        if restart:
+            self._audit_reload("needs restart", ", ".join(restart))
+        try:
+            self._after_change({})  # audit and persist the slot events the new enforce flag caused
+        except Exception:  # like the tick steps: never stop the main loop; the next change drains the rest
+            log.exception("reload: persisting the change failed")
+        log.info("reload: changed %s; needs restart %s", changed, restart)
+
+    def _audit_reload(self, op: str, reason: str) -> None:
+        self.audit.append({"ts": iso(self.clock()), "op": op, "principal": "system", "source": "reload",
+                           "reason": reason})  # fmt: skip
+
+    def _apply_config(self, c: Config) -> None:
+        """Hand the new config to every engine that holds a part of it. Engines read their flags on use, so
+        a flag that goes off stops new actions and the resume rule releases paused work (undo is always
+        allowed); a backstop that goes off is rolled back by its next tick, as after a restart."""
+        self.config = c
+        self.slots.set_enforce(c.slots_enforce)
+        self.slots.url_template = self.jobs.url_template = c.keys.url
+        self.governor.enforce = c.governor_enforce
+        self.sampler.psi_busy_gate_pct = c.headroom.psi_busy_gate_pct
+        self.backstop.cfg = c.backstop
+        mg = self.memguard
+        mg.cfg, mg.reaper_cfg = c.memguard, c.reaper
+        mg.signals.enforce = mg.docker.enforce = c.memguard.enforce
+        mg.reap_signals.enforce = c.reaper.enforce
+        mg.engine.deny = tuple(c.memguard.deny_containers)
+        st = self.strays
+        st.cfg = st.detector.cfg = c.strays
+        st.signals.enforce = c.strays.enforce
+        st.detector.project_cwds = {n: g.agent_cwd for n, g in c.memguard.projects.items() if g.agent_cwd}
+
+    def _waiting_projects(self) -> list[str]:
+        return [w.project for sl in self.slots.slots.values() for w in sl.queue]
+
+    def _configured_projects(self) -> list[str]:
+        return [*self.config.headroom.projects, *self.config.memguard.projects]
+
     def _pause_marker_file(self) -> str | None:
         marker = self.config.memguard.pause_marker
         return marker.file if marker else None
 
     def tick(self) -> dict:
         s = self.sampler.sample()
-        self._expire()
+        self._expire()  # an expired override must not feed the guard for one more tick
+        self._memguard_step(s)  # then the guard's pause/abort, ahead of the slower engines
         self.fast_tick()
         self._watch_step(s)
         self._governor_step(self.sampler.cpu_times)
-        self._memguard_step(s)
         self._backstop_step()
         self._strays_step()
         self._history_step(s)
         s["limits"] = self.limits_summary()
         s["rest"] = self.rest.status()
         s["slots"] = self.slots.summary()
+        if "heavy_slot" in s:  # the same stuck rule (held long and no CPU progress) as the slot status
+            s["heavy_slot"] = {**s["heavy_slot"], "stuck": s["slots"]["heavy"]["stuck"]}
         s["jobs"] = self.jobs.summary()
+        s["job_stats"] = self.jobs.stats.summary()
+        s["projects"] = self.projects.summary()
         s["alerts"] = self.watch.summary()
         s["ha_push"] = self.ha.status()
         s["governor"] = self.governor.status()
@@ -185,10 +324,16 @@ class Daemon:
             "mode": self.mode(),
             "enforce": enforce,
             "tick_s": self.tick_s,
+            "memory_protection_mb": cgroup.effective_memory_min(self.fs) // (1024 * 1024),
         }
         self.status = s
         atomic_write_json(self.status_path, s)
         return s
+
+    def _project_containers(self, project: str) -> str | None:
+        """The project's memguard `containers` regex, for attributing Docker CPU to its jobs."""
+        guard = self.config.memguard.projects.get(project)
+        return guard.containers if guard else None
 
     def mode(self) -> str:
         """`enforce` when every engine enforces, `partial` when some do, else `observe`."""
@@ -208,6 +353,7 @@ class Daemon:
     def fast_tick(self) -> None:
         """Release slots and drop jobs whose holder or scope is gone (runs every second, see `run`)."""
         changed = self.jobs.tick()
+        self.projects.sample()
         if self.slots.tick() or changed:
             self._after_change({})
 
@@ -297,7 +443,7 @@ class Daemon:
     def _save_state(self) -> bool:
         try:
             self.store.save(self.limits.state, self.slots.to_state(), self.jobs.to_state(),
-                            self.memguard.engine.to_state())  # fmt: skip
+                            self.memguard.engine.to_state(), self.jobs.stats.to_state())  # fmt: skip
         except OSError as e:
             log.error("cannot save state: %s", e)
             return False
@@ -451,14 +597,23 @@ class Daemon:
         op = req.get("op")
         if op == "status":
             if self.status is None:
-                return {"ok": False, "error": "not_ready", "message": "no sample yet"}
+                return {"ok": False, "error": STARTING, "message": "no sample yet"}
+            slots = self.slots.summary()
+            heavy = (
+                {**self.status["heavy_slot"], "stuck": slots["heavy"]["stuck"]}
+                if "heavy_slot" in self.status
+                else {}
+            )
             return {
                 "ok": True,
                 "status": {
                     **self.status,
+                    **({"heavy_slot": heavy} if heavy else {}),
                     "limits": self.limits_summary(),
-                    "slots": self.slots.summary(),
+                    "slots": slots,
                     "jobs": self.jobs.summary(),
+                    "job_stats": self.jobs.stats.summary(),
+                    "projects": self.projects.summary(),
                     "rest": self.rest.status(),
                     "alerts": self.watch.summary(),
                     "ha_push": self.ha.status(),
@@ -528,7 +683,7 @@ class Daemon:
                 "message": f"args: kind ({', '.join(KINDS)}) required; project must be a string",
             }
         if self.status is None:
-            return {"ok": False, "error": "not_ready", "message": "no sample yet"}
+            return {"ok": False, "error": STARTING, "message": "no sample yet"}
         age = self.clock() - calendar.timegm(time.strptime(self.status["at"], "%Y-%m-%dT%H:%M:%SZ"))
         if age > 3 * self.tick_s:  # the tick loop stalled: never decide on old numbers
             return {"ok": False, "error": "not_ready", "message": f"stale sample ({age:.0f} s old)"}
@@ -545,9 +700,19 @@ class Daemon:
             th = replace(th, **over)  # replaces the configured value; the profile scaling still applies
         h = self.config.headroom
         paused = paused_reasons(self.fs, kind, snap["hold"], snap["freeze"], self._pause_marker_file())
-        d = decide(
-            self.status, th, factor=factor, io_psi_gate=h.io_psi_gate, io_psi_max=h.io_psi_max, paused=paused
-        )
+        if kind == "review":  # the review lane: memory floor and the parallel cap only
+            running = sum(1 for j in self.jobs.jobs.values() if j.kind == "review")
+            d = decide_review(
+                self.status, th, running=running, max_reviewers=snap["effective"]["max_reviewers"],
+                ram_floor_gb=snap["effective"]["ram_floor_gb"],
+                guard_paused=bool(self.memguard.engine.paused),
+                factor=factor, io_psi_gate=h.io_psi_gate, io_psi_max=h.io_psi_max, paused=paused,
+            )  # fmt: skip
+        else:
+            d = decide(
+                self.status, th, factor=factor, io_psi_gate=h.io_psi_gate, io_psi_max=h.io_psi_max,
+                paused=paused,
+            )  # fmt: skip
         if d.would_block_io:
             self._io_blocks += 1
             self._io_block_last = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(self.clock()))
@@ -664,11 +829,6 @@ class Daemon:
         with contextlib.suppress(FileNotFoundError):
             os.unlink(self.socket_path)
         self.sampler.prime()
-        await asyncio.sleep(min(1.0, self.tick_s))
-        try:
-            self.tick()
-        except Exception:  # serve not_ready and retry next tick rather than restart-looping
-            log.exception("first tick failed")
         self._link_compat()
         self._expire()  # drop entries that expired while the daemon was down
         self._after_change({})  # audit/persist what loading or expiring changed
@@ -683,25 +843,31 @@ class Daemon:
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGTERM, signal.SIGINT):
             loop.add_signal_handler(sig, self._stop.set)
-        sd_notify("READY=1")
+        loop.add_signal_handler(signal.SIGHUP, self.request_reload)
+        heartbeat = Heartbeat(watchdog_interval_s())
+        sd_notify("READY=1")  # the first sample and tick come after this: nothing slow delays the start
+        heartbeat.start()
         log.info("loadgovd %s ready (%s mode) on %s", __version__, self.mode(), self.socket_path)
         async with server:
             step = min(self.tick_s, FAST_TICK_S)
-            next_full = time.monotonic() + self.tick_s
+            next_full = time.monotonic() + min(1.0, self.tick_s)  # the first tick, as before
             while not self._stop.is_set():
                 with contextlib.suppress(TimeoutError):
                     await asyncio.wait_for(self._stop.wait(), timeout=step)
                 if self._stop.is_set():
                     break
                 try:
+                    if self._reload:
+                        self.reload_config()
                     if time.monotonic() >= next_full - 0.01:
-                        next_full += self.tick_s
+                        next_full = max(next_full + self.tick_s, time.monotonic())
                         self.tick()
-                        sd_notify("WATCHDOG=1")
+                        heartbeat.beat()
                     else:
                         self.fast_tick()  # a scope that emptied frees its slot within a second
-                except Exception:  # keep the loop alive; systemd's watchdog catches real stalls
+                except Exception:  # keep the loop alive; the heartbeat stops if no tick succeeds
                     log.exception("tick failed")
+        heartbeat.stop()
         tasks = [t for t in (rest_task, ha_task) if t]
         for t in tasks:
             t.cancel()
@@ -732,7 +898,17 @@ def main(argv: list[str] | None = None) -> int:
         help="thaw everything the paused registry holds (daemon stopped); needs --force",
     )
     ap.add_argument("--force", action="store_true", help="with --recover: really thaw (else only list)")
+    ap.add_argument(
+        "--check-config", metavar="PATH", help="validate a config file, print the error, exit 0/1"
+    )
     a = ap.parse_args(argv)
+    if a.check_config:
+        try:
+            load_config(a.check_config)
+        except (ConfigError, OSError, ValueError) as e:  # ValueError: not UTF-8
+            print(f"loadgovd: bad config {a.check_config}: {e}", file=sys.stderr)
+            return 1
+        return 0
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s", stream=sys.stderr)
     fs = HostFS(
         proc_root=a.proc_root,
@@ -757,7 +933,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"loadgovd: bad config {a.config}: {e}", file=sys.stderr)
         return 2
     d = Daemon(fs, a.socket, a.run_dir, a.compat_link or None, a.tick, config, a.state_dir, a.log_dir,
-               a.env_file or None, tokens_file=a.tokens_file)  # fmt: skip
+               a.env_file or None, tokens_file=a.tokens_file, config_path=a.config)  # fmt: skip
     asyncio.run(d.run())
     return 0
 

@@ -7,7 +7,7 @@ from datetime import timedelta
 import aiohttp
 import pytest
 from homeassistant.config_entries import ConfigEntryState
-from homeassistant.const import STATE_OFF, STATE_ON, STATE_UNAVAILABLE
+from homeassistant.const import STATE_OFF, STATE_ON, STATE_UNAVAILABLE, STATE_UNKNOWN
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.util import dt as dt_util
 from pytest_homeassistant_custom_component.common import async_fire_time_changed
@@ -285,3 +285,200 @@ async def test_403_source_refusal_on_write_does_not_start_reauth(hass, aioclient
         )
     await hass.async_block_till_done()
     assert not any(f["context"]["source"] == "reauth" for f in hass.config_entries.flow.async_progress())
+
+
+# --- queue view, running jobs, host load, per-project compute ---
+
+
+def _waiter(pos, **kw):
+    w = {
+        "position": pos, "project": "web-app", "label": f"gate-{pos}", "kind": "gate", "key": None,
+        "url": None, "pid": 100 + pos, "queued_since": "2026-11-10T09:00:00Z", "wait_s": 60 * pos,
+        "expected_s": 300, "eta": "2026-11-10T10:05:00Z",
+    }  # fmt: skip
+    return {**w, **kw}
+
+
+def _job(slot, **kw):
+    j = {
+        "kind": "gate", "project": "web-app", "label": "gate-run", "unit": "u.scope", "cgroup": "/x",
+        "pid": 7, "slot": slot, "since": "2026-11-10T09:50:00Z", "key": "PROJ-41",
+        "url": "https://tracker.example/issues/PROJ-41", "expected_s": 900,
+        "eta": "2026-11-10T10:05:00Z", "overdue": False,
+    }  # fmt: skip
+    return {**j, **kw}
+
+
+async def test_host_load_and_level_sensors(hass, aioclient_mock, mock_entry, status):
+    status["cpu"] |= {"load1": 2.5, "load5": 1.75, "load1_per_core": 0.31}
+    status["level"] = "BUSY"
+    await setup(hass, mock_entry, aioclient_mock, status)
+    s = hass.states.get
+    assert s("sensor.host_load_1min").state == "2.5"
+    assert s("sensor.host_load_5min").state == "1.75"
+    assert s("sensor.host_load_per_core").state == "0.31"
+    assert s("sensor.host_level").state == "BUSY"
+    assert s("sensor.host_level").attributes["options"] == ["OK", "BUSY", "LIMIT"]
+
+
+async def test_slot_next_head_waiter_and_bounds(hass, aioclient_mock, mock_entry, status):
+    waiters = [_waiter(1, key="PROJ-42", url="https://tracker.example/issues/PROJ-42")]
+    waiters += [_waiter(p) for p in range(2, 14)]
+    status["slots"]["heavy"]["waiters"] = list(reversed(waiters))  # order in the list does not matter
+    status["slots"]["compile"]["waiters"] = [_waiter(1, label="cargo-build")]
+    await setup(hass, mock_entry, aioclient_mock, status)
+    st = hass.states.get("sensor.host_heavy_slot_next")
+    assert st.state == "PROJ-42"
+    assert st.attributes["count"] == 13
+    assert st.attributes["project"] == "web-app"
+    assert len(st.attributes["queue"]) == 10
+    assert st.attributes["queue"][0] == {
+        "position": 1, "project": "web-app", "label": "gate-1", "kind": "gate", "key": "PROJ-42",
+        "url": "https://tracker.example/issues/PROJ-42", "wait_s": 60, "eta": "2026-11-10T10:05:00Z",
+    }  # fmt: skip
+    assert hass.states.get("sensor.host_compile_slot_next").state == "cargo-build"
+
+
+async def test_slot_next_none_when_empty_and_unavailable_on_an_older_daemon(
+    hass, aioclient_mock, mock_entry, status
+):
+    status["slots"]["heavy"]["waiters"] = []
+    assert "waiters" not in status["slots"]["compile"]
+    await setup(hass, mock_entry, aioclient_mock, status)
+    empty = hass.states.get("sensor.host_heavy_slot_next")
+    assert empty.state == "none"
+    assert empty.attributes["count"] == 0
+    assert empty.attributes["queue"] == []
+    assert hass.states.get("sensor.host_compile_slot_next").state == STATE_UNAVAILABLE
+
+
+async def test_holder_eta_timestamp_and_attributes(hass, aioclient_mock, mock_entry, status):
+    status["jobs"] = [_job("heavy", overdue=True), _job(None, label="impl-a", kind="impl")]
+    await setup(hass, mock_entry, aioclient_mock, status)
+    st = hass.states.get("sensor.host_heavy_slot_holder_eta")
+    assert st.state == "2026-11-10T10:05:00+00:00"
+    assert st.attributes["device_class"] == "timestamp"
+    assert st.attributes["key"] == "PROJ-41"
+    assert st.attributes["url"] == "https://tracker.example/issues/PROJ-41"
+    assert (st.attributes["project"], st.attributes["label"], st.attributes["kind"]) == (
+        "web-app", "gate-run", "gate",
+    )  # fmt: skip
+    assert st.attributes["expected_s"] == 900
+    assert st.attributes["overdue"] is True
+    # the compile slot is free: no job holds it
+    assert hass.states.get("sensor.host_compile_slot_holder_eta").state == STATE_UNKNOWN
+
+
+@pytest.mark.parametrize("eta", [None, "not a time", 42])
+async def test_holder_eta_unknown_without_a_usable_estimate(hass, aioclient_mock, mock_entry, status, eta):
+    status["jobs"] = [_job("compile", eta=eta, expected_s=None)]
+    await setup(hass, mock_entry, aioclient_mock, status)
+    assert hass.states.get("sensor.host_compile_slot_holder_eta").state == STATE_UNKNOWN
+
+
+async def test_running_jobs_count_attributes_and_bound(hass, aioclient_mock, mock_entry, status):
+    status["jobs"] = [_job("heavy"), *(_job(None, label=f"impl-{n}", kind="impl") for n in range(11))]
+    await setup(hass, mock_entry, aioclient_mock, status)
+    st = hass.states.get("sensor.host_running_jobs")
+    assert st.state == "12"
+    assert len(st.attributes["jobs"]) == 10
+    assert st.attributes["jobs"][0] == {
+        "kind": "gate", "project": "web-app", "label": "gate-run", "key": "PROJ-41",
+        "url": "https://tracker.example/issues/PROJ-41", "slot": "heavy",
+        "since": "2026-11-10T09:50:00Z", "eta": "2026-11-10T10:05:00Z", "overdue": False,
+    }  # fmt: skip
+
+
+async def test_running_jobs_zero_on_an_older_daemon(hass, aioclient_mock, mock_entry, status):
+    await setup(hass, mock_entry, aioclient_mock, status)
+    st = hass.states.get("sensor.host_running_jobs")
+    assert st.state == "0"
+    assert st.attributes["jobs"] == []
+
+
+def test_list_attributes_are_kept_out_of_the_recorder():
+    from custom_components.loadgov.sensor import LoadgovRunningJobsSensor, LoadgovSlotNextSensor
+
+    assert "queue" in LoadgovSlotNextSensor._unrecorded_attributes
+    assert "jobs" in LoadgovRunningJobsSensor._unrecorded_attributes
+
+
+def _projects(*names):
+    return {
+        n: {"cpu_pct": 250.0, "cores": 2.5, "docker_cpu_pct": 50.0, "mem_mb": 2048, "jobs": 1,
+            "waiting": 2, "slice": f"/build.slice/{n}.slice"}
+        for n in names
+    }  # fmt: skip
+
+
+async def test_project_sensors_are_created_from_the_status(hass, aioclient_mock, mock_entry, status):
+    status["projects"] = _projects("web-app", "ci")
+    status["projects"]["ci"]["cores"] = 0.123
+    status["projects"]["ci"]["mem_mb"] = None
+    await setup(hass, mock_entry, aioclient_mock, status)
+    cpu = hass.states.get("sensor.host_project_web_app_cpu")
+    assert cpu.state == "2.5"
+    assert cpu.attributes["unit_of_measurement"] == "cores"
+    assert (cpu.attributes["cpu_pct"], cpu.attributes["docker_cpu_pct"]) == (250.0, 50.0)
+    assert (cpu.attributes["jobs"], cpu.attributes["waiting"]) == (1, 2)
+    mem = hass.states.get("sensor.host_project_web_app_memory")
+    assert mem.state == "2048"
+    assert mem.attributes["device_class"] == "data_size"
+    assert mem.attributes["unit_of_measurement"] == "MB"
+    assert hass.states.get("sensor.host_project_ci_cpu").state == "0.12"
+    assert hass.states.get("sensor.host_project_ci_memory").state == STATE_UNKNOWN
+
+
+async def _poll(hass, aioclient_mock, status, n):
+    aioclient_mock.clear_requests()
+    mock_status(aioclient_mock, status)
+    async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=n * (SCAN_INTERVAL_S + 1)))
+    await hass.async_block_till_done()
+
+
+async def test_project_sensors_appear_later_and_go_unavailable_when_the_project_disappears(
+    hass, aioclient_mock, mock_entry, status
+):
+    await setup(hass, mock_entry, aioclient_mock, status)
+    assert hass.states.get("sensor.host_project_web_app_cpu") is None
+
+    status["projects"] = _projects("web-app")
+    await _poll(hass, aioclient_mock, status, 1)
+    assert hass.states.get("sensor.host_project_web_app_cpu").state == "2.5"
+    assert hass.states.get("sensor.host_project_web_app_memory").state == "2048"
+
+    status["projects"] = {}
+    await _poll(hass, aioclient_mock, status, 2)
+    assert hass.states.get("sensor.host_project_web_app_cpu").state == STATE_UNAVAILABLE
+    assert hass.states.get("sensor.host_project_web_app_memory").state == STATE_UNAVAILABLE
+
+    status["projects"] = _projects("web-app")
+    await _poll(hass, aioclient_mock, status, 3)
+    assert hass.states.get("sensor.host_project_web_app_cpu").state == "2.5"
+
+
+async def test_dashboard_queue_card_renders(hass, aioclient_mock, mock_entry, status):
+    from pathlib import Path
+
+    import yaml
+    from homeassistant.helpers.template import Template
+
+    status["jobs"] = [_job("heavy", overdue=True)]
+    status["slots"]["heavy"]["waiters"] = [
+        _waiter(1, key="PROJ-42", url="https://tracker.example/issues/PROJ-42"),
+        _waiter(2),
+    ]
+    await setup(hass, mock_entry, aioclient_mock, status)
+    board = yaml.safe_load((Path(__file__).parents[1] / "dashboard" / "loadgov.yaml").read_text())
+    card = next(
+        c
+        for section in board["views"][0]["sections"]
+        for c in section["cards"]
+        if c.get("type") == "markdown"
+    )
+    text = Template(card["content"], hass).async_render()
+    assert "[PROJ-41](https://tracker.example/issues/PROJ-41) (heavy slot)" in text
+    assert "(overdue)" in text
+    assert "1. [PROJ-42](https://tracker.example/issues/PROJ-42) (web-app, waiting 1 min" in text
+    assert "2. gate-2 (web-app" in text
+    assert "- empty" in text  # the compile queue

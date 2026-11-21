@@ -59,16 +59,19 @@ def read_snapshot(path: str) -> str | None:
 
 class MemGuardRuntime:
     def __init__(self, d, **options):
-        """`options` are test-only: opener, sender, closer (pidfd), docker_runner, snapshot_reader,
-        override ((LOW, HIGH) MB for the global rule), monotonic, restrict_cgroup (a cgroup path prefix:
-        only job scopes below it are ever touched; legacy trees, containers and JVM daemons are ignored)."""
+        """`options` are test-only: opener, sender, closer (pidfd), docker_runner, docker_spawn (runs the
+        `docker ps` refresh inline), snapshot_reader, override ((LOW, HIGH) MB for the global rule),
+        monotonic, restrict_cgroup (a cgroup path prefix: only job scopes below it are ever touched; legacy
+        trees, containers and JVM daemons are ignored)."""
         self.d = d
         self.cfg, self.reaper_cfg = d.config.memguard, d.config.reaper
         self.monotonic = options.get("monotonic", time.monotonic)
         sig_kw = {k: options[k] for k in ("opener", "sender", "closer") if k in options}
         self.signals = Signals(d.fs, self.cfg.enforce, **sig_kw)
         self.reap_signals = Signals(d.fs, self.reaper_cfg.enforce, **sig_kw)  # orphan TERM/KILL: [reaper]
-        self.docker = Docker(options.get("docker_runner", run_docker), self.cfg.enforce)
+        spawn = {"spawn": options["docker_spawn"]} if "docker_spawn" in options else {}
+        self.docker = Docker(options.get("docker_runner", run_docker), self.cfg.enforce, **spawn)
+        self.containers_age_s: float | None = None  # age of the container list the last collect used
         self.snapshot_reader = options.get("snapshot_reader", read_snapshot)
         self.restrict: str | None = options.get("restrict_cgroup")
         self.engine = MemGuard(
@@ -131,9 +134,9 @@ class MemGuardRuntime:
             if self.restrict and not j.cgroup.startswith(self.restrict):
                 continue
             pids = [p for p in proctree.scope_pids(fs, j.cgroup) if p in tab]
-            if not pids:
+            procs = [tab[p] for p in pids if tab[p].state not in ("Z", "X")]
+            if not procs:
                 continue
-            procs = [tab[p] for p in pids]
             used.update(pids)
             agent = {p.pid for p in procs if p.comm == AGENT_COMM}
             keep = set(agent)
@@ -191,7 +194,7 @@ class MemGuardRuntime:
                     if tab[c].comm == AGENT_COMM:
                         claude_seen.add(c)
                     for p in proctree.descendants(tab, kids, c):
-                        if p.comm != AGENT_COMM and p.pid not in used:
+                        if p.comm != AGENT_COMM and p.pid not in used and p.state not in ("Z", "X"):
                             work[p.pid] = p
             if work:
                 out.append(self._legacy_tree(r, snap.project, list(work.values())))
@@ -209,7 +212,7 @@ class MemGuardRuntime:
                 if not any(where == x or where.startswith(x + "/") for x in prefixes):
                     continue
                 work = [p for p in proctree.descendants(tab, kids, c.pid) if p.comm != AGENT_COMM
-                        and p.pid not in used]  # fmt: skip
+                        and p.pid not in used and p.state not in ("Z", "X")]  # fmt: skip
                 if work:
                     out.append(self._legacy_tree(c, name, work))
         return out
@@ -226,7 +229,8 @@ class MemGuardRuntime:
         if not rules:
             return []
         out = []
-        for name in self.docker.names():
+        names, self.containers_age_s = self.docker.cached_names()  # last known list; never waits for docker
+        for name in names:
             if denied(name, self.cfg.deny_containers):
                 continue
             for proj, rx in rules:
@@ -255,6 +259,7 @@ class MemGuardRuntime:
     # ---- tick ------------------------------------------------------------------------------------
 
     def tick(self, s: dict) -> None:
+        was_ours = {t["pid"] for e in self.engine.paused for t in e.targets if "pid" in t}
         eff = self.d.limits.effective()
         self._expire_human()
         actions = self.engine.step(
@@ -269,7 +274,7 @@ class MemGuardRuntime:
         for a in actions:
             self._execute(a)
         self._orphans()
-        self._foreign(s)
+        self._foreign(s, was_ours)
         self.flush()
 
     def _execute(self, a: Action) -> None:
@@ -453,8 +458,8 @@ class MemGuardRuntime:
                                  entry=e.id)  # fmt: skip
             self.dirty = True
 
-    def _foreign(self, s: dict) -> None:
-        ours = {t["pid"] for e in self.engine.paused for t in e.targets if "pid" in t}
+    def _foreign(self, s: dict, was_ours: set[int] | frozenset[int] = frozenset()) -> None:
+        ours = {t["pid"] for e in self.engine.paused for t in e.targets if "pid" in t} | was_ours
         self.foreign = [x for x in s.get("stopped", []) if x["pid"] not in ours]
         now = {x["pid"] for x in self.foreign}
         for x in self.foreign:
@@ -513,6 +518,7 @@ class MemGuardRuntime:
         return {
             **self.engine.status(self.cfg.enforce),
             "reaper_enforce": self.reaper_cfg.enforce,
+            "containers_age_s": None if self.containers_age_s is None else round(self.containers_age_s, 1),
             "foreign_stopped": [{"pid": x["pid"], "comm": x["comm"], "cgroup": x["cgroup"]}
                                 for x in self.foreign],
         }  # fmt: skip

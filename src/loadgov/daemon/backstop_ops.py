@@ -53,8 +53,12 @@ class BackstopRuntime:
         self.applied = False
         self.note: str | None = None
         self.oom_kills = 0
+        self.max_events = 0
+        self.swap_fail_events = 0
         self.last_event: str | None = None
         self._base: tuple[int, int] | None = None  # (oom_kill, oom_group_kill) at the last reading
+        self._max_base: int | None = None
+        self._swap_fail_base: int | None = None
         self._seen: dict[str, tuple[int, int]] = {}  # unit -> (last memory.peak MB, own oom_kill)
         self._grouped: set[str] = set()
         self._said: str | None = None
@@ -81,6 +85,8 @@ class BackstopRuntime:
             "memory_max_mb": self.cfg.memory_max_mb,
             "memory_swap_max_mb": self.cfg.memory_swap_max_mb,
             "oom_kills": self.oom_kills,
+            "max_events": self.max_events,
+            "swap_fail_events": self.swap_fail_events,
             "last_event": self.last_event,
             "note": self.note,
         }
@@ -184,6 +190,14 @@ class BackstopRuntime:
 
     # ---- detection -------------------------------------------------------------------------------
 
+    @staticmethod
+    def _delta(cur: int | None, base: int | None) -> tuple[int, int | None]:
+        if cur is None:
+            return 0, base
+        if base is None or cur < base:
+            return 0, cur
+        return cur - base, cur
+
     def _detect(self) -> None:
         live: dict[str, tuple[int, int]] = {}
         for unit, j in self._jobs().items():
@@ -191,9 +205,16 @@ class BackstopRuntime:
             own = (cgroup.read_events(self.fs, j.cgroup) or {}).get("oom_kill", 0)
             live[unit] = ((peak or 0) // MIB, own)
         before, self._seen = self._seen, live
+        sev = cgroup.read_events(self.fs, self.slice, "memory.swap.events")
+        d_swap, self._swap_fail_base = self._delta(
+            None if sev is None else sev.get("fail", 0), self._swap_fail_base
+        )
+        self.swap_fail_events += d_swap
         ev = cgroup.read_events(self.fs, self.slice)
         if ev is None:
             return
+        d_max, self._max_base = self._delta(ev.get("max", 0), self._max_base)
+        self.max_events += d_max
         now = (ev.get("oom_kill", 0), ev.get("oom_group_kill", 0))
         prev, self._base = self._base, now
         if prev is None or now[0] < prev[0] or now[1] < prev[1]:

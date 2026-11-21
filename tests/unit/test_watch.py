@@ -179,10 +179,12 @@ def test_stuck_holder_alert_carries_cancel_action_and_ignores_holds(watch, clock
     assert kinds(ev(watch, clock, s=sample())) == [("resolved", "stuck_holder:heavy")]
 
 
-def test_stuck_via_heavy_slot_status_for_a_legacy_holder(watch, clock):
+def test_the_alert_follows_the_slot_stuck_flag_not_the_heavy_slot_age(watch, clock):
     legacy = {"state": "held", "holder": None, "held_since": None, "stuck": False}
     free = {"state": "free", "holder": None, "held_since": None, "stuck": False}
     out = ev(watch, clock, s=sample(slots={"heavy": legacy, "compile": free}, heavy_stuck=True))
+    assert out == []  # held long is not stuck: the slot rule also needs no CPU progress
+    out = ev(watch, clock, s=sample(slots={"heavy": {**legacy, "stuck": True}, "compile": free}))
     assert kinds(out) == [("alert", "stuck_holder:heavy")]
 
 

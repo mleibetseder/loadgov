@@ -522,7 +522,11 @@ def test_daemon_process_passes_tokens_file_flag(tmp_path, fake_host):
             import time
 
             time.sleep(0.05)
-        r = request(str(sock), "status")
+        for _ in range(100):  # the socket listens before the first tick
+            r = request(str(sock), "status")
+            if r.get("error") not in ("starting", "not_ready"):
+                break
+            time.sleep(0.05)
         assert r["status"]["rest"]["state"] == "down" and "32" in r["status"]["rest"]["error"]
         assert r["status"]["v"] == VERSION
     finally:
@@ -580,3 +584,15 @@ def test_config_refuses_docker_bridge_range_unless_allowed(bind):
     assert parse_config('[rest]\nbind = "192.0.2.10"\n').rest.allow_private_bridge is False
     with pytest.raises(ConfigError, match="allow_private_bridge"):
         parse_config('[rest]\nallow_private_bridge = "yes"\n')
+
+
+def test_set_max_reviewers_via_rest(tmp_path, fake_host):
+    d = make(tmp_path, fake_host("calm"))
+    d.tick()
+
+    async def scenario(port):
+        code, body, _ = await http(port, "POST", "/v1/set", {"max_reviewers": 2, "reason": "t"})
+        assert code == 200 and body["effective"]["max_reviewers"] == 2
+        assert (await http(port, "POST", "/v1/set", {"max_reviewers": 9, "reason": "t"}))[0] == 400
+
+    run_rest(d, scenario)

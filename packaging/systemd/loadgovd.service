@@ -12,9 +12,15 @@ StartLimitIntervalSec=0
 Type=notify
 NotifyAccess=main
 ExecStart=/opt/loadgov/.venv/bin/loadgovd
+ExecReload=/bin/kill -HUP $MAINPID
 Restart=always
 RestartSec=2
-WatchdogSec=60
+# A slow start under memory pressure (start timeouts while the host thrashes) must not
+# be killed; READY=1 is sent as soon as the socket listens, so a healthy start takes a second or two.
+TimeoutStartSec=300
+# The daemon pings from its own thread (every WatchdogSec/4) while its tick loop made progress within
+# the last 300 s; a pressure stall alone must not trip it. 120 s leaves room for a starved thread.
+WatchdogSec=120
 RuntimeDirectory=loadgovd
 RuntimeDirectoryMode=0755
 RuntimeDirectoryPreserve=no
@@ -23,7 +29,13 @@ LogsDirectory=loadgov
 # The guard must survive the memory pressure it exists to handle.
 OOMScoreAdjust=-900
 Nice=-5
+# RSS is about 38 MB; MemoryMin reserves 96 MB (2.5x: code, state and history pages, growth) so the
+# kernel never reclaims the guard's working set under thrash, which is what made it stall.
+MemoryMin=96M
 MemoryMax=256M
+# More CPU and IO share than the build jobs it governs (default weight 100).
+CPUWeight=500
+IOWeight=500
 # Headroom for the unix socket, the REST listener (max 64 connections), lock files and /proc reads.
 LimitNOFILE=4096
 

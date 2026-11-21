@@ -99,6 +99,7 @@ class Tools:
             },
             "slots": s.get("slots"),
             "jobs": s.get("jobs"),
+            "job_stats": s.get("job_stats"),
             "capabilities": s.get("capabilities") or [],
         }
         out.update({k: s[k] for k in OPTIONAL_STATUS_KEYS if k in s})
@@ -117,12 +118,14 @@ class Tools:
         until: str | None = None,
         agent_id: str | None = None,
         project: str | None = None,
+        max_reviewers: int | None = None,
     ) -> dict[str, Any]:
         vals = {
             "max_cores": max_cores,
             "target_cpu_pct": target_cpu_pct,
             "load_max": load_max,
             "max_implementers": max_implementers,
+            "max_reviewers": max_reviewers,
             "ram_floor_gb": ram_floor_gb,
         }
         if profile is None and all(v is None for v in vals.values()):
@@ -154,7 +157,15 @@ class Tools:
             confirm=None,
             poll=None,
             **dict.fromkeys(
-                ("load1_max", "load5_max", "psi_max", "mem_min_gb", "swap_max_mb", "mem_psi_max")
+                (
+                    "load1_max",
+                    "load5_max",
+                    "psi_max",
+                    "mem_min_gb",
+                    "swap_max_mb",
+                    "swap_in_max",
+                    "mem_psi_max",
+                )
             ),
         )
         last: dict = {}
@@ -280,6 +291,7 @@ def build_server(tools: Tools | None = None):
         until: str | None = None,
         agent_id: str | None = None,
         project: str | None = None,
+        max_reviewers: int | None = None,
     ) -> dict:
         """Change the profile or single limits as an agent. Lowering is always accepted (default TTL
         2 h, max 12 h). Raising is refused (`refused: true`, `restrictedBy`, the owner's reason) while a
@@ -297,6 +309,7 @@ def build_server(tools: Tools | None = None):
             until,
             agent_id,
             project,
+            max_reviewers,
         )
 
     @srv.tool(description=DOC_WAIT)

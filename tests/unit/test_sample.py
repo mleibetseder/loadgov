@@ -24,6 +24,7 @@ def take(host, now=NOW, mirrors=("loop-a",)):
         "mode": "observe",
         "enforce": {"governor": False, "slots": False, "memguard": False, "reaper": False},
         "tick_s": 5.0,
+        "memory_protection_mb": 96,
     }
     out["limits"] = {  # added by the daemon, like "daemon"
         "profile": "balanced",
@@ -39,16 +40,18 @@ def take(host, now=NOW, mirrors=("loop-a",)):
     out["capabilities"] = ["freeze", "reap"]
     out["headroom"] = {"io_would_block_count": 0, "io_would_block_last": None}
     out["memguard"] = {
-        "enforce": False, "reaper_enforce": False, "low_mb": 3072, "resume_mb": 6144, "crit_mb": 1500,
+        "enforce": False, "reaper_enforce": False, "containers_age_s": None, "low_mb": 3072, "resume_mb": 6144, "crit_mb": 1500,
         "baseline_swap_mb": 0, "paused": [], "last_decision": None, "last_reason": None, "last_at": None,
         "cooldown_s": 0.0, "foreign_stopped": [],
     }  # fmt: skip
     out["backstop"] = {"enabled": False, "applied": False, "memory_max_mb": None, "memory_swap_max_mb": None,
-                       "oom_kills": 0, "last_event": None, "note": None}  # fmt: skip
+                       "oom_kills": 0, "max_events": 0, "swap_fail_events": 0, "last_event": None, "note": None}  # fmt: skip
     out["strays"] = {"enabled": True, "enforce": False, "check_s": 300, "last_check": None, "items": []}
     out["rest"] = {"enabled": False, "state": "disabled", "error": None, "bind": "192.0.2.10", "port": 7420}
     out["slots"] = SlotManager(host.fs).summary()  # added by the daemon too
     out["jobs"] = []  # likewise
+    out["job_stats"] = []
+    out["projects"] = {}
     out["alerts"] = {"active": [], "events": []}
     out["governor"] = Governor(host.fs, lambda: now).status()  # likewise
     out["ha_push"] = {
@@ -92,6 +95,29 @@ def test_swap_surge_reports_used_pct_and_level(fake_host):
     s = take(fake_host("swap-surge"))
     assert s["swap"]["used_mb"] == 7600
     assert s["levels"]["swap"] == "BUSY"  # 92.8 %
+
+
+def _vmstat(host, pswpin, pswpout):
+    with open(os.path.join(host.proc, "vmstat"), "w") as f:
+        f.write(f"nr_free_pages 1\npswpin {pswpin}\npswpout {pswpout}\n")
+
+
+def test_swap_rates_over_the_window_and_safe_when_unknown(fake_host):
+    host = fake_host("calm")
+    s = Sampler(host.fs)
+    s.prime(host.prev_stat)
+    assert s.sample(now=NOW)["swap"]["in_rate"] == 0.0  # no vmstat file: unknown is 0, no crash
+    _vmstat(host, 1000, 500)
+    assert s.sample(now=NOW + 5)["swap"]["in_rate"] == 0.0  # first reading
+    _vmstat(host, 1500, 600)
+    sw = s.sample(now=NOW + 10)["swap"]
+    assert (sw["in_rate"], sw["out_rate"]) == (100.0, 20.0)  # 500 pages in 5 s
+    _vmstat(host, 1500, 600)
+    assert s.sample(now=NOW + 15)["swap"]["in_rate"] == 50.0  # 500 pages over 10 s
+    _vmstat(host, 1500, 600)
+    assert s.sample(now=NOW + 80)["swap"]["in_rate"] == 0.0  # the burst left the 60 s window
+    _vmstat(host, 10, 10)  # counter reset (reboot): history restarts
+    assert s.sample(now=NOW + 85)["swap"]["in_rate"] == 0.0
 
 
 def test_top3_jvm_count_and_heavy_slot_from_proc_locks(fake_host):

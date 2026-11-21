@@ -37,7 +37,8 @@ REASONS = {
     429: "Too Many Requests", 500: "Internal Server Error", 503: "Service Unavailable",
 }  # fmt: skip
 SET_KEYS = {
-    "profile", "max_cores", "target_cpu_pct", "load_max", "max_implementers", "ram_floor_gb",
+    "profile", "max_cores", "target_cpu_pct", "load_max", "max_implementers", "max_reviewers",
+    "ram_floor_gb",
     "ttl", "until", "reason", "project",
 }  # fmt: skip
 POST_KEYS = {
@@ -127,7 +128,7 @@ def status_for(reply: dict) -> int:
         return 200
     if reply.get("refused"):
         return 409
-    return {"not_ready": 503, "internal": 500}.get(reply.get("error"), 400)
+    return {"starting": 503, "not_ready": 503, "internal": 500}.get(reply.get("error"), 400)
 
 
 class RestServer:

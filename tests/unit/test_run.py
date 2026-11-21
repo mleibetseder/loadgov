@@ -956,3 +956,100 @@ def test_job_end_with_a_scope_removed_mid_read_releases_the_slot(fake_host, tmp_
     assert r["ok"] is True
     assert (r["ended"], r["released"]) == (True, True)
     assert d.slots.slots["heavy"].holder is None
+
+
+def holder_tree():
+    """(holder shell, pid of its real child): the child descends from the holder in the real /proc."""
+    sh = subprocess.Popen(["sh", "-c", "sleep 60 & wait"])
+    kids = f"/proc/{sh.pid}/task/{sh.pid}/children"
+    kid = []
+    for _ in range(100):
+        kid = open(kids).read().split()
+        if kid:
+            break
+        time.sleep(0.05)
+    return sh, int(kid[0])
+
+
+def test_nested_compile_run_inside_a_compile_job_runs_in_its_own_scope_and_keeps_the_outer_slot(
+    fake_host, tmp_path, monkeypatch, procs
+):
+    # the shim path: rustc-slot.sh ends in `loadctl run --kind compile --project P --label <crate> --headroom none`
+    host = fake_host("calm")
+    d = make_daemon(host, tmp_path)
+    (outer_cmd, inner_pid), outer_job = holder_tree(), procs()
+    try:
+        assert call(d, "slot_acquire", slot="compile", project="proj-a", label="build", pid=outer_cmd.pid,
+                    wait=True)["status"] == "granted"  # fmt: skip
+        assert start(d, outer_job.pid, outer_cmd.pid, slot="compile")["bound"] is True
+        ops, seen = [], {}
+        wire(monkeypatch, d, ops)
+        inner_job = procs()
+        h = Host(host, inner_job.pid)
+        h.deps.pid = inner_pid  # `loadctl run` of the shim, a descendant of the outer holder
+        h.proc_kw["on_wait"] = lambda _p: seen.update(
+            nested=d.slots.summary()["compile"]["nested"],
+            jobs=[(j["unit"], j["slot"]) for j in d.jobs.summary()],
+        )
+        rc = go(monkeypatch, d, h.deps, "--kind", "compile", "--project", "proj-a", "--label", "crate",
+                "--headroom", "none", "--", "rustc", "--crate-name", "crate")  # fmt: skip
+        assert rc == 0 and "headroom" not in ops
+        assert ops.index("slot_acquire") < ops.index("job_start") < ops.index("slot_release")
+        assert seen["nested"] == 1  # it did not wait behind its own ancestor
+        assert h.launched[0][0][0] == "systemd-run" and "--slice=build-work-proj-a.slice" in h.launched[0][0]
+        assert [slot for unit, slot in seen["jobs"] if unit.startswith("loadgov-compile-crate-")] == [None]
+        s = d.slots.summary()["compile"]  # the outer slot is still bound to the outer job
+        assert s["nested"] == 0 and s["state"] == "held" and f"pid={outer_cmd.pid}" in s["holder"]
+        assert d.slots.slots["compile"].holder.scope == UNIT
+        assert [j.unit for j in d.jobs.jobs.values()] == [UNIT]  # the nested job is gone, the outer stays
+    finally:
+        outer_cmd.kill()
+        outer_cmd.wait()
+        os.kill(inner_pid, 9)
+
+
+def test_nested_gate_inside_a_compile_job_still_waits_for_heavy(fake_host, tmp_path, monkeypatch, procs):
+    host = fake_host("calm")
+    d = make_daemon(host, tmp_path)
+    outer_cmd, inner_pid = holder_tree()
+    try:
+        other = procs()
+        grant_gate(d, other.pid)  # somebody else holds heavy
+        call(d, "slot_acquire", slot="compile", project="proj-a", label="build", pid=outer_cmd.pid, wait=True)
+        wire(monkeypatch, d)
+        h = Host(host, procs().pid)
+        h.deps.pid = inner_pid
+        rc = go(monkeypatch, d, h.deps, "--kind", "gate", "--project", "proj-a", "--label", "g", "--no-wait",
+                "--", "true")  # fmt: skip
+        assert rc == run.EXIT_BUSY and h.launched == []
+    finally:
+        outer_cmd.kill()
+        outer_cmd.wait()
+        os.kill(inner_pid, 9)
+
+
+def test_key_flag_and_environment_reach_the_slot_request_and_the_job(fake_host, tmp_path, monkeypatch, procs):
+    host = fake_host("calm")
+    d = make_daemon(host, tmp_path)
+    sent = []
+    wire(monkeypatch, d)
+    real = loadctl.request
+    monkeypatch.setattr(
+        loadctl, "request", lambda s, op, args=None, **k: sent.append((op, args)) or real(s, op, args)
+    )
+    h = Host(host, procs().pid)
+    seen = {}
+    h.proc_kw["on_wait"] = lambda _p: seen.update(jobs=d.jobs.summary(), slots=d.slots.summary())
+    monkeypatch.setenv("LOADGOV_KEY", "ENV-1")
+    base = ("--kind", "gate", "--project", "proj-a", "--label", "g")
+    assert go(monkeypatch, d, h.deps, *base, "--key", "PROJ-42", "--", "true") == 0
+    acquire = next(a for op, a in sent if op == "slot_acquire")
+    start_args = next(a for op, a in sent if op == "job_start")
+    assert (acquire["key"], acquire["kind"], start_args["key"]) == ("PROJ-42", "gate", "PROJ-42")
+    assert seen["jobs"][0]["key"] == "PROJ-42" and seen["slots"]["heavy"]["key"] == "PROJ-42"
+    sent.clear()
+    assert go(monkeypatch, d, h.deps, *base, "--", "true") == 0  # LOADGOV_KEY is the default
+    assert next(a for op, a in sent if op == "slot_acquire")["key"] == "ENV-1"
+    sent.clear()
+    assert go(monkeypatch, d, h.deps, *base, "--key", "bad key", "--", "true") == 2  # before anything starts
+    assert sent == []

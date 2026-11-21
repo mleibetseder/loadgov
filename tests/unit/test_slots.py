@@ -21,7 +21,7 @@ from loadgov.cli import loadctl
 from loadgov.cli.client import request
 from loadgov.config import Config, ConfigError, parse_config
 from loadgov.daemon.main import Daemon
-from loadgov.engines.slots import SlotManager, pid_alive
+from loadgov.engines.slots import Progress, SlotManager, pid_alive
 from loadgov.host.procfs import HostFS
 from loadgov.protocol import VERSION, validate_status
 
@@ -416,7 +416,7 @@ def test_drain_profile_holds_heavy_slot_and_leaving_drain_releases_it(fake_host,
     assert d.slots.summary()["heavy"]["state"] == "free"
 
 
-def test_stuck_flag_after_45_minutes(fake_host, tmp_path, procs):
+def test_a_long_hold_alone_is_not_stuck_and_heavy_slot_mirrors_the_slot_flag(fake_host, tmp_path, procs):
     d, _ = mk_daemon(fake_host, tmp_path)
     t = [time.time()]
     d.slots.clock = d.clock = lambda: t[0]
@@ -424,8 +424,17 @@ def test_stuck_flag_after_45_minutes(fake_host, tmp_path, procs):
     acq(d, a.pid)
     assert d.slots.summary()["heavy"]["stuck"] is False
     t[0] += 46 * 60
-    s = d.tick()["slots"]["heavy"]
-    assert s["stuck"] is True and s["held_since"]
+    st = d.tick()
+    s = st["slots"]["heavy"]
+    # the fake /proc has no data for the holder: progress is unknown, so a 46-minute hold is not stuck
+    assert s["held_s"] >= 46 * 60 and s["idle_s"] is None and s["stuck"] is False and s["held_since"]
+    assert st["heavy_slot"]["stuck"] is False
+    slot = d.slots.slots["heavy"]  # now it is known and has been idle for 11 minutes
+    slot.progress = Progress(d.slots._watch_key(slot), t[0], t[0], 1.0, t[0] - 11 * 60, True)
+    st = d.tick()
+    assert st["slots"]["heavy"]["stuck"] is True and st["heavy_slot"]["stuck"] is True
+    assert call(d, "status")["status"]["heavy_slot"]["stuck"] is True
+    assert call(d, "status")["status"]["slots"]["heavy"]["idle_s"] == 11 * 60
 
 
 def test_stale_and_timed_out_waiters_are_dropped(fake_host, tmp_path, procs):
@@ -488,7 +497,9 @@ def test_status_has_valid_slots_section(fake_host, tmp_path):
     s = d.tick()
     assert validate_status(s) == []
     assert s["slots"]["heavy"] == {
-        "state": "free", "holder": None, "source": None, "queue": 0, "held_since": None, "stuck": False,
+        "key": None, "url": None, "waiters": [],
+            "state": "free", "holder": None, "source": None, "queue": 0, "nested": 0, "held_since": None,
+        "held_s": None, "idle_s": None, "stuck": False,
         "hold": None, "hold_origin": None,
     }  # fmt: skip
     assert call(d, "status")["status"]["slots"]["compile"]["state"] == "free"

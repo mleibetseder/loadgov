@@ -143,7 +143,7 @@ class Rig:
             tokens_file=str(self.tmp / "tokens.env"),
             memguard_options={
                 "opener": self.kernel.opener, "sender": self.kernel.sender, "closer": self.kernel.closer,
-                "docker_runner": self.kernel.docker_runner, "snapshot_reader": lambda _p: SNAP,
+                "docker_runner": self.kernel.docker_runner, "docker_spawn": lambda f: f(), "snapshot_reader": lambda _p: SNAP,
                 "monotonic": self.clock, "override": self.override,
                 "restrict_cgroup": self.restrict,
             },
@@ -246,7 +246,7 @@ class Rig:
         self.add(base, "bash", 1, 5, cmd=f"bash /tmp/loop-a-snap.{base} dispatch.sh")
         self.add(base + 1, "claude", base, 600, cmd="claude -p")
         if rustc_mb:
-            self.add(base + 2, "rustc", base + 1, rustc_mb, cmd="rustc --crate-name backend")
+            self.add(base + 2, "rustc", base + 1, rustc_mb, cmd="rustc --crate-name app")
         else:
             self.add(base + 2, "node", base + 1, rss_work, cmd="node vitest")
         self.add(base + 3, "sh", base + 2, 100)

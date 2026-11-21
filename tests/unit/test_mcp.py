@@ -338,3 +338,14 @@ def test_status_shows_strays_and_there_is_no_kill_tool(daemon):
     d = daemon(status=lambda a: st)
     assert Tools(d.path).get_status()["strays"]["check_s"] == 300
     assert not [n for n in dir(Tools) if "stray" in n or "kill" in n]
+
+
+def test_wait_headroom_while_starting_respects_a_short_timeout(daemon):
+    """A starting daemon must not hold a `timeout_sec` < 30 call to the client's 30 s retry window."""
+    h = counting(lambda n: {"ok": False, "error": "starting", "message": "no sample yet"})
+    naps = []
+    t = Tools(daemon(headroom=h).path, sleep=naps.append)
+    t0 = time.monotonic()
+    r = t.wait_headroom("impl", 5)
+    assert time.monotonic() - t0 < 5  # the client did not retry on its own
+    assert r["result"] == "timeout" and sum(naps) == 5

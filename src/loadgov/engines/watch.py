@@ -138,10 +138,11 @@ class Watch:
             found["swap"] = (lvl, "Swap growing", msg, [])
 
         for name, sl in s.get("slots", {}).items():
-            stale = sl.get("stuck") or (name == "heavy" and s.get("heavy_slot", {}).get("stuck"))
-            if sl.get("state") == "held" and stale:  # an owner hold is not a stuck job (HA reminds)
+            if sl.get("state") == "held" and sl.get("stuck"):  # an owner hold is not a stuck job (HA reminds)
                 who = sl.get("holder") or "an unnamed holder"
-                msg = f"The {name} slot has been held since {sl.get('held_since')} by {who}"
+                idle = (sl.get("idle_s") or 0) // 60
+                msg = (f"The {name} slot has been held since {sl.get('held_since')} by {who}, "
+                       f"with no CPU progress for {idle} min")  # fmt: skip
                 found[f"stuck_holder:{name}"] = ("warning", f"{name} slot held too long", msg,
                                                  ACTIONS["stuck_holder"])  # fmt: skip
 

@@ -137,9 +137,9 @@ with the README's curl step before relying on them.
 
 - Agents and scripts wait with `loadctl wait --kind <impl|review|gate|compile> --project <name> --label <what>`
   and run heavy jobs with `loadctl run --kind gate|compile --project <name> --label <what> -- <command>`.
-- **Never wrap a command that takes a slot itself** in `loadctl run` (for example a gate script that already
-  calls `loadctl run --kind gate`, or a build whose `RUSTC_WRAPPER` is the compile shim): the inner call
-  waits for the slot its parent holds, forever.
+- Nesting the same slot is safe: a command that takes a slot itself and runs inside a job holding that slot
+  (a build whose `RUSTC_WRAPPER` is the compile shim inside `loadctl run --kind compile`) is granted
+  re-entrantly. A different slot inside still waits (a gate inside a compile job waits for heavy).
 - Existing scripts can point at the shims in `/opt/loadgov/compat` instead (see the README table for their
   environment variables). Replace a running loop script only between runs, by copying to a temporary name and
   renaming, and keep the old file as a backup.

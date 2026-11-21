@@ -9,6 +9,7 @@ from loadgov.daemon.principal import caller_info
 from loadgov.daemon.slot_ops import _err, _text
 from loadgov.engines.jobs import Job
 from loadgov.engines.slots import SLOT_FILES, pid_alive
+from loadgov.keys import key_error
 
 _UNIT = re.compile(r"^loadgov-[A-Za-z0-9:_.-]+\.scope$")
 _CGROUP = re.compile(r"^/[A-Za-z0-9:_.@/-]+$")
@@ -62,6 +63,9 @@ def handle(d, op: str, args: dict, peer_pid: int | None) -> dict:
         return _err("bad_request", "cgroup must be a string")
     if ".." in cgroup or len(cgroup) > 400 or not _CGROUP.match(cgroup) or not cgroup.endswith(f"/{unit}"):
         return _err("invalid_args", f"cgroup must be an absolute path ending in /{unit}")
+    key = args.get("key")
+    if key is not None and (why := key_error(key)):
+        return _err("bad_request" if not isinstance(key, str) else "invalid_args", why)
     pid, bad = _int(args, "pid")
     if bad:
         return bad
@@ -80,10 +84,12 @@ def handle(d, op: str, args: dict, peer_pid: int | None) -> dict:
         return _err("invalid_args", f"job {unit} is already registered")
     bound = False
     if slot:
-        bound = d.slots.bind_scope(slot, owner, unit, cgroup, pid)
-        if not bound:
+        bound = d.slots.bind_scope(slot, owner, unit, cgroup, pid, kind, key)
+        if not bound and not d.slots.is_nested(slot, owner):
             return _err("invalid_args", f"pid {owner} does not hold the {slot} slot")
-    j = Job(kind, project, label, unit, cgroup, pid, d.jobs.start_of(pid), owner, slot, d.clock())
+        if not bound:
+            slot = None  # a nested grant: the job runs in its own scope but binds no slot
+    j = Job(kind, project, label, unit, cgroup, pid, d.jobs.start_of(pid), owner, slot, d.clock(), key=key)
     d.jobs.add(j)
     d.backstop.on_job(unit, cgroup)  # memory.oom.group = 1 on the new scope (backstop enabled only)
     d._after_change({**ctx, "project": project})

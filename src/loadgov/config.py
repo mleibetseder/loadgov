@@ -6,7 +6,7 @@ import ipaddress
 import os
 import re
 import tomllib
-from dataclasses import dataclass, field, fields, replace
+from dataclasses import dataclass, field, fields, is_dataclass, replace
 from urllib.parse import urlsplit
 
 DEFAULT_CONFIG = "/etc/loadgov/loadgov.toml"
@@ -17,6 +17,7 @@ RANGES: dict[str, tuple[float, float, float]] = {
     "target_cpu_pct": (35, 90, 5),
     "load_max": (1.0, 6.0, 0.5),
     "max_implementers": (0, 4, 1),
+    "max_reviewers": (0, 8, 1),
     "ram_floor_gb": (2.0, 6.0, 0.5),
 }
 PARAMS = tuple(RANGES)
@@ -27,12 +28,13 @@ RESTRICTIVE: dict[str, int] = {
     "target_cpu_pct": -1,
     "load_max": -1,
     "max_implementers": -1,
+    "max_reviewers": -1,
     "cargo_build_jobs": -1,
     "vitest_max_workers": -1,
     "gate_shard_budget": -1,
     "ram_floor_gb": +1,
 }
-INT_PARAMS = ("max_implementers",)
+INT_PARAMS = ("max_implementers", "max_reviewers")
 
 
 class ConfigError(ValueError):
@@ -55,7 +57,7 @@ def tighten(param: str, a: float, b: float) -> float:
 
 
 def check_param(name: str, value) -> float | int:
-    """Validate one tunable against RANGES; return it as int (max_implementers) or float."""
+    """Validate one tunable against RANGES; return it as int (max_implementers, max_reviewers) or float."""
     if name not in RANGES:
         raise ConfigError(f"unknown parameter {name!r}")
     if isinstance(value, bool) or not isinstance(value, int | float):
@@ -80,6 +82,7 @@ class Profile:
     vitest_max_workers: int = 2
     gate_shard_budget: int = 2
     hold_heavy_slot: bool = False  # drain holds the heavy slot (SlotManager.set_profile_hold)
+    max_reviewers: int = 3  # parallel review jobs (the review lane, see engines/headroom.decide_review)
 
     def __post_init__(self):
         if self.impl_max_quiet is None:
@@ -87,10 +90,10 @@ class Profile:
 
 
 BUILTIN_PROFILES: dict[str, Profile] = {
-    "silent": Profile(2.0, 50.0, 2.0, 1, 1),
+    "silent": Profile(2.0, 50.0, 2.0, 1, 1, max_reviewers=1),
     "balanced": Profile(),
-    "boost": Profile(5.5, 85.0, 5.0, 3, 3),
-    "drain": Profile(2.0, 50.0, 2.0, 0, 1, hold_heavy_slot=True),
+    "boost": Profile(5.5, 85.0, 5.0, 3, 3, max_reviewers=4),
+    "drain": Profile(2.0, 50.0, 2.0, 0, 1, hold_heavy_slot=True, max_reviewers=0),
 }
 
 
@@ -103,11 +106,15 @@ HEADROOM_DEFAULTS: dict = {
     "psi_max": 20,
     "mem_min_gb": 4,
     "swap_max_mb": 1024,
+    "swap_in_max": 50,  # pages/s (about 200 KB/s at 4 KiB pages)
     "mem_psi_max": 5,
     "confirm_s": 60,
     "poll_s": 30,
     "max_wait_s": 7200,
 }
+# Reviews (an agent reading code) use the review lane: only the memory floor and the parallel cap apply,
+# so their default floor is lower; load and PSI keys of a review kind table are accepted but ignored.
+REVIEW_DEFAULTS: dict = {"mem_min_gb": 2}
 DEFAULT_PROJECT = "default"
 _NPROC_RE = re.compile(r"^nproc(?:\s*([-+*/])\s*(\d+(?:\.\d+)?))?$")
 
@@ -119,6 +126,7 @@ class Thresholds:
     psi_max: float
     mem_min_gb: float
     swap_max_mb: float
+    swap_in_max: float
     mem_psi_max: float
     confirm_s: float
     poll_s: float
@@ -129,6 +137,7 @@ class Thresholds:
 class HeadroomConfig:
     io_psi_gate: bool = False  # io PSI is only recorded (would_block_io) until flipped with trial data
     io_psi_max: float = 25.0
+    psi_busy_gate_pct: float = 80.0  # cpu PSI counts only while busy % >= this; 0 = always
     kinds: dict = field(default_factory=dict)  # kind -> raw overrides, every project
     projects: dict = field(default_factory=dict)  # project -> kind -> raw overrides, config only
 
@@ -217,6 +226,26 @@ def _parse_rest(raw) -> RestConfig:
 class HaConfig:
     enabled: bool = False  # push alerts to a Home Assistant webhook (the id lives in tokens.env)
     url: str = "http://homeassistant.local:8123"
+
+
+@dataclass(frozen=True)
+class KeysConfig:
+    url: str = ""  # link template for an issue key, with "{key}"; empty = no links
+
+
+def _parse_keys(raw) -> KeysConfig:
+    if not isinstance(raw, dict) or set(raw) - {"url"}:
+        raise ConfigError("keys: expected a table with only the key 'url'")
+    url = raw.get("url", "")
+    if not isinstance(url, str):
+        raise ConfigError("keys.url: expected a string")
+    if url and (
+        not url.startswith(("http://", "https://"))
+        or "{key}" not in url
+        or re.search(r"[\s\x00-\x1f\x7f]", url)
+    ):
+        raise ConfigError("keys.url: expected an http(s) URL template without spaces that contains {key}")
+    return KeysConfig(url)
 
 
 @dataclass(frozen=True)
@@ -392,6 +421,7 @@ class Config:
     backstop: BackstopConfig = field(default_factory=BackstopConfig)
     principal: PrincipalConfig = field(default_factory=PrincipalConfig)
     strays: StraysConfig = field(default_factory=StraysConfig)
+    keys: KeysConfig = field(default_factory=KeysConfig)
 
 
 def eval_nproc(value, nproc: int) -> float:
@@ -437,7 +467,8 @@ def thresholds(h: HeadroomConfig, kind: str, project: str | None, nproc: int) ->
     if kind not in KINDS:
         raise ValueError(f"kind must be one of {', '.join(KINDS)}")
     per_project = h.projects.get(project or DEFAULT_PROJECT, {})
-    raw = {**HEADROOM_DEFAULTS, **h.kinds.get(kind, {}), **per_project.get(kind, {})}
+    base = {**HEADROOM_DEFAULTS, **(REVIEW_DEFAULTS if kind == "review" else {})}
+    raw = {**base, **h.kinds.get(kind, {}), **per_project.get(kind, {})}
     l5 = raw.pop("load5_max")
     num = {k: eval_nproc(v, nproc) for k, v in raw.items()}
     return Thresholds(load5_max=None if l5 is False else eval_nproc(l5, nproc), **num)
@@ -447,7 +478,7 @@ def _parse_headroom(raw) -> HeadroomConfig:
     if not isinstance(raw, dict):
         raise ConfigError("headroom: expected a table")
     for key in raw:
-        if key not in ("io_psi_gate", "io_psi_max", "kinds"):
+        if key not in ("io_psi_gate", "io_psi_max", "psi_busy_gate_pct", "kinds"):
             raise ConfigError(f"headroom: unknown key {key!r}")
     gate = raw.get("io_psi_gate", False)
     if not isinstance(gate, bool):
@@ -455,6 +486,9 @@ def _parse_headroom(raw) -> HeadroomConfig:
     io_max = raw.get("io_psi_max", 25.0)
     if isinstance(io_max, bool) or not isinstance(io_max, int | float) or io_max <= 0:
         raise ConfigError("headroom.io_psi_max: expected a number > 0")
+    gate_pct = raw.get("psi_busy_gate_pct", 80.0)
+    if isinstance(gate_pct, bool) or not isinstance(gate_pct, int | float) or not 0 <= gate_pct <= 100:
+        raise ConfigError("headroom.psi_busy_gate_pct: expected a number from 0 to 100")
     kinds = raw.get("kinds", {})
     if not isinstance(kinds, dict):
         raise ConfigError("headroom.kinds: expected a table")
@@ -462,7 +496,7 @@ def _parse_headroom(raw) -> HeadroomConfig:
         if k not in KINDS:
             raise ConfigError(f"headroom.kinds.{k}: unknown kind ({', '.join(KINDS)})")
         _check_kind_overrides(f"headroom.kinds.{k}", v)
-    return HeadroomConfig(gate, float(io_max), dict(kinds))
+    return HeadroomConfig(gate, float(io_max), float(gate_pct), dict(kinds))
 
 
 def _parse_projects(projects, h: HeadroomConfig) -> HeadroomConfig:
@@ -699,6 +733,7 @@ def parse_config(text: str) -> Config:
             "backstop",
             "principal",
             "strays",
+            "keys",
         ):
             raise ConfigError(f"unknown key {key!r}")
     profiles = dict(BUILTIN_PROFILES)
@@ -731,7 +766,7 @@ def parse_config(text: str) -> Config:
         _parse_ha(raw.get("ha", {})), _parse_compat(raw.get("compat", {})), governor.get("enforce", False),
         _parse_memguard(raw.get("memguard", {})), _parse_reaper(raw.get("reaper", {})),
         _parse_backstop(raw.get("backstop", {})), _parse_principal(raw.get("principal", {})),
-        _parse_strays(raw.get("strays", {})),
+        _parse_strays(raw.get("strays", {})), _parse_keys(raw.get("keys", {})),
     )  # fmt: skip
 
 
@@ -745,3 +780,25 @@ def load_config(path: str | None) -> Config:
     except FileNotFoundError:
         return Config()
     return parse_config(text)
+
+
+def _flatten(value, prefix: str = "") -> dict[str, object]:
+    if is_dataclass(value) and not isinstance(value, type):
+        items = [(f.name, getattr(value, f.name)) for f in fields(value)]
+    elif isinstance(value, dict):
+        items = [(str(k), v) for k, v in value.items()]
+    else:
+        return {prefix: value}
+    out: dict[str, object] = {}
+    for k, v in items:
+        out.update(_flatten(v, f"{prefix}.{k}" if prefix else k))
+    return out
+
+
+def changed_keys(old: Config, new: Config) -> list[str]:
+    """Dotted paths of the settings that differ between two configs (a whole table that appears or goes)."""
+    a, b = _flatten(old), _flatten(new)
+    return sorted(k for k in a.keys() | b.keys() if a.get(k, _MISSING) != b.get(k, _MISSING))
+
+
+_MISSING = object()

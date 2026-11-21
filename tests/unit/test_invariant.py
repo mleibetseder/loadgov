@@ -5,7 +5,7 @@ import tempfile
 
 import pytest
 
-from loadgov.config import BUILTIN_PROFILES, PARAMS, RANGES, loosens
+from loadgov.config import BUILTIN_PROFILES, INT_PARAMS, PARAMS, RANGES, loosens
 from loadgov.daemon.state import StateStore
 from loadgov.engines.limits import AGENT, Ceiling, Limits, LimitState, Override
 
@@ -97,7 +97,7 @@ def random_op(rng, lim, clock, store=None):
 def _value(rng, param):
     lo, hi, step = RANGES[param]
     v = rng.choice([lo, (lo + hi) / 2 // step * step, hi])  # few values: collisions find the edge cases
-    return int(v) if param == "max_implementers" else float(v)
+    return int(v) if param in INT_PARAMS else float(v)
 
 
 def test_random_sequences_never_leave_an_agent_looser_than_the_owner_baseline():

@@ -6,10 +6,12 @@ import json
 
 VERSION = 1
 DEFAULT_SOCKET = "/run/loadgovd/loadgovd.sock"
+STARTING = "starting"  # error code of a request before the first sample; the client retries it
 
 NUM = (int, float)
 OPT_STR = (str, type(None))
 OPT_INT = (int, type(None))
+OPT_NUM = (int, float, type(None))
 OPT_DICT = (dict, type(None))
 LEVEL = ("OK", "BUSY", "LIMIT")
 
@@ -22,6 +24,7 @@ STATUS_SCHEMA: dict[str, tuple] = {
     "cpu.busy_pct": NUM,
     "cpu.psi_some_avg10": NUM,
     "cpu.psi_some_avg60": NUM,
+    "cpu.psi_effective": NUM,
     "cpu.load1": NUM,
     "cpu.load5": NUM,
     "cpu.load1_per_core": NUM,
@@ -33,6 +36,8 @@ STATUS_SCHEMA: dict[str, tuple] = {
     "swap.total_mb": (int,),
     "swap.used_mb": (int,),
     "swap.used_pct": NUM,
+    "swap.in_rate": NUM,
+    "swap.out_rate": NUM,
     "io.psi_some_avg10": NUM,
     "io.psi_some_avg60": NUM,
     "io.psi_full_avg60": NUM,
@@ -57,18 +62,52 @@ STATUS_SCHEMA: dict[str, tuple] = {
     "slots.heavy.holder": OPT_STR,
     "slots.heavy.source": OPT_STR,
     "slots.heavy.queue": (int,),
+    "slots.heavy.nested": (int,),
     "slots.heavy.held_since": OPT_STR,
+    "slots.heavy.held_s": OPT_INT,
+    "slots.heavy.idle_s": OPT_INT,
     "slots.heavy.stuck": (bool,),
     "slots.heavy.hold": OPT_STR,
     "slots.heavy.hold_origin": OPT_STR,
+    "slots.heavy.key": OPT_STR,
+    "slots.heavy.url": OPT_STR,
+    "slots.heavy.waiters": (list,),
+    "slots.heavy.waiters[].position": (int,),
+    "slots.heavy.waiters[].project": (str,),
+    "slots.heavy.waiters[].label": (str,),
+    "slots.heavy.waiters[].kind": OPT_STR,
+    "slots.heavy.waiters[].key": OPT_STR,
+    "slots.heavy.waiters[].url": OPT_STR,
+    "slots.heavy.waiters[].pid": (int,),
+    "slots.heavy.waiters[].queued_since": (str,),
+    "slots.heavy.waiters[].wait_s": (int,),
+    "slots.heavy.waiters[].expected_s": OPT_NUM,
+    "slots.heavy.waiters[].eta": OPT_STR,
     "slots.compile.state": (str,),
     "slots.compile.holder": OPT_STR,
     "slots.compile.source": OPT_STR,
     "slots.compile.queue": (int,),
+    "slots.compile.nested": (int,),
     "slots.compile.held_since": OPT_STR,
+    "slots.compile.held_s": OPT_INT,
+    "slots.compile.idle_s": OPT_INT,
     "slots.compile.stuck": (bool,),
     "slots.compile.hold": OPT_STR,
     "slots.compile.hold_origin": OPT_STR,
+    "slots.compile.key": OPT_STR,
+    "slots.compile.url": OPT_STR,
+    "slots.compile.waiters": (list,),
+    "slots.compile.waiters[].position": (int,),
+    "slots.compile.waiters[].project": (str,),
+    "slots.compile.waiters[].label": (str,),
+    "slots.compile.waiters[].kind": OPT_STR,
+    "slots.compile.waiters[].key": OPT_STR,
+    "slots.compile.waiters[].url": OPT_STR,
+    "slots.compile.waiters[].pid": (int,),
+    "slots.compile.waiters[].queued_since": (str,),
+    "slots.compile.waiters[].wait_s": (int,),
+    "slots.compile.waiters[].expected_s": OPT_NUM,
+    "slots.compile.waiters[].eta": OPT_STR,
     "jobs": (list,),
     "jobs[].kind": (str,),
     "jobs[].project": (str,),
@@ -78,6 +117,37 @@ STATUS_SCHEMA: dict[str, tuple] = {
     "jobs[].pid": (int,),
     "jobs[].slot": OPT_STR,
     "jobs[].since": (str,),
+    "jobs[].key": OPT_STR,
+    "jobs[].url": OPT_STR,
+    "jobs[].expected_s": OPT_NUM,
+    "jobs[].eta": OPT_STR,
+    "jobs[].overdue": (bool,),
+    "job_stats": (list,),
+    "job_stats[].project": (str,),
+    "job_stats[].kind": (str,),
+    "job_stats[].count": (int,),
+    "job_stats[].duration_sum_s": NUM,
+    "job_stats[].duration_p50_s": OPT_NUM,
+    "job_stats[].cpu_p50_s": OPT_NUM,
+    "job_stats[].cpu_p95_s": OPT_NUM,
+    "job_stats[].docker_cpu_p50_s": OPT_NUM,
+    "job_stats[].docker_cpu_p95_s": OPT_NUM,
+    "job_stats[].total_cpu_p50_s": OPT_NUM,
+    "job_stats[].total_cpu_p95_s": OPT_NUM,
+    "job_stats[].host_cpu_p50_s": OPT_NUM,
+    "job_stats[].mem_peak_p50_mb": OPT_NUM,
+    "job_stats[].mem_peak_p95_mb": OPT_NUM,
+    "job_stats[].mem_peak_max_mb": OPT_NUM,
+    "job_stats[].cpu_total_s": NUM,
+    "job_stats[].docker_cpu_total_s": NUM,
+    "projects": (dict,),
+    "projects{}.cpu_pct": OPT_NUM,
+    "projects{}.cores": OPT_NUM,
+    "projects{}.docker_cpu_pct": NUM,
+    "projects{}.mem_mb": OPT_INT,
+    "projects{}.jobs": (int,),
+    "projects{}.waiting": (int,),
+    "projects{}.slice": (str,),
     "cgroups": (dict,),
     "stopped": (list,),
     "stopped[].pid": (int,),
@@ -135,6 +205,7 @@ STATUS_SCHEMA: dict[str, tuple] = {
     "memguard.resume_mb": (int,),
     "memguard.crit_mb": (int,),
     "memguard.baseline_swap_mb": (int,),
+    "memguard.containers_age_s": OPT_NUM,
     "memguard.paused": (list,),
     "memguard.paused[].id": (str,),
     "memguard.paused[].kind": (str,),
@@ -160,6 +231,8 @@ STATUS_SCHEMA: dict[str, tuple] = {
     "backstop.memory_max_mb": OPT_INT,
     "backstop.memory_swap_max_mb": OPT_INT,
     "backstop.oom_kills": (int,),
+    "backstop.max_events": (int,),
+    "backstop.swap_fail_events": (int,),
     "backstop.last_event": OPT_STR,
     "backstop.note": OPT_STR,
     "strays.enabled": (bool,),
@@ -187,6 +260,7 @@ STATUS_SCHEMA: dict[str, tuple] = {
     "daemon.mode": (str,),
     "daemon.enforce": (dict,),
     "daemon.tick_s": NUM,
+    "daemon.memory_protection_mb": (int,),
 }
 
 
@@ -202,6 +276,23 @@ def validate_status(status: dict) -> list[str]:
     """Return a list of schema violations (empty = valid)."""
     errors = []
     for path, types in STATUS_SCHEMA.items():
+        if "{}" in path:  # one entry per key of a dict of objects
+            base, _, sub = path.partition("{}.")
+            try:
+                items = _get(status, base)
+            except KeyError:
+                continue
+            if not isinstance(items, dict):
+                continue  # reported by the base entry
+            for name, item in items.items():
+                try:
+                    v = _get(item, sub)
+                except KeyError:
+                    errors.append(f"{base}.{name}.{sub}: missing")
+                    continue
+                if not isinstance(v, types) or isinstance(v, bool) and bool not in types:
+                    errors.append(f"{base}.{name}.{sub}: {type(v).__name__}")
+            continue
         if "[]" in path:
             base, _, sub = path.partition("[].")
             try:

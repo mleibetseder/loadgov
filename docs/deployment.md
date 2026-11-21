@@ -8,7 +8,8 @@ on enforcement one flag at a time. Every command runs as root on the host. Proto
 
 - One step at a time; the next step starts when the go criterion of the current one is met.
 - Every `enforce` flag stays `false` until its step says otherwise. A step is one config line and one
-  `systemctl restart loadgovd`.
+  `systemctl reload loadgovd` (or `restart`; `loadgovd --check-config /etc/loadgov/loadgov.toml` checks the file first; settings
+  that only apply at start are listed in [protocol.md, Daemon lifecycle](protocol.md#daemon-lifecycle)).
 - Run heavy commands with `nice -n 10` and never while a heavy job holds `/run/lock/host-heavy-slot.lock`.
 - Nothing is changed on a Home Assistant instance without its owner's approval.
 
@@ -69,6 +70,20 @@ systemctl enable --now loadgovd
 systemctl --no-pager status loadgovd | head -5
 loadctl status --json | jq '{mode: .daemon.mode, gov: .governor.enforce, rest: .rest.state}'
 ```
+
+**Survives thrash.** The unit reserves memory for the daemon (`MemoryMin=96M`, RSS is about 38 MB), raises its
+CPU and IO weight, and keeps `OOMScoreAdjust=-900`. Check after an install or unit change:
+`systemctl show loadgovd -p MemoryMin -p CPUWeight -p WatchdogUSec -p TimeoutStartUSec`. `MemoryMin` only
+protects as far as the parent slices allow (cgroup v2 caps a child's protection at its parents'), so
+`packaging/install.sh` installs `/etc/systemd/system/system.slice.d/50-loadgov-memorymin.conf` (`[Slice]
+MemoryMin=96M`) before its `daemon-reload`. It leaves `system.slice` alone when it already has `MemoryMin` of
+96M or more from another drop-in (it never lowers an admin's value), and refreshes its own file on a re-run.
+Verify: read `memory.min` of `loadgovd.service` and each parent
+(`cat /sys/fs/cgroup/system.slice/loadgovd.service/memory.min /sys/fs/cgroup/system.slice/memory.min`) and
+check that the first one is not 0 and that no parent in the chain is 0 (a parent at 0 caps the protection
+at 0). `loadctl status --json | jq .daemon.memory_protection_mb` shows the least value along the daemon's
+cgroup path, and `loadctl status` prints a `warn  memory protection 0 MB` line when it is 0 (then set
+`MemoryMin=` on the slice that is 0). Rollback: delete the drop-in file and `systemctl daemon-reload`.
 
 **Go.** `mode` is `observe`, `governor.enforce` is `false`, `loadctl status` answers, `journalctl -u loadgovd -n 50`
 shows no traceback, and nothing under `/sys/fs/cgroup` changed.
@@ -142,3 +157,5 @@ loadgovd --recover --force                      # only with the daemon stopped: 
 
 `systemctl disable --now loadgovd` removes the daemon; the last cpu cap stays in place, and the lock files and
 client scopes are untouched.
+
+Downgrading to a daemon older than the queue view: the new `key` and `job_kind` fields in `state.json` are unknown to it, so it drops the saved holder and job bookkeeping on start (client locks stay held by their clients).

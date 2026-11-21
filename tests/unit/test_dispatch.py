@@ -178,11 +178,14 @@ def test_status_carries_limits_and_validates(daemon, fake_host):
         "mode": "observe",
         "enforce": {"governor": False, "slots": False, "memguard": False, "reaper": False},
         "tick_s": 5.0,
+        "memory_protection_mb": 96,
     }
     s["limits"] = daemon.limits_summary()
     s["rest"] = daemon.rest.status()
     s["slots"] = daemon.slots.summary()
     s["jobs"] = daemon.jobs.summary()
+    s["job_stats"] = daemon.jobs.stats.summary()
+    s["projects"] = daemon.projects.summary()
     s["alerts"], s["ha_push"] = daemon.watch.summary(), daemon.ha.status()
     s["governor"] = daemon.governor.status()
     s["memguard"], s["capabilities"] = daemon.memguard.status(), ["freeze", "reap"]

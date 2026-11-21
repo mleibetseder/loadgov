@@ -53,7 +53,11 @@ def test_daemon_serves_status_and_writes_only_its_run_dir(fake_host, tmp_path):
             if sock.exists():
                 break
             time.sleep(0.05)
-        reply = request(str(sock), "status")
+        for _ in range(400):  # READY and the socket come before the first tick: not_ready until it ran
+            reply = request(str(sock), "status")
+            if reply.get("error") not in ("starting", "not_ready"):
+                break
+            time.sleep(0.05)
         assert reply["ok"] is True
         assert validate_status(reply["status"]) == []
         assert reply["status"]["daemon"]["mode"] == "observe"

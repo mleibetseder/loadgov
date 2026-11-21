@@ -24,10 +24,19 @@ def worst(*levels: str) -> str:
     return max(levels, key=ORDER.__getitem__)
 
 
+def effective_psi(raw: float, busy_pct: float, gate_pct: float) -> float:
+    """CPU pressure that counts: the raw value when the CPU is busy (busy % >= gate), else 0.
+
+    Throttled cgroups (a docker `--cpus` cap, loadgov's own cpu.max) raise CPU PSI while cores sit idle.
+    gate 0 always counts the raw value. Monotonic in busy %: a busier host never counts less.
+    """
+    return raw if busy_pct >= gate_pct else 0.0
+
+
 def evaluate(s: dict) -> tuple[dict[str, str], str]:
     values = {
         "cpu_pct": s["cpu"]["busy_pct"],
-        "cpu_psi60": s["cpu"]["psi_some_avg60"],
+        "cpu_psi60": s["cpu"]["psi_effective"],
         "load1_per_core": s["cpu"]["load1_per_core"],
         "ram_avail_mb": s["memory"]["avail_mb"],
         "swap_used_pct": s["swap"]["used_pct"],

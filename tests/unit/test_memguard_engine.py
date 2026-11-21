@@ -132,6 +132,71 @@ def test_a_compile_tree_is_skipped_hold_then_abort_below_crit():
     assert g.paused == []  # nothing was paused: a stopped rustc keeps its memory
 
 
+def test_hold_then_reap_and_abort_in_the_same_sample():
+    """1800 MB holds the 9 GB compile; 650 MB reaps a JVM daemon and aborts the compile in the same sample."""
+    g, t = make_engine()
+    comp = a_tree(big_rustc_mb=9000, rustc=(4242, 5))
+    daemon = jvm.Jvm(4343, 7, in_scope=True)
+
+    def step(avail):
+        t[0] += 5
+        return g.step(avail, 0, 3.0, True, lambda: [comp], lambda: [daemon])
+
+    assert step(2300) == []
+    assert step(1800) == []  # HOLD: above CRIT, and a fall of 500 MB is not fast
+    assert [e["kind"] for e in g.drain_events()] == ["HOLD"]
+    acts = step(650)
+    assert [a.op for a in acts] == ["reap", "abort"]
+    assert acts[0].jvm == [daemon] and acts[1].tree.rustc == (4242, 5) and not acts[1].would
+    assert [e["kind"] for e in g.drain_events()] == ["REAP", "ABORT"]
+    assert step(650) == [] and g.paused == []  # 15 s quiet after the abort
+
+
+def test_abort_with_the_reap_in_the_same_sample_is_a_would_in_shadow_mode():
+    g, t = make_engine()
+    comp = a_tree(big_rustc_mb=9000, rustc=(4242, 5))
+    t[0] += 5
+    acts = g.step(650, 0, 3.0, False, lambda: [comp], lambda: [jvm.Jvm(9, 7, in_scope=True)])
+    assert [(a.op, a.would) for a in acts] == [("reap", True), ("abort", True)]
+
+
+def test_reap_in_the_sample_does_not_pause_or_abort_when_a_tree_can_be_paused():
+    g, t = make_engine()
+    t[0] += 5
+    acts = g.step(1400, 0, 3.0, True, lambda: [a_tree()], lambda: [jvm.Jvm(9, 7, in_scope=True)])
+    assert [a.op for a in acts] == ["reap"]  # unchanged: the pause waits for the next sample
+
+
+def test_reap_without_a_compile_below_crit_does_not_abort():
+    g, t = make_engine()
+    t[0] += 5
+    acts = g.step(650, 0, 3.0, True, lambda: [], lambda: [jvm.Jvm(9, 7, in_scope=True)])
+    assert [a.op for a in acts] == ["reap"]
+
+
+def test_a_fast_fall_projected_below_crit_aborts_before_crit():
+    g, t = make_engine()
+    comp = a_tree(big_rustc_mb=9000, rustc=(77, 5))
+
+    def step(avail):
+        t[0] += 5
+        return g.step(avail, 0, 3.0, True, lambda: [comp], lambda: [])
+
+    assert step(3000) == []
+    assert step(2600) == []  # -400 MB: under the 512 MB trigger, HOLD
+    assert step(2500) == []  # -100 MB
+    acts = step(1900)  # -600 MB in 5 s: 1900 - 600 = 1300 is below CRIT before the next sample
+    assert [a.op for a in acts] == ["abort"] and "falling fast" in acts[0].text
+
+
+def test_a_slow_or_old_fall_is_not_a_fast_fall():
+    g, t = make_engine()
+    comp = a_tree(big_rustc_mb=9000, rustc=(77, 5))
+    g.step(3000, 0, 3.0, True, lambda: [comp], lambda: [])
+    t[0] += 60  # the last sample is too old to give a rate
+    assert g.step(2000, 0, 3.0, True, lambda: [comp], lambda: []) == []
+
+
 def test_deny_list_and_unregistered_classes_are_never_candidates():
     g, t = make_engine()
     g.deny = (*g.deny, "proj-a-test-*")  # a site's own extra glob
@@ -167,6 +232,29 @@ def test_compile_only_holds_then_aborts_the_largest_rustc_only(rig):
     ev = rig.events("ABORT")
     assert len(ev) == 1 and "below 1500MB" in ev[0]["reason"]
     assert [e["key"] for e in rig.d.watch.summary()["events"]] == ["abort"]
+
+
+def test_daemon_reaped_and_compile_aborted_in_the_same_tick(rig):
+    rig.add(800, "rustc", 1, 9000, cmd="rustc --crate-name app")
+    rig.add(700, "java", 1, 900, cmd=GRADLE)
+    rig.scope("loadgov-compile-x.scope", "compile", [800, 700])  # the daemon serves the compile
+    rig.step(avail=2300)
+    rig.step(avail=1800)
+    assert rig.kernel.sent == []
+    assert [e["request"]["event"] for e in rig.events()] == ["HOLD"]
+    rig.step(avail=650)
+    assert rig.kernel.signals() == [(700, "SIGTERM"), (800, "SIGTERM")]  # daemon, then the rustc only
+    assert len(rig.events("REAP")) == 1 and len(rig.events("ABORT")) == 1
+
+
+def test_reap_and_abort_in_shadow_mode_signals_nothing(tmp_path, fake_host):
+    r = Rig(tmp_path, fake_host, enforce=False)
+    r.impl_tree(300, rustc_mb=9000)
+    r.add(700, "java", 1, 900, cmd=GRADLE)
+    r.step(avail=2300)
+    r.step(avail=650)
+    assert r.kernel.sent == []
+    assert {e["request"]["event"] for e in r.events()} >= {"REAP", "ABORT"}
 
 
 def test_resume_is_lifo_after_three_samples_at_the_resume_level(rig):
@@ -1062,3 +1150,38 @@ def test_orphan_that_cannot_be_thawed_is_never_given_up_alerts_once_and_retries_
     r.step(avail=2500, dt=61)  # the thaw works at last: now it may be given up
     assert r.d.status["memguard"]["paused"] == []
     assert "giving up" in [e["reason"] for e in r.events("REAP")][-1]
+
+
+def test_status_reports_the_age_of_the_container_list(rig):
+    rig.step(avail=7000)
+    assert rig.d.status["memguard"]["containers_age_s"] is None  # no project has a containers rule
+    rig.d.memguard.containers_age_s = 7.26  # as set by a collect that used a 7 s old list
+    assert rig.d.memguard.status()["containers_age_s"] == 7.3
+
+
+def test_resuming_a_sigstop_tree_does_not_report_its_processes_as_foreign(rig):
+    """Sample `s` is taken before MemGuardRuntime.tick(s) thaws the tree; the just-resumed pids were ours."""
+    rig.add(700, "claude", 1, 100)
+    rig.add(701, "node", 700, 900)
+    rig.scope("loadgov-impl-x.scope", "impl", [700, 701])
+    rig.step(avail=2000)
+    assert rig.state(701) == "T" and rig.events("REPORT") == []
+    rig.step(avail=7000, dt=20)
+    rig.step(avail=7000, dt=5)
+    rig.step(avail=7000, dt=5)  # 3rd calm sample: RESUME sends SIGCONT
+    assert rig.state(701) == "S"
+    assert [e["request"]["event"] for e in rig.events()] == ["PAUSE", "RESUME"]
+    assert rig.events("REPORT") == []
+
+
+def test_zombie_children_are_ignored_and_do_not_cause_pause_failed(rig):
+    """A tree whose only non-agent descendants are zombies (Z/X) is skipped so a real tree is paused instead."""
+    t_dead = rig.impl_tree(300)
+    rig.specs[t_dead["work"]].state = "Z"
+    rig.write(t_dead["work"])
+    rig.specs[t_dead["child"]].state = "Z"
+    rig.write(t_dead["child"])
+    t_live = rig.impl_tree(400, rss_work=800)
+    rig.step(avail=2000)
+    assert rig.events("PAUSE_FAILED") == []
+    assert rig.state(t_live["work"]) == "T"

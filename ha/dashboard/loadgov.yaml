@@ -141,6 +141,73 @@ views:
       - type: grid
         cards:
           - type: heading
+            heading: Queue
+            icon: mdi:format-list-numbered
+          - type: tile
+            entity: sensor.host_level
+            name: Host level
+          - type: tile
+            entity: sensor.host_load_1min
+            name: Load 1 min
+          - type: tile
+            entity: sensor.host_load_5min
+            name: Load 5 min
+          - type: tile
+            entity: sensor.host_load_per_core
+            name: Load per core
+          - type: tile
+            entity: sensor.host_heavy_slot_holder_eta
+            name: Heavy slot free at (est.)
+          - type: tile
+            entity: sensor.host_compile_slot_holder_eta
+            name: Compile slot free at (est.)
+          - type: markdown
+            title: Running and next
+            content: |-
+              {% set jobs = state_attr('sensor.host_running_jobs', 'jobs') or [] %}
+              **Running ({{ states('sensor.host_running_jobs') }})**
+
+              {% for j in jobs -%}
+              - {{ j.kind }} {{ j.project }}: {% if j.url %}[{{ j.key }}]({{ j.url }}){% else %}{{ j.key or j.label }}{% endif %}
+              {%- if j.slot %} ({{ j.slot }} slot){% endif %}
+              {%- if j.eta %}, done ~ {{ as_timestamp(j.eta) | timestamp_custom('%H:%M') }}{% if j.overdue %} (overdue){% endif %}{% endif %}
+              {% else -%}
+              - nothing
+              {% endfor %}
+              {% for slot in ['heavy', 'compile'] %}
+              {% set e = 'sensor.host_' ~ slot ~ '_slot_next' %}
+              {% set q = state_attr(e, 'queue') %}
+              **Next in the {{ slot }} slot ({{ state_attr(e, 'count') or 0 }})**
+
+              {% for w in q or [] -%}
+              {{ w.position }}. {% if w.url %}[{{ w.key }}]({{ w.url }}){% else %}{{ w.key or w.label }}{% endif %} ({{ w.project }}, waiting {{ (w.wait_s / 60) | round(0) | int }} min
+              {%- if w.eta %}, starts ~ {{ as_timestamp(w.eta) | timestamp_custom('%H:%M') }}{% endif %})
+              {% else -%}
+              - empty
+              {% endfor %}
+              {% endfor %}
+      - type: grid
+        cards:
+          - type: heading
+            heading: Projects
+            icon: mdi:folder-multiple
+          # One CPU and one memory sensor per project, created when the project first shows up in the
+          # status: sensor.host_project_<project>_cpu / _memory. These two are placeholders for a project
+          # named "web-app"; add a pair per project you use.
+          - type: tile
+            entity: sensor.host_project_web_app_cpu
+            name: web-app CPU
+          - type: tile
+            entity: sensor.host_project_web_app_memory
+            name: web-app memory
+          - type: history-graph
+            title: Compute per project (cores)
+            hours_to_show: 6
+            entities:
+              - sensor.host_project_web_app_cpu
+      - type: grid
+        cards:
+          - type: heading
             heading: Diagnostics
             icon: mdi:stethoscope
           - type: tile

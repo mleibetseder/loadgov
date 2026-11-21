@@ -9,8 +9,8 @@ Tools: MCP `load_get_status`, `load_set_limits`, `load_wait_headroom`, `load_exp
 
 ## Before heavy work
 
-1. Call `load_wait_headroom` (kind `impl`, `review`, `gate` or `compile`) or `loadctl wait --kind <kind> --project <p>`. Do not start the job until it passes.
-2. Run builds, gates and compiles through `loadctl run --kind <kind> --project <p> --label <l> -- <cmd>`. It takes the heavy or compile slot, starts the job in its own scope under the project slice, and sets the job env from the active profile (`CARGO_BUILD_JOBS`, `VITEST_MAX_WORKERS`, `GATE_SHARD_BUDGET`). A bare command bypasses all three.
+1. Call `load_wait_headroom` (kind `impl`, `review`, `gate` or `compile`) or `loadctl wait --kind <kind> --project <p>`. Do not start the job until it passes. A `review` uses its own lane: it ignores CPU, load and PSI and waits only for free memory and a free reviewer place (`max_reviewers`, 0 in drain).
+2. Run builds, gates and compiles through `loadctl run --kind <kind> --project <p> --label <l> -- <cmd>`. It takes the heavy or compile slot, starts the job in its own scope under the project slice, and sets the job env from the active profile (`CARGO_BUILD_JOBS`, `VITEST_MAX_WORKERS`, `GATE_SHARD_BUDGET`). A bare command bypasses all three. Nesting the same slot is safe (a request from a descendant of the holder is granted re-entrantly); a different slot inside still waits.
 
 ## Changing limits
 
