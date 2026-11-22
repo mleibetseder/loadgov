@@ -218,6 +218,19 @@ io_psi_gate = false      # io PSI some avg60 < 25 blocks only when true; otherwi
 # max_mb = 50
 # keep = 5
 
+# ---- Image train (loadctl image submit / runner) -----------------------------------------------
+# Beta and release container builds queue during the day and run in a night window, one at a time (kind
+# `image`, heavy slot like a gate). A project's beta runs at most once per beta_interval_h; otherwise only
+# when the owner says `loadctl image now ID --owner --reason ...`. The daemon only arbitrates; the runner
+# (loadgov-image-runner.timer) runs the jobs. Uncomment to change (applied on reload):
+# [image]
+# window = "00:00-06:00"       # HH:MM-HH:MM wall-clock times of `timezone`; may cross midnight
+# timezone = "UTC"             # IANA name, e.g. "America/New_York"
+# beta_interval_h = 48         # a project's beta starts at most this often (from its last beta's start)
+# max_runtime_min = 90         # past this an image job raises image_overrun:<project> (never killed)
+# max_per_night = 6            # image jobs started per window
+# env_allow = ["PATH", "HOME", "LANG", "DOCKER_HOST", "DOCKER_CONFIG", "LOADGOV_KEY"]  # kept for a job
+
 # ---- Light lane (loadctl run --kind light) -----------------------------------------------------
 # Small read-only checks (lint, shellcheck, formatters in check mode, link and config checks, small unit
 # tests) take no heavy or compile slot. `loadctl run --kind light` puts each under these hard limits on

@@ -203,6 +203,10 @@ def format_status(s: dict) -> str:
     lt = s.get("light")
     if lt:
         lines.append(f"  light {lt['running']}/{lt['max']} (per project max {lt['per_project_max']})")
+    from loadgov.cli.image import format_image_line
+
+    if line := format_image_line(s.get("image"), s.get("at")):
+        lines.append(f"  {line}")
     pj = format_projects(s.get("projects"))
     if pj:
         lines.append(f"  projects {pj}")
@@ -399,6 +403,9 @@ def _parser() -> argparse.ArgumentParser:
     lw.add_argument("max_s", nargs="?", type=float, default=1800.0, help="give up after this many seconds")
     lw.add_argument("--poll", type=float, default=15.0, help="seconds between samples (default 15)")
     run_args(sub)
+    from loadgov.cli.image import add_image_parser
+
+    add_image_parser(sub)
     add_history_parser(sub)
     lg = sub.add_parser("log", help="last audit lines")
     lg.add_argument("-n", type=int, default=20)
@@ -709,6 +716,10 @@ def main(argv: list[str] | None = None, sleep=time.sleep) -> int:
         from loadgov.cli.run import run_command
 
         return run_command(a)
+    if a.cmd == "image":
+        from loadgov.cli.image import image_command
+
+        return image_command(a)
     if a.cmd == "history" and wants_file(a):
         return from_file(a)
     if a.cmd == "level-wait":

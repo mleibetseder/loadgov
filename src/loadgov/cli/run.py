@@ -9,13 +9,15 @@ the scope. Order: `gate` takes the heavy slot and `compile` the compile slot fir
 for headroom while holding it; `impl`, `review` and `light` only wait for headroom. A `light` job also
 gets hard limits on its scope (CPUQuota, MemoryMax, MemorySwapMax=0, RuntimeMaxSec as a backstop) and
 loadctl kills it after `max_runtime_s`; the values come from the daemon's `light` status.
+An `image` job takes the heavy slot like a gate (`loadctl image runner` starts it in the night window).
 Under `[slots] enforce` loadctl opens the lock file itself and the job inherits the descriptor, so the
 flock lives as long as loadctl run or the job does and never only in the daemon. The daemon binds the
 slot to the job's scope (`job_start`), so it is released when the scope empties, even if loadctl died.
 
 Exit codes: the job's (128+n when killed by signal n), 137 after `--on-floor kill`, 3 daemon not
 reachable (the job did not start), 5 daemon error, 2 usage, 1 headroom wait timed out, 75 `--no-wait` and
-the host has no room or the slot is busy, 76 a light job overran its runtime or memory limit.
+the host has no room or the slot is busy, 76 a light job overran its runtime or memory limit, 77 `--start-by`
+passed before the job started.
 """
 
 from __future__ import annotations
@@ -35,13 +37,40 @@ from loadgov.cli import loadctl
 from loadgov.cli.client import DaemonUnavailable
 from loadgov.config import KINDS, LightConfig
 
-KIND_SLOT = {"gate": "heavy", "compile": "compile"}
+KIND_SLOT = {"gate": "heavy", "compile": "compile", "image": "heavy"}  # an image build queues like a gate
 GATE_CONFIRM_S = 30.0  # a gate that already holds the slot confirms after 30 s, others use the config (60)
 FLOOR_POLL_S = 2.0
 LEVEL_POLL_S = 15.0  # legacy guarded polled hwmon about every 15 s
 HEADROOM_MODES = ("full", "level", "none")
 EXIT_FLOOR, EXIT_BUSY, EXIT_UNSTARTABLE = 137, 75, 127
 EXIT_LIGHT_OVERRUN = 76
+EXIT_START_BY = 77  # --start-by passed before the job could start (image runner): nothing was started
+TRUSTED = (
+    "systemd-run",
+    "systemctl",
+    "pgrep",
+    "pkill",
+)  # run from the system's bin, never from the job's PATH
+
+
+def trusted(argv: list[str]) -> list[str]:
+    """Host tools loadctl itself runs are resolved in /usr/bin and /bin, not through $PATH: under the
+    image runner the environment is the submitter's allowlisted one, which must not pick the binary."""
+    if argv and argv[0] in TRUSTED:
+        for d in ("/usr/bin", "/bin"):
+            if os.path.exists(f"{d}/{argv[0]}"):
+                return [f"{d}/{argv[0]}", *argv[1:]]
+    return argv
+
+
+def _missed(a) -> int:
+    """`--start-by` passed: nothing was launched. Reported in-process (`a.outcome`), never through an
+    exit code the job could also produce."""
+    if isinstance(getattr(a, "outcome", None), dict):
+        a.outcome["start_by_missed"] = True
+    return EXIT_START_BY
+
+
 LIGHT_POLL_S = 1.0  # a light job is polled for its runtime limit and OOM kills this often
 RUNTIME_BACKSTOP_GRACE_S = 30  # RuntimeMaxSec is this much later than loadctl's own kill, so loadctl wins
 JVM_PATTERN = r"^[^ ]*/java .*(GradleDaemon|KotlinCompileDaemon)"  # same as legacy guarded
@@ -168,7 +197,9 @@ def _unit_result(unit: str) -> str | None:
     """systemd's `Result` of a (stopped) scope, e.g. `oom-kill`; None when it cannot be read."""
     try:
         p = subprocess.run(
-            ["systemctl", "show", "--property=Result", "--value", unit], capture_output=True, text=True
+            trusted(["systemctl", "show", "--property=Result", "--value", unit]),
+            capture_output=True,
+            text=True,
         )
     except OSError:
         return None
@@ -176,12 +207,12 @@ def _unit_result(unit: str) -> str | None:
 
 
 def _rustc_running() -> bool:
-    return subprocess.run(["pgrep", "-x", "rustc"], capture_output=True).returncode == 0
+    return subprocess.run(trusted(["pgrep", "-x", "rustc"]), capture_output=True).returncode == 0
 
 
 def _run_quiet(argv: list[str]) -> int:
     try:
-        return subprocess.run(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode
+        return subprocess.run(trusted(argv), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode
     except OSError:
         return 127
 
@@ -193,7 +224,7 @@ def _spawn(argv: list[str], env: dict):
 
     The job gets its own session (like legacy guarded's setsid): a terminal Ctrl-C reaches only loadctl,
     which forwards one signal through the scope, so the job is never interrupted twice."""
-    return subprocess.Popen(argv, env=env, close_fds=False, start_new_session=True)
+    return subprocess.Popen(trusted(argv), env=env, close_fds=False, start_new_session=True)
 
 
 @dataclass
@@ -232,8 +263,17 @@ def add_run_parser(sub) -> None:
         "none: slot only (legacy rustc-slot.sh)",
     )  # fmt: skip
     r.add_argument("--no-wait", action="store_true", help="exit 75 instead of waiting for slot or headroom")
+    r.add_argument(
+        "--start-by", type=float, help=argparse.SUPPRESS
+    )  # epoch seconds: image runner, window end
     r.add_argument("--slice", help=argparse.SUPPRESS)  # tests: a private slice instead of build-work-*
     r.add_argument("job_cmd", nargs=argparse.REMAINDER, metavar="cmd", help="-- command and arguments")
+
+
+def _remaining(a, d: Deps) -> float | None:
+    """Seconds left until `--start-by` (at least 1), None without it."""
+    start_by = getattr(a, "start_by", None)
+    return None if start_by is None else max(1.0, start_by - d.now())
 
 
 def _release(a, slot: str | None, pid: int) -> None:
@@ -270,8 +310,9 @@ def _headroom(a, d: Deps, slot: str | None) -> int:
         print(f"HEADROOM_WAIT {a.label} {loadctl.headroom_state(r)}: no room, not waiting", file=sys.stderr)
         return EXIT_BUSY
     ns = argparse.Namespace(
-        socket=a.socket, kind=a.kind, project=a.project, label=a.label, timeout=None, poll=None,
-        confirm=GATE_CONFIRM_S if a.kind == "gate" and slot else None,
+        socket=a.socket, kind=a.kind, project=a.project, label=a.label, poll=None,
+        confirm=GATE_CONFIRM_S if a.kind in ("gate", "image") and slot else None,
+        timeout=_remaining(a, d),
     )  # fmt: skip
     return loadctl.wait_headroom(ns, d.sleep, out=sys.stderr)
 
@@ -354,11 +395,13 @@ def run_command(a, deps: Deps | None = None) -> int:
         if slot:  # slot first, then the headroom wait while holding it
             ns = argparse.Namespace(
                 socket=a.socket, slot=slot, project=a.project, label=a.label, pid=d.pid,
-                wait=not a.no_wait, fd=None, open_lock=True, timeout_s=None,
+                wait=not a.no_wait, fd=None, open_lock=True, timeout_s=_remaining(a, d),
                 kind=a.kind, key=key,
             )  # fmt: skip
             rc = loadctl.slot_acquire(ns, out=sys.stderr, sleep=d.sleep)
             if rc:
+                if rc == 1 and getattr(a, "start_by", None):
+                    return _missed(a)
                 return EXIT_BUSY if rc == 1 else rc
             held = True
         lock_fd = ns.lock_fd if slot else None
@@ -382,7 +425,12 @@ def _run_held(
 ) -> int:
     rc = _headroom(a, d, slot)
     if rc:
-        return rc
+        return _missed(a) if rc == 1 and getattr(a, "start_by", None) else rc
+    if (
+        getattr(a, "start_by", None) and d.now() > a.start_by
+    ):  # the wait ran past the window end: do not start now
+        print(f"loadctl: --start-by passed while waiting: {a.label} not started", file=sys.stderr)
+        return _missed(a)
     r = loadctl.request(a.socket, "status")  # fresh limits and memory after a possibly long wait
     if not r.get("ok"):
         return _error(r)
@@ -465,10 +513,10 @@ def _run_held(
     finally:
         for sig, h in old.items():
             signal.signal(sig, h)
-        if registered:
-            with contextlib.suppress(DaemonUnavailable):  # else the daemon notices the empty scope
-                loadctl.request(
-                    a.socket, "job_end",
-                    {"unit": scope_unit, **({"overrun": outcome["overrun"]} if "overrun" in outcome else {})},
-                )  # fmt: skip
+        if registered or "overrun" in outcome:  # an overrun is reported even when job_start failed
+            end = {"unit": scope_unit}
+            if "overrun" in outcome:  # kind/project/label serve a daemon that no longer knows the unit
+                end.update(overrun=outcome["overrun"], kind=a.kind, project=a.project, label=a.label)
+            with contextlib.suppress(DaemonUnavailable, OSError, ValueError, KeyError, TypeError):
+                loadctl.request(a.socket, "job_end", end)  # a failed report never changes the exit code
     return 128 - code if code < 0 else code

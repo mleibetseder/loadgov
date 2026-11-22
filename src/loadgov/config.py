@@ -8,6 +8,7 @@ import re
 import tomllib
 from dataclasses import dataclass, field, fields, is_dataclass, replace
 from urllib.parse import urlsplit
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 DEFAULT_CONFIG = "/etc/loadgov/loadgov.toml"
 
@@ -100,7 +101,7 @@ BUILTIN_PROFILES: dict[str, Profile] = {
 }
 
 
-KINDS = ("impl", "review", "gate", "compile", "light")
+KINDS = ("impl", "review", "gate", "compile", "light", "image")
 # Headroom thresholds (the stricter values for every kind; per-project values come from [projects.*]).
 # Load limits may be "nproc" expressions, resolved against the host's core count when a decision is made.
 HEADROOM_DEFAULTS: dict = {
@@ -491,6 +492,53 @@ def _parse_light(raw) -> LightConfig:
     return LightConfig(**out)
 
 
+# [image]: the image train (beta and release container builds run in a night window; docs/protocol.md).
+IMAGE_ENV_ALLOW = ("PATH", "HOME", "LANG", "DOCKER_HOST", "DOCKER_CONFIG", "LOADGOV_KEY")
+_WINDOW_RE = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)-([01]\d|2[0-3]):([0-5]\d)$")
+_ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
+
+
+@dataclass(frozen=True)
+class ImageConfig:
+    window: str = "00:00-06:00"  # local HH:MM-HH:MM in `timezone`; may cross midnight
+    timezone: str = "UTC"  # IANA name
+    beta_interval_h: int = 48  # a project's beta starts at most this often (from the last beta's start)
+    max_runtime_min: int = 90  # past this a running image job raises `image_overrun:<project>` (no kill)
+    max_per_night: int = 6  # image jobs started per window
+    env_allow: tuple[str, ...] = IMAGE_ENV_ALLOW  # variables a submitted job keeps
+
+
+def _parse_image(raw) -> ImageConfig:
+    d = ImageConfig()
+    names = [f.name for f in fields(ImageConfig)]
+    if not isinstance(raw, dict) or set(raw) - set(names):
+        raise ConfigError(f"image: allowed keys are {', '.join(names)}")
+    window, tz = raw.get("window", d.window), raw.get("timezone", d.timezone)
+    m = _WINDOW_RE.match(window) if isinstance(window, str) else None
+    if not m or m.group(1, 2) == m.group(3, 4):
+        raise ConfigError("image.window: expected HH:MM-HH:MM with different start and end, e.g. 00:00-06:00")
+    if not isinstance(tz, str) or not tz:
+        raise ConfigError("image.timezone: expected an IANA time zone name")
+    try:
+        ZoneInfo(tz)
+    except (ZoneInfoNotFoundError, ValueError, OSError):
+        raise ConfigError(f"image.timezone: unknown time zone {tz!r}") from None
+    out = {}
+    for name, lo, hi in (("beta_interval_h", 1, 720), ("max_runtime_min", 5, 1440), ("max_per_night", 1, 50)):
+        v = raw.get(name, getattr(d, name))
+        if not _is_int(v) or not lo <= v <= hi:
+            raise ConfigError(f"image.{name}: expected an integer from {lo} to {hi}")
+        out[name] = v
+    env = raw.get("env_allow", list(d.env_allow))
+    if (
+        not isinstance(env, list)
+        or len(env) > 64
+        or not all(isinstance(x, str) and _ENV_NAME_RE.match(x) for x in env)
+    ):
+        raise ConfigError("image.env_allow: expected a list of up to 64 environment variable names")
+    return ImageConfig(window, tz, env_allow=tuple(dict.fromkeys(env)), **out)
+
+
 @dataclass(frozen=True)
 class AuditConfig:
     """Size rotation of the daemon's own audit.jsonl; max_mb 0 turns it off."""
@@ -518,6 +566,7 @@ class Config:
     keys: KeysConfig = field(default_factory=KeysConfig)
     audit: AuditConfig = field(default_factory=AuditConfig)
     light: LightConfig = field(default_factory=LightConfig)
+    image: ImageConfig = field(default_factory=ImageConfig)
     levels: LevelsConfig = field(default_factory=LevelsConfig)
 
 
@@ -846,6 +895,7 @@ def parse_config(text: str) -> Config:
             "keys",
             "audit",
             "light",
+            "image",
             "levels",
         ):
             raise ConfigError(f"unknown key {key!r}")
@@ -882,6 +932,7 @@ def parse_config(text: str) -> Config:
         _parse_strays(raw.get("strays", {})), _parse_keys(raw.get("keys", {})),
         _parse_audit(raw.get("audit", {})),
         light=_parse_light(raw.get("light", {})),
+        image=_parse_image(raw.get("image", {})),
         levels=_parse_levels(raw.get("levels", {})),
     )  # fmt: skip
 

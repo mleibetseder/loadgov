@@ -582,3 +582,105 @@ async def test_disk_used_sensor_unavailable_without_used_pct(hass, aioclient_moc
     status["disk"] = {"per_path": []}
     await setup(hass, mock_entry, aioclient_mock, status)
     assert hass.states.get("sensor.host_disk_used").state == STATE_UNAVAILABLE
+
+
+def _image_job(n, **kw):
+    j = {
+        "id": n, "position": n, "project": "web-app", "label": f"web-{n}", "key": "PROJ-42",
+        "url": "https://tracker.example/issues/PROJ-42", "channel": "release",
+        "submitted": "2026-11-10T09:00:00Z", "planned_start": f"2026-11-11T0{n % 10}:00:00Z",
+        "planned_finish": f"2026-11-11T0{n % 10}:30:00Z", "state": "queued",
+    }  # fmt: skip
+    return {**j, **kw}
+
+
+def _image(queue, **kw):
+    return {
+        "queued": sum(j["state"] != "running" for j in queue),
+        "running": sum(j["state"] == "running" for j in queue),
+        "window": "00:00-06:00", "timezone": "Europe/Berlin", "in_window": False,
+        "next_window_start": "2026-11-11T23:00:00Z", "queue": queue, **kw,
+    }  # fmt: skip
+
+
+async def test_image_train_state_and_attributes(hass, aioclient_mock, mock_entry, status):
+    status["image"] = _image([_image_job(1, state="running"), _image_job(2), _image_job(3, state="now")])
+    await setup(hass, mock_entry, aioclient_mock, status)
+    st = hass.states.get("sensor.host_image_train")
+    assert st.state == "3"  # the running job and the two waiting ones
+    assert (st.attributes["window"], st.attributes["timezone"]) == ("00:00-06:00", "Europe/Berlin")
+    assert st.attributes["in_window"] is False
+    assert st.attributes["next_window_start"] == "2026-11-11T23:00:00Z"
+    assert [j["id"] for j in st.attributes["queue"]] == [1, 2, 3]
+    assert st.attributes["queue"][1] == {
+        "id": 2, "position": 2, "project": "web-app", "label": "web-2", "key": "PROJ-42",
+        "url": "https://tracker.example/issues/PROJ-42", "channel": "release",
+        "planned_start": "2026-11-11T02:00:00Z", "planned_finish": "2026-11-11T02:30:00Z",
+        "state": "queued",
+    }  # fmt: skip
+
+
+async def test_image_train_queue_is_bounded_and_unrecorded(hass, aioclient_mock, mock_entry, status):
+    status["image"] = _image([_image_job(n) for n in range(1, 14)])
+    await setup(hass, mock_entry, aioclient_mock, status)
+    st = hass.states.get("sensor.host_image_train")
+    assert st.state == "13"
+    assert len(st.attributes["queue"]) == 10
+    entities = hass.data["entity_components"]["sensor"].entities
+    entity = next(e for e in entities if e.entity_id == "sensor.host_image_train")
+    assert "queue" in entity._Entity__combined_unrecorded_attributes
+
+
+async def test_image_train_counts_come_from_the_daemon_not_the_cut_list(
+    hass, aioclient_mock, mock_entry, status
+):
+    status["image"] = _image([_image_job(n) for n in range(1, 21)], queued=34, running=1)
+    await setup(hass, mock_entry, aioclient_mock, status)
+    st = hass.states.get("sensor.host_image_train")
+    assert st.state == "35"
+    assert len(st.attributes["queue"]) == 10
+
+
+async def test_image_train_empty_queue(hass, aioclient_mock, mock_entry, status):
+    status["image"] = _image([])
+    await setup(hass, mock_entry, aioclient_mock, status)
+    st = hass.states.get("sensor.host_image_train")
+    assert (st.state, st.attributes["queue"]) == ("0", [])
+
+
+async def test_image_train_unavailable_on_an_older_daemon(hass, aioclient_mock, mock_entry, status):
+    assert "image" not in status
+    await setup(hass, mock_entry, aioclient_mock, status)
+    assert hass.states.get("sensor.host_image_train").state == STATE_UNAVAILABLE
+    assert hass.states.get("sensor.host_image_train_next_start").state == STATE_UNKNOWN
+
+
+async def test_image_train_next_start_is_the_head_job_else_the_window(
+    hass, aioclient_mock, mock_entry, status
+):
+    status["image"] = _image([_image_job(1, state="running"), _image_job(2)])
+    await setup(hass, mock_entry, aioclient_mock, status)
+    st = hass.states.get("sensor.host_image_train_next_start")
+    assert st.state == "2026-11-11T02:00:00+00:00"
+    assert st.attributes["device_class"] == "timestamp"
+
+
+async def test_image_train_next_start_skips_a_running_head_job(hass, aioclient_mock, mock_entry, status):
+    status["image"] = _image([_image_job(1, state="running", planned_start="2026-11-10T22:00:00Z")])
+    await setup(hass, mock_entry, aioclient_mock, status)
+    assert hass.states.get("sensor.host_image_train_next_start").state == "2026-11-11T23:00:00+00:00"
+
+
+@pytest.mark.parametrize("planned", [None, "not a time", 42])
+async def test_image_train_next_start_falls_back_to_the_next_window(
+    hass, aioclient_mock, mock_entry, status, planned
+):
+    status["image"] = _image([_image_job(1, planned_start=planned)])
+    await setup(hass, mock_entry, aioclient_mock, status)
+    assert hass.states.get("sensor.host_image_train_next_start").state == "2026-11-11T23:00:00+00:00"
+
+
+async def test_image_train_next_start_unknown_without_any_time(hass, aioclient_mock, mock_entry, status):
+    status["image"] = _image([], next_window_start="garbage")
+    await setup(hass, mock_entry, aioclient_mock, status)
+    assert hass.states.get("sensor.host_image_train_next_start").state == STATE_UNKNOWN

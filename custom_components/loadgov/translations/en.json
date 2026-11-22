@@ -84,6 +84,15 @@
         "reason": { "name": "Reason", "description": "Audit reason." },
         "config_entry_id": { "name": "Config entry", "description": "Only needed with several daemons." }
       }
+    },
+    "image_run_now": {
+      "name": "Run image job now",
+      "description": "Let a queued image train job start outside the night window and the beta interval (owner action, audited with the reason). Only a queued job can be released.",
+      "fields": {
+        "id": { "name": "Job id", "description": "Id of the queued job, from the image train sensor." },
+        "reason": { "name": "Reason", "description": "Why it should run now (required, audited)." },
+        "config_entry_id": { "name": "Config entry", "description": "Only needed with several daemons." }
+      }
     }
   }
 }

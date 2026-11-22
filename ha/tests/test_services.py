@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pytest
+import voluptuous as vol
 from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
 
 from .conftest import BASE, posts
@@ -82,3 +83,38 @@ async def test_service_without_loaded_entry(hass):
     await async_setup(hass, {})
     with pytest.raises(ServiceValidationError):
         await hass.services.async_call("loadgov", "clear_ceiling", {}, blocking=True)
+
+
+async def test_image_run_now_posts_the_body(hass, aioclient_mock, mock_entry, status):
+    await setup(hass, mock_entry, aioclient_mock, status)
+    aioclient_mock.post(f"{BASE}/v1/image/now", json={"ok": True, "id": 3, "now": True})
+    await hass.services.async_call(
+        "loadgov", "image_run_now", {"id": 3, "reason": "release needed early"}, blocking=True
+    )
+    assert posts(aioclient_mock) == [("/v1/image/now", {"reason": "release needed early", "id": 3})]
+
+
+@pytest.mark.parametrize(
+    "data", [{"id": 3}, {"id": 3, "reason": ""}, {"reason": "r"}, {"id": 0, "reason": "r"}]
+)
+async def test_image_run_now_requires_id_and_reason(hass, aioclient_mock, mock_entry, status, data):
+    await setup(hass, mock_entry, aioclient_mock, status)
+    with pytest.raises(vol.Invalid):
+        await hass.services.async_call("loadgov", "image_run_now", data, blocking=True)
+    assert posts(aioclient_mock) == []
+
+
+@pytest.mark.parametrize(
+    ("code", "reply"),
+    [
+        (409, {"ok": False, "refused": True, "message": "job 3 is running"}),
+        (404, {"ok": False, "error": "not_found", "message": "no image job 3"}),
+    ],
+)
+async def test_image_run_now_refusal_raises_the_daemons_message(
+    hass, aioclient_mock, mock_entry, status, code, reply
+):
+    await setup(hass, mock_entry, aioclient_mock, status)
+    aioclient_mock.post(f"{BASE}/v1/image/now", status=code, json=reply)
+    with pytest.raises(HomeAssistantError, match=reply["message"]):
+        await hass.services.async_call("loadgov", "image_run_now", {"id": 3, "reason": "r"}, blocking=True)

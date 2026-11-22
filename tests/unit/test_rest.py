@@ -596,3 +596,65 @@ def test_set_max_reviewers_via_rest(tmp_path, fake_host):
         assert (await http(port, "POST", "/v1/set", {"max_reviewers": 9, "reason": "t"}))[0] == 400
 
     run_rest(d, scenario)
+
+
+def _queue_image_job(d, label="build"):
+    reply = d.dispatch(
+        {"v": VERSION, "op": "image_submit", "args": {
+            "project": "web-app", "label": label, "channel": "release", "key": "PROJ-42",
+            "argv": ["make", "image"], "cwd": "/srv/x"}},
+        None,
+    )  # fmt: skip
+    assert reply["ok"], reply
+    return reply["id"]
+
+
+def test_image_now_is_owner_via_rest_with_a_required_reason(tmp_path, fake_host):
+    d = make(tmp_path, fake_host("calm"))
+    job_id = _queue_image_job(d)
+
+    async def scenario(port):
+        post = "/v1/image/now"
+        for body in ({}, {"id": job_id}, {"id": job_id, "reason": "  "}, {"id": "1", "reason": "x"}):
+            assert (await http(port, "POST", post, body))[0] == 400
+        assert (await http(port, "POST", post, {"id": job_id, "reason": "r", "extra": 1}))[0] == 400
+        code, body, _ = await http(port, "POST", post, {"id": 999, "reason": "r"})
+        assert (code, body["error"]) == (404, "not_found")
+        assert (await http(port, "GET", post))[0] == 405
+        code, body, _ = await http(port, "POST", post, {"id": job_id, "reason": "release now"})
+        assert (code, body) == (200, {"ok": True, "id": job_id, "now": True})
+
+    run_rest(d, scenario)
+    assert d.image.get(job_id).now_ok
+    line = [a for a in audit(d) if a["op"] == "image_now"][-1]
+    assert (line["principal"], line["result"], line["source"]) == ("owner", "accepted", "rest")
+    assert "release now" in line["reason"]
+
+
+def test_image_now_on_a_running_job_is_refused_409(tmp_path, fake_host):
+    d = make(tmp_path, fake_host("calm"))
+    job_id = _queue_image_job(d)
+    d.image.get(job_id).state = "running"
+
+    async def scenario(port):
+        code, body, _ = await http(port, "POST", "/v1/image/now", {"id": job_id, "reason": "r"})
+        assert (code, body["ok"], body["refused"]) == (409, False, True)
+
+    run_rest(d, scenario)
+
+
+def test_image_cancel_is_owner_via_rest(tmp_path, fake_host):
+    d = make(tmp_path, fake_host("calm"))
+    job_id = _queue_image_job(d)
+
+    async def scenario(port):
+        post = "/v1/image/cancel"
+        assert (await http(port, "POST", post, {}))[0] == 400
+        assert (await http(port, "POST", post, {"id": 999}))[0] == 404
+        code, body, _ = await http(port, "POST", post, {"id": job_id})
+        assert (code, body) == (200, {"ok": True, "id": job_id, "cancelled": True})
+        assert (await http(port, "POST", post, {"id": job_id}))[0] == 404
+
+    run_rest(d, scenario)
+    line = [a for a in audit(d) if a["op"] == "image_cancel"][-1]
+    assert (line["principal"], line["source"]) == ("owner", "rest")

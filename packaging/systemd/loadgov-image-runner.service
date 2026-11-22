@@ -1,0 +1,19 @@
+[Unit]
+Description=loadgov: run the image builds the daemon releases (the image train)
+Documentation=https://github.com/mleibetseder/loadgov
+After=loadgovd.service
+Wants=loadgovd.service
+
+# One pass: ask the daemon for the next released image job, run it like `loadctl run --kind image`, report the
+# result, repeat while a job is released, then exit. With an empty queue or a closed window the daemon
+# releases nothing and this exits at once, so the timer can fire all night and all day. The job runs in its
+# own scope under its project's slice; `KillMode=process` signals only the runner, which forwards SIGTERM to the
+# job's scope (like any `loadctl run`), so `systemctl stop` of this service does stop the build it is running.
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/loadctl image runner
+# A build can take hours; nothing here may cut it short.
+TimeoutStartSec=infinity
+KillMode=process
+Nice=10

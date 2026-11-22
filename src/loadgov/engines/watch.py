@@ -110,6 +110,9 @@ class Watch:
         self._cpu_hi = 0
         self._swap_base: int | None = None
         self._calm = 0
+        self.external: dict[
+            str, tuple
+        ] = {}  # alerts the daemon computes (image train): key -> (level, title, msg, actions)
         self._overruns: dict[str, list[tuple[float, str]]] = {}  # project -> (time, label), light lane
         self._ctx = {"avail_mb": 0, "swap_mb": 0, "profile": None, "ceiling": None, "top3": []}
 
@@ -157,6 +160,7 @@ class Watch:
             found["disk"] = ("critical" if lvl == "LIMIT" else "warning", "Disk space low", why,
                              ACTIONS["disk"])  # fmt: skip
         found.update(self._overrun_alerts(now))
+        found.update(self.external)
         return self._reconcile(now, found)
 
     def note_overrun(self, project: str, label: str) -> None:

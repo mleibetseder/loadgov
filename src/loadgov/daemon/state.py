@@ -39,6 +39,7 @@ class StateStore:
         jobs: list | None = None,
         memguard: dict | None = None,
         job_stats: list | None = None,
+        image: dict | None = None,
     ) -> None:
         os.makedirs(os.path.dirname(self.path), exist_ok=True)
         body = {
@@ -47,6 +48,7 @@ class StateStore:
             "jobs": jobs or [],
             "memguard": memguard or {},
             "job_stats": job_stats or [],
+            "image": image or {},
         }
         atomic_write_text(self.path, json.dumps(body, indent=1))
 
@@ -67,6 +69,15 @@ class StateStore:
         except (OSError, ValueError, AttributeError):
             return []
         return raw if isinstance(raw, list) else []
+
+    def load_image(self) -> dict:
+        """The saved image train: queued jobs, last beta starts (empty when missing or unreadable)."""
+        try:
+            with open(self.path) as f:
+                raw = json.load(f).get("image")
+        except (OSError, ValueError, AttributeError):
+            return {}
+        return raw if isinstance(raw, dict) else {}
 
     def load_memguard(self) -> dict:
         """The saved paused registry (empty when missing or unreadable)."""

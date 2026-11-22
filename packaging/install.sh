@@ -63,6 +63,8 @@ fi
 
 install -m 0644 "$src/packaging/systemd/loadgovd.service" /etc/systemd/system/loadgovd.service
 install -m 0644 "$src/packaging/systemd/build-work.slice" /etc/systemd/system/build-work.slice
+install -m 0644 "$src/packaging/systemd/loadgov-image-runner.service" /etc/systemd/system/loadgov-image-runner.service
+install -m 0644 "$src/packaging/systemd/loadgov-image-runner.timer" /etc/systemd/system/loadgov-image-runner.timer
 
 # loadgovd.service's MemoryMin only protects as far as system.slice's (cgroup v2 caps a child at its parents').
 # Install the drop-in unless system.slice already reserves at least as much through another file (never lower
@@ -100,8 +102,10 @@ for name in "${projects[@]+"${projects[@]}"}"; do
 done
 
 systemctl daemon-reload
+systemctl enable loadgov-image-runner.timer  # the image train's runner: harmless while the image queue is empty
 if [ "$start" -eq 1 ]; then
   systemctl enable loadgovd.service
+  systemctl start loadgov-image-runner.timer
   systemctl restart loadgovd.service
   systemctl --no-pager --lines=5 status loadgovd.service
 fi

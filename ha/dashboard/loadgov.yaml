@@ -201,6 +201,33 @@ views:
       - type: grid
         cards:
           - type: heading
+            heading: Image train
+            icon: mdi:train
+          - type: tile
+            entity: sensor.host_image_train_next_start
+            name: Image train next start
+          - type: tile
+            entity: sensor.host_image_train
+            name: Image train queued
+          - type: markdown
+            title: Image train queue
+            content: |-
+              {% set e = 'sensor.host_image_train' %}
+              {% set q = state_attr(e, 'queue') or [] %}
+              Window {{ state_attr(e, 'window') or '?' }} ({{ state_attr(e, 'timezone') or '?' }}), {{ 'open now' if state_attr(e, 'in_window') else 'closed' }}.
+
+              {% for j in q -%}
+              {{ j.position }}. {% if j.url %}[{{ j.key or j.label }}]({{ j.url }}){% else %}{{ j.key or j.label }}{% endif %} ({{ j.project }}, {{ j.channel }}, {{ j.state }})
+              {%- if j.planned_start %}, starts ~ {{ as_timestamp(j.planned_start, none) | timestamp_custom('%H:%M', true, '?') }}{% endif %}
+              {% else -%}
+              - empty
+              {% endfor %}
+          - type: markdown
+            content: |-
+              To run a queued job now, outside the window: Developer tools, Actions, `loadgov.image_run_now` with the job `id` (shown in the sensor's `queue` attribute) and a `reason`. The daemon audits it as an owner action.
+      - type: grid
+        cards:
+          - type: heading
             heading: Projects
             icon: mdi:folder-multiple
           # One CPU and one memory sensor per project, created when the project first shows up in the

@@ -1,0 +1,13 @@
+[Unit]
+Description=loadgov: look for released image builds (the image train)
+
+# Every 10 minutes, all day: the daemon decides whether the window is open, so the window and its time zone
+# live only in [image] of the config. Starting the service while a build still runs is a no-op.
+
+[Timer]
+OnCalendar=*:0/10
+AccuracySec=30s
+Persistent=false
+
+[Install]
+WantedBy=timers.target

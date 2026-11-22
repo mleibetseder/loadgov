@@ -143,7 +143,7 @@ class MemGuardRuntime:
             for a in agent:
                 keep |= proctree.ancestors(tab, a)
             stop = [p for p in procs if p.pid not in keep]
-            if j.kind in ("gate", "compile") and not agent:
+            if j.kind in ("gate", "compile", "image") and not agent:
                 how, targets, pool = "freeze", [{"cgroup": j.cgroup}], procs
                 cur = fs.cgroup(j.cgroup, "memory.current")
                 mb = int(cur) // 2**20 if cur and cur.strip().isdigit() else sum(p.rss_mb for p in procs)

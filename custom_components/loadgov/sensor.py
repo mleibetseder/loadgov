@@ -140,6 +140,8 @@ async def async_setup_entry(
             LoadgovStraysSensor(entry.runtime_data),
             LoadgovLightLaneSensor(entry.runtime_data),
             LoadgovDiskUsedSensor(entry.runtime_data),
+            LoadgovImageTrainSensor(entry.runtime_data),
+            LoadgovImageTrainNextStartSensor(entry.runtime_data),
             *(LoadgovSlotNextSensor(entry.runtime_data, slot) for slot in SLOTS),
             *(LoadgovSlotHolderEtaSensor(entry.runtime_data, slot) for slot in SLOTS),
             LoadgovRunningJobsSensor(entry.runtime_data),
@@ -338,6 +340,19 @@ class LoadgovDiskUsedSensor(LoadgovEntity, SensorEntity):
         return {"disk_alert": dig(self.status, "levels.disk_alert")}
 
 
+IMAGE_QUEUE_MAX_ITEMS = 10
+IMAGE_ATTRS = (
+    "id",
+    "position",
+    "project",
+    "label",
+    "key",
+    "url",
+    "channel",
+    "planned_start",
+    "planned_finish",
+    "state",
+)
 STATE_MAX_LENGTH = 255
 QUEUE_MAX_ITEMS = 10
 JOBS_MAX_ITEMS = 10
@@ -410,6 +425,75 @@ class LoadgovSlotNextSensor(LoadgovEntity, SensorEntity):
         if waiters:
             attrs["project"] = waiters[0].get("project")
         return attrs
+
+
+def _image(status: dict[str, Any]) -> dict[str, Any] | None:
+    image = status.get("image")
+    return image if isinstance(image, dict) else None
+
+
+class LoadgovImageTrainSensor(LoadgovEntity, SensorEntity):
+    """The image train: the state is the number of jobs in it, waiting plus the running one (the daemon's
+    `image.queued` + `image.running`, the full counts; its `queue` list is cut to 20). Unavailable when the
+    daemon is older and has no `image` in its status. The queue is kept out of the recorder."""
+
+    _domain = "sensor"
+    _attr_icon = "mdi:train"
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _unrecorded_attributes = frozenset({"queue"})
+
+    def __init__(self, coordinator: LoadgovCoordinator) -> None:
+        super().__init__(coordinator, "image_train", "Host Image Train")
+
+    @property
+    def available(self) -> bool:
+        return super().available and _image(self.status) is not None
+
+    @property
+    def _jobs(self) -> list[dict[str, Any]]:
+        return _list((_image(self.status) or {}).get("queue"))
+
+    @property
+    def native_value(self) -> int | None:
+        image = _image(self.status)
+        if image is None:
+            return None
+        counts = [image.get("queued"), image.get("running")]
+        if all(isinstance(c, int) and not isinstance(c, bool) for c in counts):
+            return sum(counts)
+        return len(self._jobs)  # a daemon that reports no counts: what the list shows
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any] | None:
+        image = _image(self.status)
+        if image is None:
+            return None
+        return {
+            **{k: image.get(k) for k in ("window", "timezone", "in_window", "next_window_start")},
+            "queue": [{k: j.get(k) for k in IMAGE_ATTRS} for j in self._jobs[:IMAGE_QUEUE_MAX_ITEMS]],
+        }
+
+
+class LoadgovImageTrainNextStartSensor(LoadgovEntity, SensorEntity):
+    """When the train runs next: the planned start of the first job not yet running, else the next window
+    start. A running job has started already, so its planned start is skipped."""
+
+    _domain = "sensor"
+    _attr_icon = "mdi:train-variant"
+    _attr_device_class = SensorDeviceClass.TIMESTAMP
+
+    def __init__(self, coordinator: LoadgovCoordinator) -> None:
+        super().__init__(coordinator, "image_train_next_start", "Host Image Train Next Start")
+
+    @property
+    def native_value(self) -> datetime | None:
+        image = _image(self.status)
+        if image is None:
+            return None
+        head = next((j for j in _list(image.get("queue")) if j.get("state") != "running"), None)
+        return (_timestamp(head.get("planned_start")) if head else None) or _timestamp(
+            image.get("next_window_start")
+        )
 
 
 class LoadgovSlotHolderEtaSensor(LoadgovEntity, SensorEntity):

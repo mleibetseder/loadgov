@@ -8,6 +8,7 @@ from loadgov.config import KINDS
 from loadgov.daemon.principal import caller_info
 from loadgov.daemon.slot_ops import _err, _text
 from loadgov.engines.jobs import Job
+from loadgov.engines.limits import iso
 from loadgov.engines.slots import SLOT_FILES, pid_alive
 from loadgov.keys import key_error
 
@@ -36,6 +37,26 @@ def _unit(args: dict) -> tuple[str | None, dict | None]:
     return unit, None
 
 
+def _unregistered(d, unit: str, args: dict, peer_pid: int | None) -> Job | str | None:
+    """The overrun report for a light unit the daemon neither runs nor remembers (its `job_start` failed, a
+    daemon restart or 64 later reports dropped it): `project` and `label` (and `kind` light) ride on
+    `job_end`. The unit name ends in the pid of the `loadctl run` that made it (run.py `unit_name`); only
+    that peer may report it, else the reason string is returned (refused). One audit per unit; nothing else
+    is booked."""
+    project, label = args.get("project"), args.get("label")
+    if args.get("kind") != "light" or not unit.startswith("loadgov-light-") or unit in d.jobs.recent:
+        return None
+    if not isinstance(project, str) or not isinstance(label, str):
+        return None
+    if _text(args, "project")[1] or _text(args, "label")[1]:
+        return None
+    tail = unit.removesuffix(".scope").rsplit("-", 1)[-1]
+    if peer_pid is None or not tail.isdigit() or int(tail) != peer_pid:
+        return f"overrun report for {unit} refused: the peer is not the loadctl run that started it"
+    j = Job("light", project.strip(), label.strip(), unit, "", peer_pid, None, peer_pid, None, d.clock())
+    return d.jobs.unregistered_overrun(j)
+
+
 def handle(d, op: str, args: dict, peer_pid: int | None) -> dict:
     """`d` is the Daemon (jobs, slots, audit, clock, _after_change)."""
     unit, bad = _unit(args)
@@ -48,14 +69,26 @@ def handle(d, op: str, args: dict, peer_pid: int | None) -> dict:
             return _err("invalid_args", f"overrun must be one of: {', '.join(OVERRUNS)}")
         running = d.jobs.jobs.get(unit)
         reason = "job_end"
-        if overrun and running and running.kind == "light":  # a light job hit its runtime or memory limit
+        if overrun:
             c = d.config.light
-            reason = "light_overrun: " + (
+            why = "light_overrun: " + (
                 f"runtime {c.max_runtime_s} s exceeded" if overrun == "runtime"
                 else f"memory limit {c.memory_max_mb} MB hit"
             )  # fmt: skip
-            d.jobs.overrun(running, reason)
-            d.watch.note_overrun(running.project, running.label)
+            hit = None
+            if running:
+                if running.kind == "light":  # a light job hit its runtime or memory limit
+                    hit, reason = running, why
+            elif (hit := d.jobs.late_overrun(unit)) is None:  # the tick may have ended it first
+                hit = _unregistered(d, unit, args, peer_pid)  # or it never registered, or was forgotten
+            if isinstance(hit, str):
+                d.audit.append(
+                    {"ts": iso(d.clock()), **ctx, "principal": "agent", "result": "refused", "reason": hit}
+                )
+                return _err("owner_denied", hit)
+            if hit:
+                d.jobs.overrun(hit, why)
+                d.watch.note_overrun(hit.project, hit.label)
         j = d.jobs.end(unit, reason)
         released = False
         if j and j.slot and not (d.jobs.scope_reader(j.cgroup) or "").strip():

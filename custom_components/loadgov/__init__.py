@@ -44,6 +44,13 @@ KILL_STRAY_SCHEMA = vol.Schema(
         vol.Optional("reason"): cv.string,
     }
 )
+IMAGE_RUN_NOW_SCHEMA = vol.Schema(
+    {
+        vol.Optional(ATTR_ENTRY): cv.string,
+        vol.Required("id"): vol.All(vol.Coerce(int), vol.Range(min=1)),
+        vol.Required("reason"): vol.All(cv.string, vol.Length(min=1)),
+    }
+)
 
 
 def _coordinator(hass: HomeAssistant, call: ServiceCall) -> LoadgovCoordinator:
@@ -73,10 +80,16 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
         body = {k: call.data[k] for k in ("pid", "start_time", "reason") if k in call.data}
         await _coordinator(hass, call).async_post("/v1/stray/kill", body)
 
+    async def image_run_now(call: ServiceCall) -> None:
+        await _coordinator(hass, call).async_post(
+            "/v1/image/now", {"id": call.data["id"], "reason": call.data["reason"]}
+        )
+
     hass.services.async_register(DOMAIN, "set_profile", set_profile, SET_PROFILE_SCHEMA)
     hass.services.async_register(DOMAIN, "set_ceiling", set_ceiling, SET_CEILING_SCHEMA)
     hass.services.async_register(DOMAIN, "clear_ceiling", clear_ceiling, CLEAR_CEILING_SCHEMA)
     hass.services.async_register(DOMAIN, "kill_stray", kill_stray, KILL_STRAY_SCHEMA)
+    hass.services.async_register(DOMAIN, "image_run_now", image_run_now, IMAGE_RUN_NOW_SCHEMA)
     return True
 
 

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import time
+from collections import OrderedDict
 from dataclasses import asdict, dataclass
 
 from loadgov.engines.eta import finish_estimate
@@ -46,6 +47,10 @@ class Job:
         return HolderRef(self.pid, self.start, self.cgroup)
 
 
+RECENT_MAX = 64  # ended jobs remembered for a late `job_end` overrun report
+RECENT_S = 600.0
+
+
 class JobTable:
     def __init__(self, fs, clock=time.time, stat_reader=read_stat, scope_reader=None, pattern=None, **meter):
         self.clock, self.stat_reader = clock, stat_reader
@@ -55,6 +60,32 @@ class JobTable:
         self.stats = JobStats()
         self.url_template = ""  # [keys] url
         self.events: list[dict] = []
+        # unit -> [job, ended_at, overrun already audited]; lets a `job_end` that arrives after the tick
+        # ended the job still audit its overrun, exactly once
+        self.recent: OrderedDict[str, list] = OrderedDict()
+
+    def _remember(self, j: Job, counted: bool) -> None:
+        now = self.clock()
+        self.recent[j.unit] = [j, now, counted]
+        while self.recent and (
+            len(self.recent) > RECENT_MAX or now - next(iter(self.recent.values()))[1] > RECENT_S
+        ):
+            self.recent.popitem(last=False)
+
+    def late_overrun(self, unit: str) -> Job | None:
+        """The recently ended light job of `unit` whose overrun was not audited yet (marks it audited)."""
+        rec = self.recent.get(unit)
+        if rec is None or rec[2] or rec[0].kind != "light" or self.clock() - rec[1] > RECENT_S:
+            return None
+        rec[2] = True
+        return rec[0]
+
+    def unregistered_overrun(self, j: Job) -> Job | None:
+        """A light job that never registered (`job_start` failed) reports its overrun, audited once."""
+        if j.unit in self.jobs or j.unit in self.recent:
+            return None
+        self._remember(j, True)
+        return j
 
     def _ev(self, op: str, result: str, reason: str, j: Job) -> None:
         self.events.append(
@@ -97,6 +128,7 @@ class JobTable:
         if j:
             use = self.meter.finish(j, self.clock())  # while j is still registered: its last reads count
             del self.jobs[unit]
+            self._remember(j, reason.startswith("light_overrun"))
             self.stats.record(j.project, j.kind, use)
             self._ev("job_end", "ended", reason, j)
             self._keyed(self.events[-1], j)

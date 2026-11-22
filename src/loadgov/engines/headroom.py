@@ -7,7 +7,7 @@ from dataclasses import asdict, dataclass, field, replace
 from loadgov.config import Thresholds
 from loadgov.host.procfs import HostFS
 
-HOLD_KINDS = ("gate", "compile")  # an owner `hold` stops new heavy work, not implementers/reviewers
+HOLD_KINDS = ("gate", "compile", "image")  # an owner `hold` stops new heavy work, not implementers/reviewers
 
 
 @dataclass(frozen=True)

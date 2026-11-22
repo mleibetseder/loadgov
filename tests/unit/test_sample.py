@@ -52,6 +52,9 @@ def take(host, now=NOW, mirrors=("loop-a",)):
     out["jobs"] = []  # likewise
     out["light"] = {"running": 0, "max": 4, "per_project_max": 2, "cpu_quota_pct": 100,
                     "memory_max_mb": 1024, "max_runtime_s": 600}  # fmt: skip
+    out["image"] = {"window": "00:00-06:00", "timezone": "UTC", "in_window": False, "next_window_start": None,
+                    "max_runtime_min": 90, "beta_interval_h": 48, "max_per_night": 6,
+                    "env_allow": ["PATH"], "queued": 0, "running": 0, "queue": []}  # fmt: skip
     out["job_stats"] = []
     out["projects"] = {}
     out["alerts"] = {"active": [], "events": []}

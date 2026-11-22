@@ -48,8 +48,8 @@ rest_command:
     timeout: 10
 
   # POST /v1/set: profile and/or limits (daemon requires at least one of profile, max_cores,
-  # target_cpu_pct, load_max, max_implementers, ram_floor_gb). Optional: ttl ("90s", "15m", "2h") or
-  # until ("HH:MM Europe/Berlin"), reason.
+  # target_cpu_pct, load_max, max_implementers, max_reviewers, max_light, ram_floor_gb).
+  # Optional: ttl ("90s", "15m", "2h") or until ("HH:MM Europe/Berlin"), reason.
   loadgov_set:
     url: "http://YOUR_LOADGOV_HOST:7420/v1/set"
     method: post
@@ -63,6 +63,8 @@ rest_command:
       {% if target_cpu_pct is defined %}{% set _ = d.update({'target_cpu_pct': target_cpu_pct | float}) %}{% endif %}
       {% if load_max is defined %}{% set _ = d.update({'load_max': load_max | float}) %}{% endif %}
       {% if max_implementers is defined %}{% set _ = d.update({'max_implementers': max_implementers | int}) %}{% endif %}
+      {% if max_reviewers is defined %}{% set _ = d.update({'max_reviewers': max_reviewers | int}) %}{% endif %}
+      {% if max_light is defined %}{% set _ = d.update({'max_light': max_light | int}) %}{% endif %}
       {% if ram_floor_gb is defined %}{% set _ = d.update({'ram_floor_gb': ram_floor_gb | float}) %}{% endif %}
       {% if ttl is defined %}{% set _ = d.update({'ttl': ttl}) %}{% endif %}
       {% if until is defined %}{% set _ = d.update({'until': until}) %}{% endif %}

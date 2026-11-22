@@ -24,6 +24,7 @@ uv run ruff check && uv run ruff format --check
 See [AGENTS.md](AGENTS.md) for the rules that apply when changing this repo.
 
 Setting it up by hand, step by step with a check after each step: [docs/howto-setup.md](docs/howto-setup.md).
+A project that adopts the light lane or the image train: [docs/adopting.md](docs/adopting.md).
 
 ## Install the Home Assistant integration
 
@@ -60,8 +61,9 @@ client shims in `compat/`, and Home Assistant (the integration's options and `se
 | Home Assistant base URL for alert pushes | TOML `[ha] url` | `url = "http://ha.example:8123"` |
 | Home Assistant webhook id | `tokens.env` `LOADGOV_HA_WEBHOOK_ID`; HA secret `loadgov_webhook_id` and the `webhook_id` of the alert automation | `LOADGOV_HA_WEBHOOK_ID=loadgov-alert-<random>` |
 | The projects that run governed work (one `build-work-<project>.slice` each, made by `packaging/install.sh`) | TOML `[projects.<name>]`, `[memguard.projects.<name>]`, or `install.sh --project <name>` | `[projects.web-app]` |
-| Headroom thresholds of a project, per kind (`impl`, `review`, `gate`, `compile`, `light`) | TOML `[projects.<name>.kinds.<kind>]` | `load1_max = "nproc"`, `poll_s = 120` |
+| Headroom thresholds of a project, per kind (`impl`, `review`, `gate`, `compile`, `light`, `image`) | TOML `[projects.<name>.kinds.<kind>]` | `load1_max = "nproc"`, `poll_s = 120` |
 | Light lane: small checks run with `loadctl run --kind light --project web-app --label lint -- shellcheck x.sh` under hard CPU, memory and runtime limits | TOML `[light]`, profile `max_light` | `memory_max_mb = 512`, `max_runtime_s = 300` |
+| Image train: beta and release container builds queued with `loadctl image submit --project web-app --label web --channel beta -- make image`, run one at a time in a night window by `loadgov-image-runner.timer`; the owner releases one early with `loadctl image now ID --owner --reason ...` | TOML `[image]` | `window = "00:00-06:00"`, `timezone = "UTC"`, `beta_interval_h = 48`, `max_per_night = 6` |
 | Memory-guard rule of a project, its container names and the working directory of its agents | TOML `[memguard.projects.<name>]` | `low_mb = 2048`, `containers = '^(ci-|test-)'`, `agent_cwd = "/srv/work/web-app"` (or a list of directories) |
 | Containers that are never paused | TOML `[memguard] deny_containers` | `["*-test-db*", "*-review-*"]` (the default) |
 | Implementer trees of a legacy dispatcher (a snapshot shell and its usage line) | TOML `[memguard] legacy_snapshot` | `{ prefix = "/tmp/dispatcher-snap.", marker = "# Usage: dispatch.sh", project = "web-app" }` |
@@ -92,7 +94,7 @@ client shims in `compat/`, and Home Assistant (the integration's options and `se
 | `ha/` | Home Assistant package, automations and dashboard drafts, and the integration's tests |
 | `skills/loadgov/` | an agent skill that explains `loadctl` and the MCP tools to coding agents |
 | `tools/` | `shadow_compare.py` (observe-mode comparison), `backstop_sizing.py` |
-| `docs/` | deployment guide, protocol reference, MCP server, decisions |
+| `docs/` | deployment guide, adoption guide for projects, protocol reference, MCP server, decisions |
 
 ## License
 

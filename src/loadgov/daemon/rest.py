@@ -52,6 +52,8 @@ POST_KEYS = {
     "/v1/unfreeze": {"project", "reason"},
     "/v1/reap": {"reason"},
     "/v1/stray/kill": {"pid", "start_time", "reason"},
+    "/v1/image/now": {"id", "reason"},
+    "/v1/image/cancel": {"id"},
 }
 ACTION_RE = re.compile(r"^profile=([a-z][a-z0-9_-]*)$")
 
@@ -128,7 +130,7 @@ def status_for(reply: dict) -> int:
         return 200
     if reply.get("refused"):
         return 409
-    return {"starting": 503, "not_ready": 503, "internal": 500}.get(reply.get("error"), 400)
+    return {"not_found": 404, "starting": 503, "not_ready": 503, "internal": 500}.get(reply.get("error"), 400)
 
 
 class RestServer:
@@ -380,6 +382,15 @@ class RestServer:
             return "cancel_holder", args
         if path == "/v1/stray/kill":
             return "stray_kill", args
+        if path in ("/v1/image/now", "/v1/image/cancel"):
+            if not isinstance(args.get("id"), int) or isinstance(args.get("id"), bool):
+                return self._err(400, "bad_request", "id (integer) is required")
+            if path.endswith("now"):
+                reason = args.get("reason")
+                if not isinstance(reason, str) or not reason.strip():
+                    return self._err(400, "bad_request", "reason (non-empty string) is required")
+                return "image_now", args
+            return "image_cancel", args
         if path == "/v1/hold":
             on = args.pop("on", None)
             if not isinstance(on, bool):

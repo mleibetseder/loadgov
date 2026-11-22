@@ -14,7 +14,8 @@ on enforcement one flag at a time. Every command runs as root on the host. Proto
 - Nothing is changed on a Home Assistant instance without its owner's approval.
 
 For a hands-on checklist of the same first steps (daemon, REST, Home Assistant), see
-[howto-setup.md](howto-setup.md).
+[howto-setup.md](howto-setup.md). Once the daemon runs, projects adopt the light lane and the image train as
+described in [adopting.md](adopting.md).
 
 ## 1. Install
 
@@ -28,7 +29,8 @@ nice -n 10 packaging/install.sh --no-start        # /opt/loadgov venv, /usr/loca
 `install.sh` is idempotent and never turns on an enforce flag. Re-running it always rebuilds the `loadgov`
 package from the checkout (even at an unchanged version); to check, `grep` a recent change in
 `/opt/loadgov/.venv/lib/python*/site-packages/loadgov`. It installs the daemon into `/opt/loadgov/.venv`
-(pinned interpreter, not editable), links `loadctl`, installs `loadgovd.service` and `build-work.slice`, and
+(pinned interpreter, not editable), links `loadctl`, installs `loadgovd.service` and `build-work.slice`, installs and enables `loadgov-image-runner.timer` (with its service; it starts
+the runner of the image train every 10 minutes and does nothing while the image queue is empty, see `docs/protocol.md` "The image train"), and
 writes one `build-work-<project>.slice` for every project named in `/etc/loadgov/loadgov.toml`
 (`[projects.*]` and `[memguard.projects.*]`) and for every `--project NAME` you pass. Slices are generated
 because systemd cannot template slice units. If a `site/loadgov.toml` exists in the checkout and

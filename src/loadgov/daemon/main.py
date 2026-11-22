@@ -45,7 +45,7 @@ from loadgov.config import (
     load_config,
     thresholds,
 )
-from loadgov.daemon import backstop_ops, job_ops, memguard_ops, recover, slot_ops, stray_ops
+from loadgov.daemon import backstop_ops, image_ops, job_ops, memguard_ops, recover, slot_ops, stray_ops
 from loadgov.daemon.audit import AuditLog
 from loadgov.daemon.compat import render_env, write_env
 from loadgov.daemon.ha_push import HaPush
@@ -56,6 +56,7 @@ from loadgov.engines import slots as slots_engine
 from loadgov.engines.governor import PRIMARY, Governor, event_line
 from loadgov.engines.headroom import decide, decide_light, decide_review, paused_reasons, profile_factor
 from loadgov.engines.history import COLUMNS, SOCKET_MAX, History, row_for
+from loadgov.engines.image import VIEW_MAX, ImageTrain, find_builds, window_state
 from loadgov.engines.jobs import JobTable
 from loadgov.engines.limits import Limits, iso
 from loadgov.engines.projects import ProjectMeter
@@ -80,6 +81,7 @@ HEADROOM_OVERRIDES = (
     "swap_in_max",
     "mem_psi_max",
 )
+IMAGE_OPS = ("image_submit", "image_list", "image_cancel", "image_now", "image_next", "image_done")
 WATCH_EVERY_S = 30  # alert evaluation interval
 PARAM_ARGS = (
     "max_cores", "target_cpu_pct", "load_max", "max_implementers", "max_reviewers", "max_light",
@@ -198,6 +200,8 @@ class Daemon:
         self.runner = slot_ops.run_argv
         self.jobs.restore(self.store.load_jobs())
         self.jobs.stats.restore(self.store.load_job_stats())
+        self.image = ImageTrain(clock)
+        self.image.restore(self.store.load_image())
         self.memguard = memguard_ops.MemGuardRuntime(self, **(memguard_options or {}))
         self.memguard.restore(self.store.load_memguard())  # paused work stays paused: re-adopt
         self.backstop = backstop_ops.BackstopRuntime(
@@ -319,6 +323,7 @@ class Daemon:
             s["heavy_slot"] = {**s["heavy_slot"], "stuck": s["slots"]["heavy"]["stuck"]}
         s["jobs"] = self.jobs.summary()
         s["light"] = self.light_status()
+        s["image"] = self.image_status()
         s["job_stats"] = self.jobs.stats.summary()
         s["projects"] = self.projects.summary()
         s["alerts"] = self.watch.summary()
@@ -366,6 +371,7 @@ class Daemon:
     def fast_tick(self) -> None:
         """Release slots and drop jobs whose holder or scope is gone (runs every second, see `run`)."""
         changed = self.jobs.tick()
+        image_ops.reap(self)  # a running image job whose runner died
         self.projects.sample()
         if self.slots.tick() or changed:
             self._after_change({})
@@ -389,6 +395,7 @@ class Daemon:
             snap = self.limits.snapshot()
             ceiling = snap["ceiling"]["profile"] if snap["ceiling"] else None
             s_now = {**s, "slots": self.slots.summary()}
+            self.watch.external = self._image_alerts()
             self._publish(
                 self.watch.evaluate(s_now, busy, eff["target_cpu_pct"], snap["profile"], ceiling, top3)
             )
@@ -456,7 +463,8 @@ class Daemon:
     def _save_state(self) -> bool:
         try:
             self.store.save(self.limits.state, self.slots.to_state(), self.jobs.to_state(),
-                            self.memguard.engine.to_state(), self.jobs.stats.to_state())  # fmt: skip
+                            self.memguard.engine.to_state(), self.jobs.stats.to_state(),
+                            self.image.to_state())  # fmt: skip
         except OSError as e:
             log.error("cannot save state: %s", e)
             return False
@@ -516,6 +524,45 @@ class Daemon:
             "memory_max_mb": c.memory_max_mb,
             "max_runtime_s": c.max_runtime_s,
         }
+
+    def image_hold(self) -> bool:
+        """An owner hold or the drain profile: no new image job starts and no start time is planned."""
+        return bool(self.limits.state.hold) or bool(self.limits.effective()["hold_heavy_slot"])
+
+    def image_status(self, limit: int = VIEW_MAX) -> dict:
+        """The image train: the window, and the queue with planned starts (bounded to `limit` entries)."""
+        expected = lambda p: self.jobs.stats.expected_s(p, "image")  # noqa: E731
+        return self.image.status(
+            self.config.image, self.clock(), expected, self.image_hold(), self.config.keys.url, limit
+        )
+
+    def _image_alerts(self) -> dict:
+        """Alerts of the image train for the watch: a running image job past `max_runtime_min` (never a kill)
+        and container build activity outside the window that is no image job (observe only)."""
+        cfg, now, found = self.config.image, self.clock(), {}
+        jobs = [j for j in self.jobs.jobs.values() if j.kind == "image"]
+        for j in jobs:
+            if now - j.since > cfg.max_runtime_min * 60:
+                msg = (f"image job {j.label} has run {int((now - j.since) // 60)} min "
+                       f"(alert after {cfg.max_runtime_min} min); it is not stopped")  # fmt: skip
+                found[f"image_overrun:{j.project}"] = (
+                    "warning",
+                    f"Image build overrunning: {j.project}",
+                    msg,
+                    [],
+                )
+        if not window_state(cfg, now)[0]:
+            builds = find_builds(self.fs, self.sampler.proc_ticks, [j.cgroup for j in jobs])
+            if builds:
+                seen = ", ".join(f"{b['what']} (pid {b['pid']})" for b in builds[:3])
+                msg = f"container build outside the image window {cfg.window} {cfg.timezone}: {seen}"
+                found["image_out_of_window"] = (
+                    "warning",
+                    "Container build outside the image window",
+                    msg,
+                    [],
+                )
+        return found
 
     def limits_summary(self) -> dict:
         snap = self.limits.snapshot()
@@ -638,6 +685,7 @@ class Daemon:
                     "slots": slots,
                     "jobs": self.jobs.summary(),
                     "light": self.light_status(),
+                    "image": self.image_status(),
                     "job_stats": self.jobs.stats.summary(),
                     "projects": self.projects.summary(),
                     "rest": self.rest.status(),
@@ -656,6 +704,11 @@ class Daemon:
             if args is not None and not isinstance(args, dict):
                 return {"ok": False, "error": "bad_request", "message": "args must be an object"}
             return slot_ops.handle(self, op, args or {}, peer_pid)
+        if op in IMAGE_OPS:
+            args = req.get("args")
+            if args is not None and not isinstance(args, dict):
+                return {"ok": False, "error": "bad_request", "message": "args must be an object"}
+            return image_ops.handle(self, op, args or {}, peer_pid)
         if op in ("job_start", "job_end"):
             args = req.get("args")
             if args is not None and not isinstance(args, dict):
@@ -806,6 +859,8 @@ class Daemon:
             return memguard_ops.rest(self, op, args, peer)
         if op == "stray_kill":
             return stray_ops.rest(self, args, peer)
+        if op in ("image_now", "image_cancel"):
+            return image_ops.rest(self, op, args, peer)
         return self._mutate(op, args, None, rest_peer=peer)
 
     def _mutate(self, op: str, args: dict, peer_pid: int | None, rest_peer: str | None = None) -> dict:
