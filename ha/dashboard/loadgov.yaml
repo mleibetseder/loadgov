@@ -170,7 +170,7 @@ views:
               {% for j in jobs -%}
               - {{ j.kind }} {{ j.project }}: {% if j.url %}[{{ j.key }}]({{ j.url }}){% else %}{{ j.key or j.label }}{% endif %}
               {%- if j.slot %} ({{ j.slot }} slot){% endif %}
-              {%- if j.eta %}, done ~ {{ as_timestamp(j.eta) | timestamp_custom('%H:%M') }}{% if j.overdue %} (overdue){% endif %}{% endif %}
+              {%- if j.eta %}, done ~ {{ as_timestamp(j.eta, none) | timestamp_custom('%H:%M', true, '?') }}{% if j.overdue %} (overdue){% endif %}{% endif %}
               {% else -%}
               - nothing
               {% endfor %}
@@ -180,8 +180,8 @@ views:
               **Next in the {{ slot }} slot ({{ state_attr(e, 'count') or 0 }})**
 
               {% for w in q or [] -%}
-              {{ w.position }}. {% if w.url %}[{{ w.key }}]({{ w.url }}){% else %}{{ w.key or w.label }}{% endif %} ({{ w.project }}, waiting {{ (w.wait_s / 60) | round(0) | int }} min
-              {%- if w.eta %}, starts ~ {{ as_timestamp(w.eta) | timestamp_custom('%H:%M') }}{% endif %})
+              {{ w.position }}. {% if w.url %}[{{ w.key }}]({{ w.url }}){% else %}{{ w.key or w.label }}{% endif %} ({{ w.project }}, waiting {{ ((w.wait_s or 0) / 60) | round(0) | int }} min
+              {%- if w.eta %}, starts ~ {{ as_timestamp(w.eta, none) | timestamp_custom('%H:%M', true, '?') }}{% endif %})
               {% else -%}
               - empty
               {% endfor %}

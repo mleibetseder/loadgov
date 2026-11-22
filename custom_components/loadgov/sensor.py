@@ -272,6 +272,7 @@ class LoadgovStraysSensor(LoadgovEntity, SensorEntity):
         return {"items": items, "enforce": strays.get("enforce")}
 
 
+STATE_MAX_LENGTH = 255
 QUEUE_MAX_ITEMS = 10
 JOBS_MAX_ITEMS = 10
 SLOTS = ("heavy", "compile")
@@ -287,6 +288,12 @@ def _timestamp(value: Any) -> datetime | None:
     if parsed is None:
         return None
     return dt_util.as_utc(parsed) if parsed.tzinfo else parsed.replace(tzinfo=dt_util.UTC)
+
+
+def _state_text(value: Any) -> str:
+    """Free text as a state: Home Assistant rejects states over 255 characters."""
+    text = str(value)
+    return text if len(text) <= STATE_MAX_LENGTH else text[: STATE_MAX_LENGTH - 1] + "…"
 
 
 def _list(value: Any) -> list[dict[str, Any]]:
@@ -321,7 +328,9 @@ class LoadgovSlotNextSensor(LoadgovEntity, SensorEntity):
         waiters = self._waiters
         if waiters is None:
             return None
-        return (waiters[0].get("key") or waiters[0].get("label") or "none") if waiters else "none"
+        if not waiters:
+            return "none"
+        return _state_text(waiters[0].get("key") or waiters[0].get("label") or "none")
 
     @property
     def extra_state_attributes(self) -> dict[str, Any] | None:

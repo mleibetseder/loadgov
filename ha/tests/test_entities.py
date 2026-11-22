@@ -396,11 +396,27 @@ async def test_running_jobs_zero_on_an_older_daemon(hass, aioclient_mock, mock_e
     assert st.attributes["jobs"] == []
 
 
-def test_list_attributes_are_kept_out_of_the_recorder():
-    from custom_components.loadgov.sensor import LoadgovRunningJobsSensor, LoadgovSlotNextSensor
+async def test_list_attributes_are_kept_out_of_the_recorder(hass, aioclient_mock, mock_entry, status):
+    status["slots"]["heavy"]["waiters"] = [_waiter(1)]
+    await setup(hass, mock_entry, aioclient_mock, status)
+    for entity_id, attr in (
+        ("sensor.host_heavy_slot_next", "queue"),
+        ("sensor.host_running_jobs", "jobs"),
+    ):
+        # the set the recorder reads: the entity class collects it from all bases and mixins
+        entities = hass.data["entity_components"]["sensor"].entities
+        entity = next(e for e in entities if e.entity_id == entity_id)
+        assert attr in entity._Entity__combined_unrecorded_attributes
 
-    assert "queue" in LoadgovSlotNextSensor._unrecorded_attributes
-    assert "jobs" in LoadgovRunningJobsSensor._unrecorded_attributes
+
+async def test_slot_next_state_is_cut_to_255_characters(hass, aioclient_mock, mock_entry, status):
+    label = "x" * 300
+    status["slots"]["heavy"]["waiters"] = [_waiter(1, label=label)]
+    await setup(hass, mock_entry, aioclient_mock, status)
+    state = hass.states.get("sensor.host_heavy_slot_next")
+    assert len(state.state) == 255
+    assert state.state == "x" * 254 + "…"
+    assert state.attributes["queue"][0]["label"] == label
 
 
 def _projects(*names):
@@ -482,3 +498,24 @@ async def test_dashboard_queue_card_renders(hass, aioclient_mock, mock_entry, st
     assert "1. [PROJ-42](https://tracker.example/issues/PROJ-42) (web-app, waiting 1 min" in text
     assert "2. gate-2 (web-app" in text
     assert "- empty" in text  # the compile queue
+
+
+async def test_dashboard_card_survives_null_wait_and_bad_eta(hass, aioclient_mock, mock_entry, status):
+    from pathlib import Path
+
+    import yaml
+    from homeassistant.helpers.template import Template
+
+    status["jobs"] = [_job("heavy", eta="not-a-time")]
+    status["slots"]["heavy"]["waiters"] = [_waiter(1, wait_s=None, eta="garbage")]
+    await setup(hass, mock_entry, aioclient_mock, status)
+    board = yaml.safe_load((Path(__file__).parents[1] / "dashboard" / "loadgov.yaml").read_text())
+    card = next(
+        c
+        for section in board["views"][0]["sections"]
+        for c in section["cards"]
+        if c.get("type") == "markdown"
+    )
+    text = Template(card["content"], hass).async_render()
+    assert "waiting 0 min, starts ~ ?)" in text
+    assert "done ~ ?" in text
