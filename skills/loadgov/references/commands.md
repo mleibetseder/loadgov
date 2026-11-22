@@ -3,9 +3,10 @@
 ```bash
 loadctl status [--json]                                  # host load, levels, limits, slots
 loadctl limits [--json]                                  # effective limits, overrides, ceiling, restriction
-loadctl wait --kind impl|review|gate|compile [--project P] [--timeout S]   # exit 0 ok, 1 timeout, 3 no daemon
+loadctl wait --kind impl|review|gate|compile|light [--project P] [--timeout S]   # exit 0 ok, 1 timeout, 3 no daemon
 loadctl wait --kind review                                              # review lane: memory floor and max_reviewers only
 loadctl run --kind gate --project P --label L -- cargo test                # governed job in a slot
+loadctl run --kind light --project P --label L -- shellcheck x.sh        # light lane: no slot, CPU 100 %, 1 GB, 600 s; exit 76 = LIGHT_OVERRUN
 loadctl set --max-cores 2 --ttl 2h --reason "fan too loud" [--project P]  # lower
 loadctl set --max-implementers 3 --until "07:00 Europe/Berlin" --reason "night run"  # raise: refused under a human restriction
 loadctl slot status [--json]
@@ -13,7 +14,7 @@ loadctl jobs --stats [--json]                                 # what finished jo
 loadctl log -n 20                                        # audit lines
 ```
 
-Limits: `--profile`, `--max-cores`, `--target-cpu`, `--load-max`, `--max-impl`, `--max-reviewers`, `--ram-floor-gb`; timing `--ttl 90s|15m|2h` or `--until 'HH:MM Zone'`; `--reason` is required.
+Limits: `--profile`, `--max-cores`, `--target-cpu`, `--load-max`, `--max-impl`, `--max-reviewers`, `--max-light`, `--ram-floor-gb`; timing `--ttl 90s|15m|2h` or `--until 'HH:MM Zone'`; `--reason` is required.
 
 MCP equivalents: `load_get_status`, `load_explain` (status and limits), `load_wait_headroom` (wait), `load_set_limits` (set). `loadctl run` has no MCP tool.
 

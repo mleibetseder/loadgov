@@ -475,3 +475,55 @@ def test_a_pending_drain_profile_hold_makes_every_eta_unknown(tmp_path):
     assert r.heavy()["hold_origin"] == "profile" and r.heavy()["waiters"][0]["eta"] is None
     r.m.set_profile_hold(False)
     assert r.heavy()["waiters"][0]["eta"] == stamp(T0 + 600)
+
+
+def test_first_waiter_eta_equals_the_bound_job_eta(tmp_path):
+    r = Rig(tmp_path)
+    r.acquire(10, "h")
+    r.t += 40  # the headroom wait: the job registers after the grant
+    assert r.m.bind_scope("heavy", 10, "u.scope", "/cg/u.scope", 20, "gate", None, r.t)
+    r.acquire(11, "a", kind="gate")
+    job = Job("gate", "proj", "h", "u.scope", "/cg/u.scope", 20, None, 10, "heavy", r.t)
+    eta, _ = finish_estimate(job.since, r.stats[("proj", "gate")], r.t)
+    assert r.heavy()["waiters"][0]["eta"] == stamp(eta) == stamp(T0 + 40 + 600)
+
+
+def test_unbound_holder_eta_uses_the_grant_time(tmp_path):
+    r = Rig(tmp_path)
+    r.acquire(10, "h", kind="gate")
+    r.t += 40
+    r.acquire(11, "a", kind="gate")
+    assert r.heavy()["waiters"][0]["eta"] == stamp(T0 + 600)
+
+
+def test_saved_holder_without_job_since_still_loads(tmp_path):
+    r = Rig(tmp_path)
+    r.acquire(10, "h")
+    r.m.bind_scope("heavy", 10, "u.scope", "/cg/u.scope", 20, "gate", None, T0 + 5)
+    saved = r.m.to_state()
+    assert saved["heavy"]["holder"]["job_since"] == T0 + 5
+    del saved["heavy"]["holder"]["job_since"]  # a state.json written before the field existed
+    r2 = Rig(tmp_path)
+    r2.m.restore(saved)
+    h = r2.m.slots["heavy"].holder
+    assert h is not None and h.job_since is None
+
+
+def test_job_start_wires_the_registration_time_into_the_slot_eta(fake_host, tmp_path, monkeypatch):
+    monkeypatch.setattr("loadgov.daemon.slot_ops.pid_alive", lambda pid, *a: True)  # fake pids, no real /proc
+    d = make_daemon(fake_host, tmp_path)
+    d.slots.stat_reader = d.jobs.stat_reader = stat_text  # every pid is a live fake process; no real /proc
+    d.jobs.stats.record("proj", "gate", {"duration_s": 600.0})
+    ask = {"slot": "heavy", "project": "proj", "wait": True, "kind": "gate"}
+    assert call(d, "slot_acquire", label="h", pid=4001, **ask)["status"] == "granted"
+    d.t += 40  # the headroom wait between the grant and the job registration
+    unit = "loadgov-gate-h-1.scope"
+    r = call(d, "job_start", kind="gate", project="proj", label="h", unit=unit, cgroup=f"/a/{unit}",
+             pid=4002, owner_pid=4001, slot="heavy")  # fmt: skip
+    assert r["ok"] and r["bound"]
+    d.t += 5
+    assert call(d, "slot_acquire", label="w", pid=4003, **ask)["status"] == "queued"
+    st = call(d, "status")["status"]
+    job, waiter = st["jobs"][0], st["slots"]["heavy"]["waiters"][0]
+    assert job["eta"] == stamp(T0 + 40 + 600)  # registration time + p50, not the grant time
+    assert waiter["eta"] == job["eta"]

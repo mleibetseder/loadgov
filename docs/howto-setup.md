@@ -135,7 +135,7 @@ with the README's curl step before relying on them.
 
 ## 7. Let your agents and loops use it
 
-- Agents and scripts wait with `loadctl wait --kind <impl|review|gate|compile> --project <name> --label <what>`
+- Agents and scripts wait with `loadctl wait --kind <impl|review|gate|compile|light> --project <name> --label <what>`
   and run heavy jobs with `loadctl run --kind gate|compile --project <name> --label <what> -- <command>`.
 - Nesting the same slot is safe: a command that takes a slot itself and runs inside a job holding that slot
   (a build whose `RUSTC_WRAPPER` is the compile shim inside `loadctl run --kind compile`) is granted

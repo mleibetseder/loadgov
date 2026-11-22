@@ -62,6 +62,11 @@ class JobTable:
              "pid": j.pid, "request": {"kind": j.kind, "label": j.label, "unit": j.unit, "slot": j.slot}}
         )  # fmt: skip
 
+    def overrun(self, j: Job, reason: str) -> None:
+        """Audit `light_overrun` for a light job that hit its runtime or memory limit."""
+        self._ev("light_overrun", "overrun", reason, j)
+        self._keyed(self.events[-1], j)
+
     def drain_events(self) -> list[dict]:
         ev, self.events = self.events, []
         return ev

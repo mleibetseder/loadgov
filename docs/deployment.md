@@ -94,6 +94,10 @@ In observe mode the daemon samples the host, makes every decision a real run wou
 `WOULD ...` audit lines (`/var/log/loadgov/audit.jsonl`) without writing a cgroup file, sending a signal, pausing a
 container or taking a lock.
 
+The audit log rotates by size (`[audit] max_mb`, `keep`; docs/protocol.md "Files written by the daemon"): older lines are in
+`audit.jsonl.1` (newest) to `audit.jsonl.N`. `tools/shadow_compare.py --audit` reads one file, so for a window that spans a
+rotation concatenate them oldest first, e.g. `cat audit.jsonl.2 audit.jsonl.1 audit.jsonl > /tmp/audit-all.jsonl`.
+
 If you already run loops that do the same work (a CPU governor, memory guards, an alert sampler), compare them for
 at least three days, including a full build or test gate, with `tools/shadow_compare.py`:
 

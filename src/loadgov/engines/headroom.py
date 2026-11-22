@@ -177,3 +177,66 @@ def decide_review(
         {k: round(x, 4) for k, x in factor.items()},
         f"review lane: {running} of {max_reviewers} reviewers running, {mem_gb:.1f} GB free",
     )
+
+
+def decide_light(
+    sample: dict,
+    th: Thresholds,
+    *,
+    project: str,
+    running: int,
+    project_running: int,
+    max_light: int,
+    max_per_project: int,
+    ram_floor_gb: float = 0.0,
+    guard_paused: bool = False,
+    factor: dict | None = None,
+    io_psi_gate: bool = False,
+    io_psi_max: float = 25.0,
+    paused: list[str] | None = None,
+) -> Decision:
+    """The light lane: small read-only checks (lint, formatters in check mode) under hard scope limits.
+    No heavy or compile slot and no load, PSI or swap checks. Passes on the memory floor (at least the
+    profile's `ram_floor_gb`), no pause, `running` registered light jobs < `max_light` host-wide and
+    `project_running` < `max_per_project` for this project. An owner `hold` does not stop it."""
+    factor = factor or {"load": 1.0, "mem_add_gb": 0.0}
+    th = scale(th, factor)
+    th = replace(th, mem_min_gb=max(th.mem_min_gb, ram_floor_gb))
+    paused = paused or []
+    mem_gb = sample["memory"]["avail_mb"] / 1024
+    v = {
+        "load1": sample["cpu"]["load1"],
+        "load5": sample["cpu"]["load5"],
+        "cpu_psi": sample["cpu"]["psi_some_avg60"],
+        "mem_gb": mem_gb,
+        "swap_mb": sample["swap"]["used_mb"],
+        "mem_psi": sample["memory"]["psi_some_avg60"],
+        "io_psi": sample["io"]["psi_some_avg60"],
+        "cpus": sample["host"]["cores"],
+        "light_running": running,
+        "max_light": max_light,
+        "project_running": project_running,
+        "max_light_per_project": max_per_project,
+    }
+    why = []
+    if not running < max_light:
+        why.append(f"light lane: {running} of {max_light} running")
+    if not project_running < max_per_project:
+        why.append(f"light lane: {project} {project_running} of {max_per_project} running")
+    if not mem_gb >= th.mem_min_gb:
+        why.append(f"mem available {mem_gb:.1f} GB < {th.mem_min_gb:g} GB")
+    if guard_paused:
+        why.append("memory guard is pausing work")
+    why += [f"paused: {p}" for p in paused]
+    over_io = not v["io_psi"] < io_psi_max
+    return Decision(
+        not why,
+        why,
+        over_io,
+        {k: round(x, 2) if isinstance(x, float) else x for k, x in v.items()},
+        paused,
+        asdict(th) | {"io_psi_max": io_psi_max, "io_psi_gate": io_psi_gate},
+        {k: round(x, 4) for k, x in factor.items()},
+        f"light lane: {running} of {max_light} running ({project} {project_running} of {max_per_project}), "
+        f"{mem_gb:.1f} GB free",
+    )

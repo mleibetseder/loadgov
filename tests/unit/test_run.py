@@ -299,6 +299,7 @@ class Host:
             popen=self.popen, run=lambda argv: self.ran.append(argv) or 0, sleep=lambda _s: None,
             now=lambda: T0, avail_mb=lambda: 1234, rustc_running=lambda: False,
             find_cgroup=lambda pid, unit, slice_: CG.replace(UNIT, unit),
+            unit_result=lambda unit: None,
         )  # fmt: skip
 
     def popen(self, argv, env=None, pass_fds=()):
@@ -1053,3 +1054,32 @@ def test_key_flag_and_environment_reach_the_slot_request_and_the_job(fake_host, 
     sent.clear()
     assert go(monkeypatch, d, h.deps, *base, "--key", "bad key", "--", "true") == 2  # before anything starts
     assert sent == []
+
+
+def test_a_configured_disk_threshold_never_delays_a_guarded_start(fake_host, tmp_path, monkeypatch, procs):
+    from loadgov.config import DiskThreshold
+
+    host = fake_host("calm")  # 48 GB free, about 44 % used
+    d = make_daemon(host, tmp_path)
+    busy, limit = DiskThreshold(30.0, True), DiskThreshold(40.0, True)
+    d.sampler.disk_busy = d.watch.disk_busy = busy
+    d.sampler.disk_limit = d.watch.disk_limit = limit
+    d.status = d.sampler.sample(now=d.t)
+    st = call(d, "status")["status"]
+    assert st["levels"]["disk_alert"] == "LIMIT"  # the configured percent is crossed ...
+    assert st["levels"]["disk"] == "OK" and st["level"] == "OK"  # ... the level start paths read is not
+    # `hwmon gate` fails only on "level LIMIT" in the first line; `level-wait` and `--headroom level` need OK
+    assert loadctl.format_hwmon(st).splitlines()[0].endswith("level OK")
+    ops = []
+    wire(monkeypatch, d, ops)
+    h = Host(host, procs().pid)
+    sleeps = []
+    h.deps.sleep = sleeps.append
+    rc = go(
+        monkeypatch, d, h.deps, "--kind", "compile", "--project", "tv", "--label", "guarded",
+        "--headroom", "level", "--", "x",
+    )  # fmt: skip
+    assert rc == 0 and sleeps == [15.0]  # the two OK samples of the level wait, nothing else
+    out = d.watch.evaluate({**st, "slots": {}, "heavy_slot": {"stuck": False}}, 10, 65, "balanced", None, [])
+    (alert,) = [e for e in out if e["key"] == "disk"]
+    assert alert["level"] == "critical" and alert["message"].endswith(">= 40 %")

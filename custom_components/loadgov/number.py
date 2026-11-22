@@ -1,4 +1,4 @@
-"""The five tunables as numbers; values come from `limits.effective`."""
+"""The six tunables as numbers; values come from `limits.effective`."""
 
 from __future__ import annotations
 
@@ -40,6 +40,11 @@ NUMBERS = (
         native_min_value=0, native_max_value=4, native_step=1, icon="mdi:account-hard-hat",
     ),
     LoadgovNumberDescription(
+        # the daemon accepts 0-8 (config.RANGES); parallel light jobs, host-wide.
+        key="max_light", param="max_light", name_text="Host Max Light Jobs",
+        native_min_value=0, native_max_value=8, native_step=1, icon="mdi:feather",
+    ),
+    LoadgovNumberDescription(
         # the daemon accepts 2.0-6.0 (config.RANGES); the entity mirrors that range.
         key="ram_floor_gb", param="ram_floor_gb", name_text="Host RAM Floor",
         native_min_value=2.0, native_max_value=6.0, native_step=0.5,
@@ -70,5 +75,5 @@ class LoadgovNumber(LoadgovEntity, NumberEntity):
         return float(value) if isinstance(value, int | float) else None
 
     async def async_set_native_value(self, value: float) -> None:
-        sent = int(value) if self._param == "max_implementers" else float(value)
+        sent = int(value) if self._param in ("max_implementers", "max_light") else float(value)
         await self.coordinator.async_post("/v1/set", {self._param: sent})

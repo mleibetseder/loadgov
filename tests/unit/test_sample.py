@@ -50,6 +50,8 @@ def take(host, now=NOW, mirrors=("loop-a",)):
     out["rest"] = {"enabled": False, "state": "disabled", "error": None, "bind": "192.0.2.10", "port": 7420}
     out["slots"] = SlotManager(host.fs).summary()  # added by the daemon too
     out["jobs"] = []  # likewise
+    out["light"] = {"running": 0, "max": 4, "per_project_max": 2, "cpu_quota_pct": 100,
+                    "memory_max_mb": 1024, "max_runtime_s": 600}  # fmt: skip
     out["job_stats"] = []
     out["projects"] = {}
     out["alerts"] = {"active": [], "events": []}

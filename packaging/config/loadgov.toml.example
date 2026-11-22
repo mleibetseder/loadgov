@@ -3,7 +3,7 @@
 # see README.md "Configure for your site".
 # Only the four profiles below exist; a table overrides just the keys it names.
 # Ranges: max_cores 1.0-6.0 step 0.5, target_cpu_pct 35-90 step 5, load_max 1.0-6.0 step 0.5,
-# max_implementers 0-4, max_reviewers 0-8, ram_floor_gb 2.0-6.0 step 0.5.
+# max_implementers 0-4, max_reviewers 0-8, max_light 0-8, ram_floor_gb 2.0-6.0 step 0.5.
 
 default_profile = "balanced"
 
@@ -77,6 +77,15 @@ enforce = false
 # LOADGOV_COMPILE_LOCK sets the same when this key is absent.
 # compile_lock = "host-compile-slot.lock"
 
+# Thresholds of the `disk` alert (busy = warning, limit = critical) and of `levels.disk_alert`. A number is GB free,
+# a string "NN%" is percent used of the filesystem (above 0, below 100). Defaults: 25 and 10 GB free.
+# Each value is checked on its own (units may be mixed) against every watched path; the worst path wins.
+# Applied on reload. They never change the overall `level` (`levels.disk` keeps the fixed 25/10 GB free rule), so
+# nothing is refused or delayed because of disk: no gate, compile or `--headroom level` start waits on it.
+# [levels]
+# disk_busy = "80%"
+# disk_limit = 10
+
 [keys]
 # Link template for the issue key of a queue item or job (`loadctl run --key`, LOADGOV_KEY). It must
 # contain {key}; the status field `url` is this with {key} replaced by the URL-quoted key. Empty: no links.
@@ -88,6 +97,7 @@ target_cpu_pct = 50
 load_max = 2.0
 max_implementers = 1
 max_reviewers = 1
+max_light = 2
 cargo_build_jobs = 1
 
 [profiles.balanced]
@@ -96,6 +106,7 @@ target_cpu_pct = 65
 load_max = 3.0
 max_implementers = 2
 max_reviewers = 3
+max_light = 4
 cargo_build_jobs = 2
 # Per profile, with these defaults when omitted:
 # load_hold = 5.0          # its own key, never derived from load_max
@@ -110,6 +121,7 @@ target_cpu_pct = 85
 load_max = 5.0
 max_implementers = 3
 max_reviewers = 4
+max_light = 6
 cargo_build_jobs = 3
 
 [profiles.drain]
@@ -118,16 +130,18 @@ target_cpu_pct = 50
 load_max = 2.0
 max_implementers = 0
 max_reviewers = 0
+max_light = 0
 cargo_build_jobs = 1
 hold_heavy_slot = true   # stored only; the hold itself is taken through the slots
 
 # ---- Headroom (loadctl wait) -------------------------------------------------------------------
-# Defaults are the stricter values below for every kind (impl, review, gate, compile).
+# Defaults are the stricter values below for every kind (impl, review, gate, compile, light).
 # load1_max / load5_max may be numbers or "nproc" expressions ("nproc", "nproc-2", "nproc*0.5"),
 # resolved against the host's core count when a decision is made (a result <= 0 makes every decision
 # fail with a "misconfigured" reason); load5_max = false disables it. max_wait_s = 0 waits forever.
 # Kind `review` uses the review lane: only mem_min_gb (default 2 for reviews) and the profile's
 # max_reviewers apply; load1_max, load5_max, psi_max, swap_max_mb, swap_in_max and mem_psi_max are ignored for it.
+# Kind `light` (see [light] below) works the same way with the profile's max_light.
 # Load thresholds scale with the active profile (load_max / default profile's load_max) and
 # mem_min_gb rises by the profile's ram_floor_gb above the default profile's.
 [headroom]
@@ -197,3 +211,20 @@ io_psi_gate = false      # io PSI some avg60 < 25 blocks only when true; otherwi
 # [principal]
 # deny_cgroups = ["/legacy-loop"]
 # ancestor_deny = ['dispatch-[^/ ]*\.sh', 'queue\.sh']
+
+# Size rotation of the daemon's own audit log (<log-dir>/audit.jsonl). Rotated files are audit.jsonl.1 (newest)
+# .. audit.jsonl.<keep> (oldest). max_mb = 0 turns rotation off. Applied on reload.
+# [audit]
+# max_mb = 50
+# keep = 5
+
+# ---- Light lane (loadctl run --kind light) -----------------------------------------------------
+# Small read-only checks (lint, shellcheck, formatters in check mode, link and config checks, small unit
+# tests) take no heavy or compile slot. `loadctl run --kind light` puts each under these hard limits on
+# the scope it creates; the daemon itself writes nothing. Uncomment to tighten (the ranges cap how loose):
+# [light]
+# cpu_quota_pct = 100          # CPUQuota of the scope, 10-200
+# memory_max_mb = 1024         # MemoryMax of the scope (MemorySwapMax is always 0), 128-4096
+# max_runtime_s = 600          # loadctl kills the scope after this long (exit 76, LIGHT_OVERRUN), 30-1800
+# max_light_per_project = 2    # registered light jobs of one project, 1-8 (the host-wide cap is the
+#                              # profile's max_light)

@@ -3,14 +3,18 @@
 from __future__ import annotations
 
 import calendar
+import logging
 import os
 import re
 import time
 from collections import deque
 from dataclasses import dataclass
 
-from loadgov.engines.levels import effective_psi, evaluate
+from loadgov.config import DiskThreshold
+from loadgov.engines.levels import DISK_BUSY, DISK_LIMIT, disk_check, effective_psi, evaluate
 from loadgov.host.procfs import HostFS
+
+log = logging.getLogger(__name__)
 
 JVM_DAEMONS = ("GradleDaemon", "KotlinCompileDaemon")
 # status key -> cgroup path below the cgroup root. systemd nests a dashed slice name by prefix, so
@@ -202,6 +206,19 @@ def parse_vmstat_swap(text: str) -> tuple[int, int] | None:
     return (vals["pswpin"], vals["pswpout"]) if len(vals) == 2 else None
 
 
+def _disk_path(path: str, v: os.statvfs_result) -> dict:
+    """Free GB (as before), total GB and used % of one filesystem; used % is df's (reserved blocks count
+    as neither used nor free)."""
+    used = max(0, v.f_blocks - v.f_bfree)
+    denom = used + v.f_bavail
+    return {
+        "path": path,
+        "free_gb": round(v.f_bavail * v.f_frsize / 2**30, 1),
+        "total_gb": round(v.f_blocks * v.f_frsize / 2**30, 1),
+        "used_pct": round(100.0 * used / denom, 1) if denom else 0.0,
+    }
+
+
 class Sampler:
     """Keeps the previous /proc/stat reading so each sample reports busy % over the last interval."""
 
@@ -209,6 +226,9 @@ class Sampler:
         self, fs: HostFS | None = None, mirrors: tuple[str, ...] = (), psi_busy_gate_pct: float = 80.0
     ):
         self.psi_busy_gate_pct = psi_busy_gate_pct
+        self._bad_disks: set[str] = set()
+        self.disk_busy: DiskThreshold = DISK_BUSY  # [levels] disk_busy / disk_limit, set by the daemon
+        self.disk_limit: DiskThreshold = DISK_LIMIT
         self.fs = fs or HostFS()
         self.watched = {**{m: m for m in mirrors}, **WATCHED_CGROUPS}
         self.stopped_under = tuple(f"/{m}" for m in mirrors) + STOPPED_UNDER
@@ -253,7 +273,25 @@ class Sampler:
         swap_total = mem.get("SwapTotal", 0)
         swap_used = swap_total - mem.get("SwapFree", 0)
         swap_in, swap_out = self._swap_rates(now)
-        disk_free = min(round(v.f_bavail * v.f_frsize / 2**30, 1) for v in (fs.statvfs(d) for d in fs.disks))
+        per_path = []
+        for d in fs.disks:
+            try:
+                per_path.append(_disk_path(d, fs.statvfs(d)))
+                self._bad_disks.discard(d)
+            except OSError as e:  # one unreadable path is skipped (logged once), not fatal for the sample
+                if d not in self._bad_disks:
+                    log.warning("disk path %s unreadable, skipped: %s", d, e)
+                    self._bad_disks.add(d)
+        if not per_path:
+            raise OSError("no watched disk path is readable")
+        low = min(per_path, key=lambda p: p["free_gb"])
+        disk = {
+            "free_gb": low["free_gb"],
+            "total_gb": low["total_gb"],
+            "used_pct": disk_check({"per_path": per_path}, self.disk_busy, self.disk_limit)[1]["used_pct"],
+            "paths": list(fs.disks),
+            "per_path": per_path,
+        }
         uptime = float(fs.proc("uptime").split()[0])
         procs = [p for p in (_read_proc(fs, pid, uptime) for pid in fs.pids()) if p]
         self.proc_ticks = {p.pid: (p.start, p.ticks, p.comm, p.rss_mb) for p in procs}
@@ -293,7 +331,7 @@ class Sampler:
                 "psi_some_avg60": psi["io"].get("some_avg60", 0.0),
                 "psi_full_avg60": psi["io"].get("full_avg60", 0.0),
             },
-            "disk": {"free_gb": disk_free, "paths": list(fs.disks)},
+            "disk": disk,
             "top": [
                 {
                     "pid": p.pid,
@@ -315,7 +353,7 @@ class Sampler:
                 if p.state == "T" and p.cgroup.startswith(self.stopped_under)
             ],
         }
-        s["levels"], s["level"] = evaluate(s)
+        s["levels"], s["level"] = evaluate(s, self.disk_busy, self.disk_limit)
         return s
 
     def _heavy_slot(self, now: float) -> dict:

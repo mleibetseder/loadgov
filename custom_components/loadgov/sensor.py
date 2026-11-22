@@ -138,6 +138,8 @@ async def async_setup_entry(
             LoadgovFeaturesSensor(entry.runtime_data),
             LoadgovTriggersSensor(entry.runtime_data),
             LoadgovStraysSensor(entry.runtime_data),
+            LoadgovLightLaneSensor(entry.runtime_data),
+            LoadgovDiskUsedSensor(entry.runtime_data),
             *(LoadgovSlotNextSensor(entry.runtime_data, slot) for slot in SLOTS),
             *(LoadgovSlotHolderEtaSensor(entry.runtime_data, slot) for slot in SLOTS),
             LoadgovRunningJobsSensor(entry.runtime_data),
@@ -270,6 +272,70 @@ class LoadgovStraysSensor(LoadgovEntity, SensorEntity):
             for i in (strays.get("items") or [])[:STRAY_MAX_ITEMS]
         ]
         return {"items": items, "enforce": strays.get("enforce")}
+
+
+LIGHT_ATTRS = ("max", "per_project_max", "cpu_quota_pct", "memory_max_mb", "max_runtime_s")
+
+
+class LoadgovLightLaneSensor(LoadgovEntity, SensorEntity):
+    """The light lane: the state is the number of running light jobs. Unavailable when the daemon is older
+    and has no `light` in its status."""
+
+    _domain = "sensor"
+    _attr_icon = "mdi:feather"
+    _attr_state_class = SensorStateClass.MEASUREMENT
+
+    def __init__(self, coordinator: LoadgovCoordinator) -> None:
+        super().__init__(coordinator, "light_lane", "Host Light Lane")
+
+    @property
+    def _light(self) -> dict[str, Any] | None:
+        light = self.status.get("light")
+        return light if isinstance(light, dict) else None
+
+    @property
+    def available(self) -> bool:
+        return super().available and self._light is not None
+
+    @property
+    def native_value(self) -> Any:
+        light = self._light
+        return None if light is None else light.get("running")
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any] | None:
+        light = self._light
+        return None if light is None else {k: light.get(k) for k in LIGHT_ATTRS}
+
+
+class LoadgovDiskUsedSensor(LoadgovEntity, SensorEntity):
+    """Used % of the worst watched path (`disk.used_pct`); the attribute `disk_alert` is the level of the
+    disk alert (`levels.disk_alert`). Unavailable on a daemon without `disk.used_pct`."""
+
+    _domain = "sensor"
+    _attr_icon = "mdi:harddisk"
+    _attr_native_unit_of_measurement = PERCENTAGE
+    _attr_state_class = SensorStateClass.MEASUREMENT
+
+    def __init__(self, coordinator: LoadgovCoordinator) -> None:
+        super().__init__(coordinator, "disk_used", "Host Disk Used")
+
+    @property
+    def _used(self) -> int | float | None:
+        used = dig(self.status, "disk.used_pct")
+        return used if isinstance(used, int | float) and not isinstance(used, bool) else None
+
+    @property
+    def available(self) -> bool:
+        return super().available and self._used is not None
+
+    @property
+    def native_value(self) -> int | float | None:
+        return self._used
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        return {"disk_alert": dig(self.status, "levels.disk_alert")}
 
 
 STATE_MAX_LENGTH = 255

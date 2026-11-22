@@ -11,7 +11,8 @@ from __future__ import annotations
 import time
 from collections import deque
 
-from loadgov.engines.levels import LIMITS
+from loadgov.config import DiskThreshold
+from loadgov.engines.levels import DISK_BUSY, DISK_LIMIT, disk_check
 from loadgov.engines.limits import iso
 
 DEDUPE_S = 600
@@ -22,6 +23,8 @@ MEM_ALERT_MB = 3000
 SWAP_GROWTH_MB = 768  # the legacy guard's swap-growth step
 CALM_AVAIL_MB = 6000  # the legacy guard's high-water mark
 CALM_RESET_EVALS = 20  # 10 minutes of calm (legacy guard: 120 samples at 5 s): then the baseline follows swap
+OVERRUN_COUNT = 3  # light overruns of one project within OVERRUN_WINDOW_S raise `light_overrun:<project>`
+OVERRUN_WINDOW_S = 24 * 3600  # ... and 24 h without one clears it
 CLEAR_EVALS = 2  # a condition must stay clear this long before `resolved` is sent
 LEGACY_SWAP_MB = 2048
 LEGACY_CPU_PCT = 70
@@ -98,6 +101,8 @@ class LegacyTee:
 class Watch:
     def __init__(self, clock=time.time, dedupe_s: int = DEDUPE_S):
         self.clock, self.dedupe_s = clock, dedupe_s
+        self.disk_busy: DiskThreshold = DISK_BUSY  # from [levels]; the daemon sets them, also on reload
+        self.disk_limit: DiskThreshold = DISK_LIMIT
         self.active: dict[str, dict] = {}
         self.events: deque[dict] = deque(maxlen=KEEP_EVENTS)
         self._last_sent: dict[str, float] = {}
@@ -105,6 +110,7 @@ class Watch:
         self._cpu_hi = 0
         self._swap_base: int | None = None
         self._calm = 0
+        self._overruns: dict[str, list[tuple[float, str]]] = {}  # project -> (time, label), light lane
         self._ctx = {"avail_mb": 0, "swap_mb": 0, "profile": None, "ceiling": None, "top3": []}
 
     # ---- evaluation ------------------------------------------------------------------------------
@@ -146,13 +152,33 @@ class Watch:
                 found[f"stuck_holder:{name}"] = ("warning", f"{name} slot held too long", msg,
                                                  ACTIONS["stuck_holder"])  # fmt: skip
 
-        free = s["disk"]["free_gb"]
-        busy_gb, limit_gb = LIMITS["disk_free_gb"]
-        if free < busy_gb:
-            msg = f"{free:g} GB free (BUSY below {busy_gb} GB, LIMIT below {limit_gb} GB)"
-            found["disk"] = ("critical" if free < limit_gb else "warning", "Disk space low", msg,
+        lvl, _path, why = disk_check(s["disk"], self.disk_busy, self.disk_limit, inclusive=False)
+        if lvl != "OK":
+            found["disk"] = ("critical" if lvl == "LIMIT" else "warning", "Disk space low", why,
                              ACTIONS["disk"])  # fmt: skip
+        found.update(self._overrun_alerts(now))
         return self._reconcile(now, found)
+
+    def note_overrun(self, project: str, label: str) -> None:
+        """A light job of `project` hit its runtime or memory limit (kept in memory, not across restarts)."""
+        self._overruns.setdefault(project, []).append((self.clock(), label))
+
+    def _overrun_alerts(self, now: float) -> dict:
+        """Three overruns of a project within 24 h raise a warning; it stays until 24 h after the last."""
+        found = {}
+        for project in list(self._overruns):
+            hits = [h for h in self._overruns[project] if now - h[0] < OVERRUN_WINDOW_S]
+            key = f"light_overrun:{project}"
+            latched = key in self.active and bool(hits)  # active alerts stay while the latest is < 24 h old
+            self._overruns[project] = hits
+            if not hits:
+                del self._overruns[project]
+            elif len(hits) >= OVERRUN_COUNT or latched:
+                labels = ", ".join(dict.fromkeys(label for _, label in hits[-OVERRUN_COUNT:]))
+                msg = (f"{len(hits)} light job(s) of {project} hit their runtime or memory limit in 24 h "
+                       f"(latest {hits[-1][1]}; labels {labels})")  # fmt: skip
+                found[key] = ("warning", f"Light jobs overrunning: {project}", msg, [])
+        return found
 
     def _swap_growth(self, swap: int, avail: int) -> int:
         """Swap above the calm baseline. The baseline is the lowest swap seen while MemAvailable is

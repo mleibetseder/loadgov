@@ -80,6 +80,12 @@ views:
               - type: numeric-input
                 style: buttons
           - type: tile
+            entity: number.host_max_light
+            name: Max light jobs
+            features:
+              - type: numeric-input
+                style: buttons
+          - type: tile
             entity: number.host_ram_floor_gb
             name: RAM floor
             features:
@@ -155,6 +161,12 @@ views:
           - type: tile
             entity: sensor.host_load_per_core
             name: Load per core
+          - type: tile
+            entity: sensor.host_light_lane
+            name: Light lane
+          - type: tile
+            entity: sensor.host_disk_used
+            name: Disk used
           - type: tile
             entity: sensor.host_heavy_slot_holder_eta
             name: Heavy slot free at (est.)

@@ -43,6 +43,7 @@ STATUS: dict[str, Any] = {
             "target_cpu_pct": 70.0,
             "load_max": 4.0,
             "max_implementers": 2,
+            "max_light": 4,
             "ram_floor_gb": 4.0,
         },
     },

@@ -34,6 +34,7 @@ async def test_states(hass, aioclient_mock, mock_entry, status):
     assert float(s("number.host_max_cores").state) == 4.0
     assert float(s("number.host_ram_floor_gb").attributes["max"]) == 6.0
     assert float(s("number.host_max_implementers").state) == 2
+    assert float(s("number.host_max_light").state) == 4
     assert s("switch.host_load_gate_hold").state == STATE_OFF
     assert s("sensor.host_busy_pct").state == "42.5"
     assert s("sensor.host_cap_cores_build_work").state == "4.0"
@@ -154,6 +155,12 @@ async def test_number_set_and_refused_409_raises_with_reason(hass, aioclient_moc
     assert [b["max_cores"] for p, b in posts(aioclient_mock) if "max_cores" in b] == [2.5]
     assert [b["max_implementers"] for p, b in posts(aioclient_mock) if "max_implementers" in b] == [3]
     assert isinstance(posts(aioclient_mock)[1][1]["max_implementers"], int)
+
+    await hass.services.async_call(
+        "number", "set_value", {"entity_id": "number.host_max_light", "value": 6}, blocking=True
+    )
+    sent = [b["max_light"] for p, b in posts(aioclient_mock) if "max_light" in b]
+    assert sent == [6] and isinstance(sent[0], int)
 
     aioclient_mock.clear_requests()
     mock_status(aioclient_mock, status)
@@ -519,3 +526,59 @@ async def test_dashboard_card_survives_null_wait_and_bad_eta(hass, aioclient_moc
     text = Template(card["content"], hass).async_render()
     assert "waiting 0 min, starts ~ ?)" in text
     assert "done ~ ?" in text
+
+
+LIGHT = {
+    "running": 2, "max": 4, "per_project_max": 2, "cpu_quota_pct": 100, "memory_max_mb": 1024,
+    "max_runtime_s": 600,
+}  # fmt: skip
+
+
+async def test_light_lane_sensor_state_and_attributes(hass, aioclient_mock, mock_entry, status):
+    status["light"] = dict(LIGHT)
+    await setup(hass, mock_entry, aioclient_mock, status)
+    st = hass.states.get("sensor.host_light_lane")
+    assert st.state == "2"
+    assert st.attributes["friendly_name"].endswith("Host Light Lane")
+    assert {k: st.attributes[k] for k in LIGHT if k != "running"} == {
+        k: v for k, v in LIGHT.items() if k != "running"
+    }
+
+
+async def test_light_lane_sensor_unavailable_on_an_older_daemon(hass, aioclient_mock, mock_entry, status):
+    assert "light" not in status
+    await setup(hass, mock_entry, aioclient_mock, status)
+    assert hass.states.get("sensor.host_light_lane").state == STATE_UNAVAILABLE
+
+
+async def test_light_jobs_show_in_running_jobs_and_leave_slot_sensors_alone(
+    hass, aioclient_mock, mock_entry, status
+):
+    status["light"] = dict(LIGHT)
+    status["jobs"] = [_job("heavy"), _job(None, kind="light", label="check", key=None, url=None, eta=None)]
+    await setup(hass, mock_entry, aioclient_mock, status)
+    st = hass.states.get("sensor.host_running_jobs")
+    assert st.state == "2"
+    assert [j["kind"] for j in st.attributes["jobs"]] == ["gate", "light"]
+    assert hass.states.get("sensor.host_heavy_slot_holder_eta").state == "2026-11-10T10:05:00+00:00"
+    assert hass.states.get("sensor.host_compile_slot_holder_eta").state == STATE_UNKNOWN
+
+
+async def test_disk_used_sensor_state_and_alert_attribute(hass, aioclient_mock, mock_entry, status):
+    status["disk"] = {
+        "used_pct": 83.5,
+        "per_path": [{"path": "/", "free_gb": 40, "total_gb": 250, "used_pct": 83.5}],
+    }
+    status["levels"] = {"disk_alert": "BUSY"}
+    await setup(hass, mock_entry, aioclient_mock, status)
+    st = hass.states.get("sensor.host_disk_used")
+    assert st.state == "83.5"
+    assert st.attributes["unit_of_measurement"] == "%"
+    assert st.attributes["state_class"] == "measurement"
+    assert st.attributes["disk_alert"] == "BUSY"
+
+
+async def test_disk_used_sensor_unavailable_without_used_pct(hass, aioclient_mock, mock_entry, status):
+    status["disk"] = {"per_path": []}
+    await setup(hass, mock_entry, aioclient_mock, status)
+    assert hass.states.get("sensor.host_disk_used").state == STATE_UNAVAILABLE

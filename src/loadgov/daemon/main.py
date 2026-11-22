@@ -54,7 +54,7 @@ from loadgov.daemon.rest import DEFAULT_TOKENS_FILE, RestServer
 from loadgov.daemon.state import StateStore
 from loadgov.engines import slots as slots_engine
 from loadgov.engines.governor import PRIMARY, Governor, event_line
-from loadgov.engines.headroom import decide, decide_review, paused_reasons, profile_factor
+from loadgov.engines.headroom import decide, decide_light, decide_review, paused_reasons, profile_factor
 from loadgov.engines.history import COLUMNS, SOCKET_MAX, History, row_for
 from loadgov.engines.jobs import JobTable
 from loadgov.engines.limits import Limits, iso
@@ -81,7 +81,10 @@ HEADROOM_OVERRIDES = (
     "mem_psi_max",
 )
 WATCH_EVERY_S = 30  # alert evaluation interval
-PARAM_ARGS = ("max_cores", "target_cpu_pct", "load_max", "max_implementers", "max_reviewers", "ram_floor_gb")
+PARAM_ARGS = (
+    "max_cores", "target_cpu_pct", "load_max", "max_implementers", "max_reviewers", "max_light",
+    "ram_floor_gb",
+)  # fmt: skip
 
 
 def atomic_write_json(path: str, obj: dict) -> None:
@@ -170,7 +173,11 @@ class Daemon:
         self.clock = clock
         config = config or Config()
         self.config, self.config_path, self._reload = config, config_path, False
-        self.store, self.audit, self.env_file = StateStore(state_dir), AuditLog(log_dir), env_file
+        self.store, self.audit, self.env_file = (
+            StateStore(state_dir),
+            AuditLog(log_dir, config.audit.max_mb, config.audit.keep),
+            env_file,
+        )
         self.limits = Limits(
             config.profiles,
             self.store.load(config.default_profile, set(config.profiles)),
@@ -203,6 +210,7 @@ class Daemon:
             self.limits.set_flag("hold", self.slots.owner_hold_reason())  # the flag follows the saved hold
         self._env_key: str | None = None
         self.sampler = Sampler(fs, config.compat.mirror_cgroups, config.headroom.psi_busy_gate_pct)
+        self.sampler.disk_busy, self.sampler.disk_limit = config.levels.disk_busy, config.levels.disk_limit
         self.socket_path = socket_path
         self.run_dir = run_dir
         self.status_path = os.path.join(run_dir, "status.json")
@@ -213,6 +221,7 @@ class Daemon:
         self._stop = asyncio.Event()
         self.rest = RestServer(self, config.rest, tokens_file, fs, **(rest_options or {}))
         self.watch, self.tee = Watch(clock), LegacyTee(clock)
+        self.watch.disk_busy, self.watch.disk_limit = config.levels.disk_busy, config.levels.disk_limit
         self.ha = HaPush(config.ha, tokens_file, clock=clock)
         self._watch_every = max(1, round(WATCH_EVERY_S / tick_s))
         self._ticks, self._busy_acc = 0, []
@@ -265,10 +274,13 @@ class Daemon:
         a flag that goes off stops new actions and the resume rule releases paused work (undo is always
         allowed); a backstop that goes off is rolled back by its next tick, as after a restart."""
         self.config = c
+        self.audit.configure(c.audit.max_mb, c.audit.keep)
         self.slots.set_enforce(c.slots_enforce)
         self.slots.url_template = self.jobs.url_template = c.keys.url
         self.governor.enforce = c.governor_enforce
         self.sampler.psi_busy_gate_pct = c.headroom.psi_busy_gate_pct
+        self.sampler.disk_busy = self.watch.disk_busy = c.levels.disk_busy
+        self.sampler.disk_limit = self.watch.disk_limit = c.levels.disk_limit
         self.backstop.cfg = c.backstop
         mg = self.memguard
         mg.cfg, mg.reaper_cfg = c.memguard, c.reaper
@@ -306,6 +318,7 @@ class Daemon:
         if "heavy_slot" in s:  # the same stuck rule (held long and no CPU progress) as the slot status
             s["heavy_slot"] = {**s["heavy_slot"], "stuck": s["slots"]["heavy"]["stuck"]}
         s["jobs"] = self.jobs.summary()
+        s["light"] = self.light_status()
         s["job_stats"] = self.jobs.stats.summary()
         s["projects"] = self.projects.summary()
         s["alerts"] = self.watch.summary()
@@ -492,6 +505,18 @@ class Daemon:
         reason = ctx.get("reason") or (ctx.get("request") or {}).get("reason")
         self._publish([self.watch.owner_change(ctx, what, reason)])
 
+    def light_status(self) -> dict:
+        """The light lane: running count, caps and the hard limits `loadctl run --kind light` applies."""
+        c = self.config.light
+        return {
+            "running": sum(1 for j in self.jobs.jobs.values() if j.kind == "light"),
+            "max": self.limits.effective()["max_light"],
+            "per_project_max": c.max_light_per_project,
+            "cpu_quota_pct": c.cpu_quota_pct,
+            "memory_max_mb": c.memory_max_mb,
+            "max_runtime_s": c.max_runtime_s,
+        }
+
     def limits_summary(self) -> dict:
         snap = self.limits.snapshot()
         r = snap["restriction"]
@@ -612,6 +637,7 @@ class Daemon:
                     "limits": self.limits_summary(),
                     "slots": slots,
                     "jobs": self.jobs.summary(),
+                    "light": self.light_status(),
                     "job_stats": self.jobs.stats.summary(),
                     "projects": self.projects.summary(),
                     "rest": self.rest.status(),
@@ -704,6 +730,18 @@ class Daemon:
             running = sum(1 for j in self.jobs.jobs.values() if j.kind == "review")
             d = decide_review(
                 self.status, th, running=running, max_reviewers=snap["effective"]["max_reviewers"],
+                ram_floor_gb=snap["effective"]["ram_floor_gb"],
+                guard_paused=bool(self.memguard.engine.paused),
+                factor=factor, io_psi_gate=h.io_psi_gate, io_psi_max=h.io_psi_max, paused=paused,
+            )  # fmt: skip
+        elif kind == "light":  # the light lane: memory floor, pause and the two parallel caps only
+            light = [j for j in self.jobs.jobs.values() if j.kind == "light"]
+            name = project or DEFAULT_PROJECT
+            d = decide_light(
+                self.status, th, project=name, running=len(light),
+                project_running=sum(1 for j in light if j.project == name),
+                max_light=snap["effective"]["max_light"],
+                max_per_project=self.config.light.max_light_per_project,
                 ram_floor_gb=snap["effective"]["ram_floor_gb"],
                 guard_paused=bool(self.memguard.engine.paused),
                 factor=factor, io_psi_gate=h.io_psi_gate, io_psi_max=h.io_psi_max, paused=paused,

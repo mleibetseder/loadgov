@@ -82,7 +82,8 @@ def format_hwmon(s: dict) -> str:
 def _lim(e: dict) -> str:
     return (
         f"cores {e['max_cores']:g}, cpu {e['target_cpu_pct']:g} %, load {e['load_max']:g}, "
-        f"impl {e['max_implementers']}, reviewers {e['max_reviewers']}, ram floor {e['ram_floor_gb']:g} GB"
+        f"impl {e['max_implementers']}, reviewers {e['max_reviewers']}, light {e['max_light']}, "
+        f"ram floor {e['ram_floor_gb']:g} GB"
     )
 
 
@@ -139,7 +140,11 @@ def format_job_stats(rows: list) -> str:
 
 
 def format_status(s: dict) -> str:
-    lines = [format_hwmon(s).replace("hwmon ", "loadgov ", 1)]
+    lines = format_hwmon(s).replace("hwmon ", "loadgov ", 1).split("\n")
+    if (
+        "used_pct" in s["disk"]
+    ):  # the legacy five-line format stays as it was; an older daemon has no used_pct
+        lines[4] = lines[4].replace(" on ", f", {s['disk']['used_pct']:.0f} % used on ", 1)
     c, m, io = s["cpu"], s["memory"], s["io"]
     cpu_psi = f"cpu {c['psi_some_avg10']:.0f}/{c['psi_some_avg60']:.0f}"
     if c.get("psi_effective", c["psi_some_avg60"]) != c["psi_some_avg60"]:
@@ -195,6 +200,9 @@ def format_status(s: dict) -> str:
         lines.append(
             f"  job   {j['project']} {j['kind']} {j.get('key') or j['label']}{slot}{format_job_eta(j)}"
         )
+    lt = s.get("light")
+    if lt:
+        lines.append(f"  light {lt['running']}/{lt['max']} (per project max {lt['per_project_max']})")
     pj = format_projects(s.get("projects"))
     if pj:
         lines.append(f"  projects {pj}")
@@ -301,6 +309,7 @@ def _parser() -> argparse.ArgumentParser:
     se.add_argument("--load-max", type=float, dest="load_max")
     se.add_argument("--max-impl", type=int, dest="max_implementers")
     se.add_argument("--max-reviewers", type=int, dest="max_reviewers")
+    se.add_argument("--max-light", type=int, dest="max_light")
     se.add_argument("--ram-floor-gb", type=float, dest="ram_floor_gb")
     se.add_argument("--owner", action="store_true", help="act as the human owner (checked by the daemon)")
     se.add_argument("--project")
@@ -729,6 +738,7 @@ def main(argv: list[str] | None = None, sleep=time.sleep) -> int:
             "load_max",
             "max_implementers",
             "max_reviewers",
+            "max_light",
             "ram_floor_gb",
         )
         args = {k: getattr(a, k) for k in (*keys, "ttl", "until", "reason", "project")}

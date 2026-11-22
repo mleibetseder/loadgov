@@ -8,6 +8,8 @@ error or no events at all.
 Inputs (all optional, give at least one legacy and one shadow source):
   --audit FILE            loadgov audit.jsonl: op=governor (reason "WOULD cap=..."), op=memguard
                           (reason "WOULD PAUSE|RESUME|ABORT|REAP build daemons ...")
+                          one file; loadgov rotates it by size into audit.jsonl.N (N=1 newest), so for a
+                          longer window concatenate the rotated files oldest first and pass the result
   --mem-guard-log FILE    legacy memguard logs, repeatable; the format is detected per line:
                           a guard log   "<ISO>Z PAUSE|RESUME|ABORT ..."
                           a per-episode guard log "<ISO>Z PAUSED|RESUMED ..." (see --episode-project)

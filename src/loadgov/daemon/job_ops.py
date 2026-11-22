@@ -11,6 +11,7 @@ from loadgov.engines.jobs import Job
 from loadgov.engines.slots import SLOT_FILES, pid_alive
 from loadgov.keys import key_error
 
+OVERRUNS = ("runtime", "memory")  # what `loadctl run --kind light` reports with job_end
 _UNIT = re.compile(r"^loadgov-[A-Za-z0-9:_.-]+\.scope$")
 _CGROUP = re.compile(r"^/[A-Za-z0-9:_.@/-]+$")
 
@@ -42,7 +43,20 @@ def handle(d, op: str, args: dict, peer_pid: int | None) -> dict:
         return bad
     ctx = {**caller_info(d.fs, peer_pid), "op": op, "request": args}
     if op == "job_end":
-        j = d.jobs.end(unit)
+        overrun = args.get("overrun")
+        if overrun is not None and overrun not in OVERRUNS:
+            return _err("invalid_args", f"overrun must be one of: {', '.join(OVERRUNS)}")
+        running = d.jobs.jobs.get(unit)
+        reason = "job_end"
+        if overrun and running and running.kind == "light":  # a light job hit its runtime or memory limit
+            c = d.config.light
+            reason = "light_overrun: " + (
+                f"runtime {c.max_runtime_s} s exceeded" if overrun == "runtime"
+                else f"memory limit {c.memory_max_mb} MB hit"
+            )  # fmt: skip
+            d.jobs.overrun(running, reason)
+            d.watch.note_overrun(running.project, running.label)
+        j = d.jobs.end(unit, reason)
         released = False
         if j and j.slot and not (d.jobs.scope_reader(j.cgroup) or "").strip():
             # a scope that still has processes keeps the slot; the tick frees it when the scope empties
@@ -82,14 +96,15 @@ def handle(d, op: str, args: dict, peer_pid: int | None) -> dict:
         return _err("invalid_args", f"job pid {pid} is not running")
     if unit in d.jobs.jobs:
         return _err("invalid_args", f"job {unit} is already registered")
+    registered = d.clock()
     bound = False
     if slot:
-        bound = d.slots.bind_scope(slot, owner, unit, cgroup, pid, kind, key)
+        bound = d.slots.bind_scope(slot, owner, unit, cgroup, pid, kind, key, registered)
         if not bound and not d.slots.is_nested(slot, owner):
             return _err("invalid_args", f"pid {owner} does not hold the {slot} slot")
         if not bound:
             slot = None  # a nested grant: the job runs in its own scope but binds no slot
-    j = Job(kind, project, label, unit, cgroup, pid, d.jobs.start_of(pid), owner, slot, d.clock(), key=key)
+    j = Job(kind, project, label, unit, cgroup, pid, d.jobs.start_of(pid), owner, slot, registered, key=key)
     d.jobs.add(j)
     d.backstop.on_job(unit, cgroup)  # memory.oom.group = 1 on the new scope (backstop enabled only)
     d._after_change({**ctx, "project": project})

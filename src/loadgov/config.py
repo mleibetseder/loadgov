@@ -18,6 +18,7 @@ RANGES: dict[str, tuple[float, float, float]] = {
     "load_max": (1.0, 6.0, 0.5),
     "max_implementers": (0, 4, 1),
     "max_reviewers": (0, 8, 1),
+    "max_light": (0, 8, 1),
     "ram_floor_gb": (2.0, 6.0, 0.5),
 }
 PARAMS = tuple(RANGES)
@@ -29,12 +30,13 @@ RESTRICTIVE: dict[str, int] = {
     "load_max": -1,
     "max_implementers": -1,
     "max_reviewers": -1,
+    "max_light": -1,
     "cargo_build_jobs": -1,
     "vitest_max_workers": -1,
     "gate_shard_budget": -1,
     "ram_floor_gb": +1,
 }
-INT_PARAMS = ("max_implementers", "max_reviewers")
+INT_PARAMS = ("max_implementers", "max_reviewers", "max_light")
 
 
 class ConfigError(ValueError):
@@ -83,6 +85,7 @@ class Profile:
     gate_shard_budget: int = 2
     hold_heavy_slot: bool = False  # drain holds the heavy slot (SlotManager.set_profile_hold)
     max_reviewers: int = 3  # parallel review jobs (the review lane, see engines/headroom.decide_review)
+    max_light: int = 4  # parallel light jobs, host-wide (the light lane, see engines/headroom.decide_light)
 
     def __post_init__(self):
         if self.impl_max_quiet is None:
@@ -90,14 +93,14 @@ class Profile:
 
 
 BUILTIN_PROFILES: dict[str, Profile] = {
-    "silent": Profile(2.0, 50.0, 2.0, 1, 1, max_reviewers=1),
+    "silent": Profile(2.0, 50.0, 2.0, 1, 1, max_reviewers=1, max_light=2),
     "balanced": Profile(),
-    "boost": Profile(5.5, 85.0, 5.0, 3, 3, max_reviewers=4),
-    "drain": Profile(2.0, 50.0, 2.0, 0, 1, hold_heavy_slot=True, max_reviewers=0),
+    "boost": Profile(5.5, 85.0, 5.0, 3, 3, max_reviewers=4, max_light=6),
+    "drain": Profile(2.0, 50.0, 2.0, 0, 1, hold_heavy_slot=True, max_reviewers=0, max_light=0),
 }
 
 
-KINDS = ("impl", "review", "gate", "compile")
+KINDS = ("impl", "review", "gate", "compile", "light")
 # Headroom thresholds (the stricter values for every kind; per-project values come from [projects.*]).
 # Load limits may be "nproc" expressions, resolved against the host's core count when a decision is made.
 HEADROOM_DEFAULTS: dict = {
@@ -115,6 +118,8 @@ HEADROOM_DEFAULTS: dict = {
 # Reviews (an agent reading code) use the review lane: only the memory floor and the parallel cap apply,
 # so their default floor is lower; load and PSI keys of a review kind table are accepted but ignored.
 REVIEW_DEFAULTS: dict = {"mem_min_gb": 2}
+# The light lane (small checks: lint, shellcheck, formatters in check mode) has the same default floor.
+LIGHT_DEFAULTS: dict = {"mem_min_gb": 2}
 DEFAULT_PROJECT = "default"
 _NPROC_RE = re.compile(r"^nproc(?:\s*([-+*/])\s*(\d+(?:\.\d+)?))?$")
 
@@ -246,6 +251,56 @@ def _parse_keys(raw) -> KeysConfig:
     ):
         raise ConfigError("keys.url: expected an http(s) URL template without spaces that contains {key}")
     return KeysConfig(url)
+
+
+@dataclass(frozen=True)
+class DiskThreshold:
+    """One disk level: `value` GB free (pct False, lower is worse) or `value` percent used (pct True)."""
+
+    value: float
+    pct: bool = False
+
+    def __str__(self) -> str:
+        return f"{self.value:g} %" if self.pct else f"{self.value:g} GB"
+
+
+@dataclass(frozen=True)
+class LevelsConfig:
+    # They drive the `disk` alert and `levels.disk_alert` only, never the overall level or any start.
+    disk_busy: DiskThreshold = DiskThreshold(25.0)  # the `disk` warning: 25 GB free
+    disk_limit: DiskThreshold = DiskThreshold(10.0)  # the `disk` critical: 10 GB free
+
+
+_PCT_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*%\s*$")
+
+
+def _parse_disk_threshold(where: str, v) -> DiskThreshold:
+    if isinstance(v, str):
+        m = _PCT_RE.match(v)
+        if m and 0 < float(m.group(1)) < 100:
+            return DiskThreshold(float(m.group(1)), True)
+    elif not isinstance(v, bool) and isinstance(v, int | float) and v > 0:
+        return DiskThreshold(float(v))
+    raise ConfigError(
+        f'{where}: expected a number > 0 (GB free) or a string like "80%" (used, above 0 and below 100)'
+    )
+
+
+def _parse_levels(raw) -> LevelsConfig:
+    keys = ("disk_busy", "disk_limit")
+    if not isinstance(raw, dict) or set(raw) - set(keys):
+        raise ConfigError(f"levels: allowed keys are {', '.join(keys)}")
+    d = LevelsConfig()
+    busy = _parse_disk_threshold("levels.disk_busy", raw["disk_busy"]) if "disk_busy" in raw else d.disk_busy
+    limit = d.disk_limit
+    if "disk_limit" in raw:
+        limit = _parse_disk_threshold("levels.disk_limit", raw["disk_limit"])
+    if busy.pct == limit.pct and (busy.value >= limit.value if busy.pct else busy.value <= limit.value):
+        raise ConfigError(
+            f"levels: disk_busy ({busy}) must warn earlier than disk_limit ({limit}) "
+            "(more free space for GB, a lower percent for %)"
+        )
+    return LevelsConfig(busy, limit)
 
 
 @dataclass(frozen=True)
@@ -405,6 +460,45 @@ class BackstopConfig:
     memory_swap_max_mb: int | None = None
 
 
+# [light]: hard limits of the light lane, applied by `loadctl run --kind light` to the scope it creates.
+# (name, default, min, max); a site may tighten, the ranges cap how loose it can be.
+LIGHT_KEYS = (
+    ("cpu_quota_pct", 100, 10, 200),
+    ("memory_max_mb", 1024, 128, 4096),
+    ("max_runtime_s", 600, 30, 1800),
+    ("max_light_per_project", 2, 1, 8),
+)
+
+
+@dataclass(frozen=True)
+class LightConfig:
+    cpu_quota_pct: int = 100  # CPUQuota of the scope, percent of one core
+    memory_max_mb: int = 1024  # MemoryMax of the scope (MemorySwapMax is always 0)
+    max_runtime_s: int = 600  # loadctl kills the scope after this long (LIGHT_OVERRUN)
+    max_light_per_project: int = 2  # registered light jobs of one project
+
+
+def _parse_light(raw) -> LightConfig:
+    names = [k[0] for k in LIGHT_KEYS]
+    if not isinstance(raw, dict) or set(raw) - set(names):
+        raise ConfigError(f"light: allowed keys are {', '.join(names)}")
+    out = {}
+    for name, default, lo, hi in LIGHT_KEYS:
+        v = raw.get(name, default)
+        if not _is_int(v) or not lo <= v <= hi:
+            raise ConfigError(f"light.{name}: expected an integer from {lo} to {hi}")
+        out[name] = v
+    return LightConfig(**out)
+
+
+@dataclass(frozen=True)
+class AuditConfig:
+    """Size rotation of the daemon's own audit.jsonl; max_mb 0 turns it off."""
+
+    max_mb: int = 50
+    keep: int = 5  # rotated files audit.jsonl.1 .. .keep
+
+
 @dataclass(frozen=True)
 class Config:
     default_profile: str = "balanced"
@@ -422,6 +516,9 @@ class Config:
     principal: PrincipalConfig = field(default_factory=PrincipalConfig)
     strays: StraysConfig = field(default_factory=StraysConfig)
     keys: KeysConfig = field(default_factory=KeysConfig)
+    audit: AuditConfig = field(default_factory=AuditConfig)
+    light: LightConfig = field(default_factory=LightConfig)
+    levels: LevelsConfig = field(default_factory=LevelsConfig)
 
 
 def eval_nproc(value, nproc: int) -> float:
@@ -467,7 +564,8 @@ def thresholds(h: HeadroomConfig, kind: str, project: str | None, nproc: int) ->
     if kind not in KINDS:
         raise ValueError(f"kind must be one of {', '.join(KINDS)}")
     per_project = h.projects.get(project or DEFAULT_PROJECT, {})
-    base = {**HEADROOM_DEFAULTS, **(REVIEW_DEFAULTS if kind == "review" else {})}
+    lane = {"review": REVIEW_DEFAULTS, "light": LIGHT_DEFAULTS}.get(kind, {})
+    base = {**HEADROOM_DEFAULTS, **lane}
     raw = {**base, **h.kinds.get(kind, {}), **per_project.get(kind, {})}
     l5 = raw.pop("load5_max")
     num = {k: eval_nproc(v, nproc) for k, v in raw.items()}
@@ -712,6 +810,18 @@ def _parse_strays(raw) -> StraysConfig:
     )
 
 
+def _parse_audit(raw) -> AuditConfig:
+    if not isinstance(raw, dict) or set(raw) - {"max_mb", "keep"}:
+        raise ConfigError("audit: allowed keys are max_mb, keep")
+    d = AuditConfig()
+    max_mb, keep = raw.get("max_mb", d.max_mb), raw.get("keep", d.keep)
+    if not _is_int(max_mb) or max_mb < 0:
+        raise ConfigError("audit.max_mb: expected an integer >= 0 (0 = no rotation)")
+    if not _is_int(keep) or keep < 1:
+        raise ConfigError("audit.keep: expected an integer >= 1")
+    return AuditConfig(max_mb, keep)
+
+
 def parse_config(text: str) -> Config:
     try:
         raw = tomllib.loads(text)
@@ -734,6 +844,9 @@ def parse_config(text: str) -> Config:
             "principal",
             "strays",
             "keys",
+            "audit",
+            "light",
+            "levels",
         ):
             raise ConfigError(f"unknown key {key!r}")
     profiles = dict(BUILTIN_PROFILES)
@@ -767,6 +880,9 @@ def parse_config(text: str) -> Config:
         _parse_memguard(raw.get("memguard", {})), _parse_reaper(raw.get("reaper", {})),
         _parse_backstop(raw.get("backstop", {})), _parse_principal(raw.get("principal", {})),
         _parse_strays(raw.get("strays", {})), _parse_keys(raw.get("keys", {})),
+        _parse_audit(raw.get("audit", {})),
+        light=_parse_light(raw.get("light", {})),
+        levels=_parse_levels(raw.get("levels", {})),
     )  # fmt: skip
 
 

@@ -1,18 +1,21 @@
 """loadctl run: one job in its own systemd scope under build-work-<project>.slice.
 
-    loadctl run --kind impl|review|gate|compile --project P --label L [--floor-mb N --on-floor kill]
+    loadctl run --kind impl|review|gate|compile|light --project P --label L
+                [--floor-mb N --on-floor kill]
                 [--no-wait] -- cmd...
 
 loadctl stays the parent of the job: the exit code passes through, SIGINT and SIGTERM are forwarded to
 the scope. Order: `gate` takes the heavy slot and `compile` the compile slot first, then both wait
-for headroom while holding it; `impl` and `review` only wait for headroom. Under `[slots] enforce`
-loadctl opens the lock file itself and the job inherits the descriptor, so the flock lives as long as
-loadctl run or the job does and never only in the daemon. The daemon binds the slot to the job's
-scope (`job_start`), so it is released when the scope empties, even if loadctl died.
+for headroom while holding it; `impl`, `review` and `light` only wait for headroom. A `light` job also
+gets hard limits on its scope (CPUQuota, MemoryMax, MemorySwapMax=0, RuntimeMaxSec as a backstop) and
+loadctl kills it after `max_runtime_s`; the values come from the daemon's `light` status.
+Under `[slots] enforce` loadctl opens the lock file itself and the job inherits the descriptor, so the
+flock lives as long as loadctl run or the job does and never only in the daemon. The daemon binds the
+slot to the job's scope (`job_start`), so it is released when the scope empties, even if loadctl died.
 
 Exit codes: the job's (128+n when killed by signal n), 137 after `--on-floor kill`, 3 daemon not
 reachable (the job did not start), 5 daemon error, 2 usage, 1 headroom wait timed out, 75 `--no-wait` and
-the host has no room or the slot is busy.
+the host has no room or the slot is busy, 76 a light job overran its runtime or memory limit.
 """
 
 from __future__ import annotations
@@ -26,11 +29,11 @@ import subprocess
 import sys
 import time
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 
 from loadgov.cli import loadctl
 from loadgov.cli.client import DaemonUnavailable
-from loadgov.config import KINDS
+from loadgov.config import KINDS, LightConfig
 
 KIND_SLOT = {"gate": "heavy", "compile": "compile"}
 GATE_CONFIRM_S = 30.0  # a gate that already holds the slot confirms after 30 s, others use the config (60)
@@ -38,6 +41,9 @@ FLOOR_POLL_S = 2.0
 LEVEL_POLL_S = 15.0  # legacy guarded polled hwmon about every 15 s
 HEADROOM_MODES = ("full", "level", "none")
 EXIT_FLOOR, EXIT_BUSY, EXIT_UNSTARTABLE = 137, 75, 127
+EXIT_LIGHT_OVERRUN = 76
+LIGHT_POLL_S = 1.0  # a light job is polled for its runtime limit and OOM kills this often
+RUNTIME_BACKSTOP_GRACE_S = 30  # RuntimeMaxSec is this much later than loadctl's own kill, so loadctl wins
 JVM_PATTERN = r"^[^ ]*/java .*(GradleDaemon|KotlinCompileDaemon)"  # same as legacy guarded
 GATE_JOBS_BYTES_MB = 8192  # CARGO_BUILD_JOBS=3 needs GATE_JOBS=3 and at least 8 GB available
 
@@ -65,14 +71,39 @@ def scope_cgroup(slice_: str, unit: str) -> str:
     return "/" + "/".join([*chain, f"{unit}.scope"])
 
 
+def light_limits(status: dict) -> dict:
+    """The light lane's hard limits from the daemon's status (`light`), else the built-in defaults."""
+    keys = ("cpu_quota_pct", "memory_max_mb", "max_runtime_s")
+    given = status.get("light") or {}
+    return {k: given.get(k, v) for k, v in asdict(LightConfig()).items() if k in keys}
+
+
+def light_properties(light: dict) -> list[str]:
+    """`-p` arguments of a light scope. MemorySwapMax is always 0; RuntimeMaxSec (supported on scopes since
+    systemd 244) is only the backstop for loadctl's own kill at `max_runtime_s`."""
+    props = (
+        f"CPUQuota={light['cpu_quota_pct']}%",
+        f"MemoryMax={light['memory_max_mb']}M",
+        "MemorySwapMax=0",
+        f"RuntimeMaxSec={light['max_runtime_s'] + RUNTIME_BACKSTOP_GRACE_S}",
+    )
+    return [x for p in props for x in ("-p", p)]
+
+
 def systemd_run_argv(
-    unit: str, slice_: str, kind: str, cmd: list[str], rustc_running: bool = False
+    unit: str, slice_: str, kind: str, cmd: list[str], rustc_running: bool = False, light: dict | None = None
 ) -> list[str]:
     """The launcher command. Like the legacy gate wrapper: gates and compiles go to the idle io class while a
-    rustc runs, everything else uses best-effort class 2 priority 7. All jobs run at nice 10."""
+    rustc runs, everything else uses best-effort class 2 priority 7. All jobs run at nice 10. A `light` job
+    adds the hard limits in `light` (see `light_limits`) as scope properties and is not started with
+    `--collect`: systemd would otherwise drop the emptied scope (and its OOM record) before loadctl reads it;
+    loadctl stops and resets that one unit itself (`_collect_light`). No other kind gets either."""
     io = ["ionice", "-c", "3"] if kind in KIND_SLOT and rustc_running else ["ionice", "-c", "2", "-n", "7"]
+    props = light_properties(light or light_limits({})) if kind == "light" else []
+    # a light scope stays until loadctl has read its result
+    collect = [] if kind == "light" else ["--collect"]
     return [
-        "systemd-run", "--scope", "--quiet", "--collect", f"--slice={slice_}", f"--unit={unit}", "--",
+        "systemd-run", "--scope", "--quiet", *collect, f"--slice={slice_}", f"--unit={unit}", *props, "--",
         "nice", "-n", "10", *io, *cmd,
     ]  # fmt: skip
 
@@ -118,6 +149,32 @@ def _find_cgroup(pid: int, scope_unit: str, slice_: str, proc_root: str = "/proc
     return scope_cgroup(slice_, scope_unit.removesuffix(".scope"))
 
 
+def _read_oom_kills(cgroup: str | None, root: str = "/sys/fs/cgroup") -> int | None:
+    """`oom_kill` of the scope's memory.events; None when the scope is gone or unreadable."""
+    if not cgroup:
+        return None
+    try:
+        with open(os.path.join(root, cgroup.lstrip("/"), "memory.events")) as f:
+            for line in f:
+                key, _, val = line.partition(" ")
+                if key == "oom_kill":
+                    return int(val)
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def _unit_result(unit: str) -> str | None:
+    """systemd's `Result` of a (stopped) scope, e.g. `oom-kill`; None when it cannot be read."""
+    try:
+        p = subprocess.run(
+            ["systemctl", "show", "--property=Result", "--value", unit], capture_output=True, text=True
+        )
+    except OSError:
+        return None
+    return p.stdout.strip() or None if p.returncode == 0 else None
+
+
 def _rustc_running() -> bool:
     return subprocess.run(["pgrep", "-x", "rustc"], capture_output=True).returncode == 0
 
@@ -150,6 +207,8 @@ class Deps:
     avail_mb: Callable = _meminfo_avail_mb
     rustc_running: Callable = _rustc_running
     find_cgroup: Callable = _find_cgroup
+    oom_kills: Callable = _read_oom_kills  # cgroup -> oom_kill count or None
+    unit_result: Callable = _unit_result  # scope unit -> systemd Result ("oom-kill", "success", ...) or None
     pid: int = field(default_factory=os.getpid)
 
     def __post_init__(self):
@@ -228,14 +287,35 @@ def _floor_avail(a, d: Deps) -> int:
     return d.avail_mb()
 
 
-def _wait_job(proc, a, d: Deps, scope_unit: str) -> int:
-    if a.floor_mb is None:
+def _wait_job(
+    proc,
+    a,
+    d: Deps,
+    scope_unit: str,
+    light: dict | None = None,
+    cgroup: str | None = None,
+    outcome: dict | None = None,
+) -> int:
+    """Wait for the job. A light job is also polled: past `max_runtime_s` loadctl kills its scope
+    (`outcome["overrun"] = "runtime"`), and `outcome["oom"]` keeps the scope's OOM kills seen so far."""
+    outcome = outcome if outcome is not None else {}
+    if a.floor_mb is None and light is None:
         return proc.wait()
+    deadline = d.now() + light["max_runtime_s"] if light else None
     while True:
         try:
-            return proc.wait(timeout=FLOOR_POLL_S)
+            return proc.wait(timeout=LIGHT_POLL_S if light else FLOOR_POLL_S)
         except subprocess.TimeoutExpired:
             pass
+        if light:
+            outcome["oom"] = max(outcome.get("oom", 0), d.oom_kills(cgroup) or 0)
+            if d.now() >= deadline:
+                outcome["overrun"] = "runtime"
+                d.run(["systemctl", "kill", "--signal=SIGKILL", scope_unit])
+                proc.wait()
+                return EXIT_LIGHT_OVERRUN
+        if a.floor_mb is None:
+            continue
         avail = _floor_avail(a, d)
         if avail < a.floor_mb:
             print(
@@ -316,7 +396,8 @@ def _run_held(
     unit = unit_name(a.kind, a.label, ts)
     scope_unit = unit + ".scope"
     slice_ = a.slice or slice_name(a.project)
-    argv = systemd_run_argv(unit, slice_, a.kind, cmd, d.rustc_running() if slot else False)
+    light = light_limits(st) if a.kind == "light" else None
+    argv = systemd_run_argv(unit, slice_, a.kind, cmd, d.rustc_running() if slot else False, light)
     env = job_env(os.environ, st["limits"]["effective"], a.kind, st["memory"]["avail_mb"], scope_unit)
     caught: list[int] = []
 
@@ -336,6 +417,8 @@ def _run_held(
         except ValueError:  # not the main thread (tests): no forwarding
             break
     registered = False
+    outcome: dict = {}
+    cgroup = None
     try:
         try:
             proc = d.popen(argv, env=env)
@@ -360,11 +443,32 @@ def _run_held(
                 print(f"loadctl: job not registered: {reply.get('message')}", file=sys.stderr)
         except DaemonUnavailable:
             print("loadctl: daemon went away; the job runs unregistered", file=sys.stderr)
-        code = _wait_job(proc, a, d, scope_unit)
+        code = _wait_job(proc, a, d, scope_unit, light, cgroup, outcome)
+        if light is not None:
+            outcome["oom"] = max(outcome.get("oom", 0), d.oom_kills(cgroup) or 0)
+            if d.unit_result(scope_unit) == "oom-kill":  # the scope is kept, so this holds even when the
+                outcome["oom"] = max(outcome["oom"], 1)  # cgroup (and its memory.events) is already gone
+            # Only our own unit. SIGKILL first so a leftover child cannot hold `stop` for TimeoutStopSec.
+            d.run(["systemctl", "kill", "--signal=SIGKILL", scope_unit])
+            d.run(["systemctl", "stop", scope_unit])
+            d.run(["systemctl", "reset-failed", scope_unit])
+            if outcome["oom"] and "overrun" not in outcome:
+                outcome["overrun"] = "memory"
+            if outcome.get("overrun") == "runtime":
+                why = f"runtime {light['max_runtime_s']} s exceeded"
+                print(f"LIGHT_OVERRUN {a.label}: {why}", file=sys.stderr)
+            elif outcome.get("overrun") == "memory":
+                why = f"memory limit {light['memory_max_mb']} MB hit"
+                print(f"LIGHT_OVERRUN {a.label}: {why}", file=sys.stderr)
+            if "overrun" in outcome:
+                code = EXIT_LIGHT_OVERRUN
     finally:
         for sig, h in old.items():
             signal.signal(sig, h)
         if registered:
             with contextlib.suppress(DaemonUnavailable):  # else the daemon notices the empty scope
-                loadctl.request(a.socket, "job_end", {"unit": scope_unit})
+                loadctl.request(
+                    a.socket, "job_end",
+                    {"unit": scope_unit, **({"overrun": outcome["overrun"]} if "overrun" in outcome else {})},
+                )  # fmt: skip
     return 128 - code if code < 0 else code

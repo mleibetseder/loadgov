@@ -159,6 +159,26 @@ def test_alert_offers_a_kill_button_for_a_stray_and_keeps_three_at_most():
     assert len(_variables(step, {"trigger": _AttrDict({"json": payload})})["buttons"]) == 3
 
 
+def test_light_overrun_and_disk_alerts_render_without_buttons_or_errors():
+    (auto,) = load("loadgov_alerts.yaml")
+    step = next(s for s in auto["actions"] if "variables" in s)
+    for key, title in (
+        ("light_overrun:web-app", "light overrun web-app"),
+        ("disk", "disk / 81 % used >= 80 %"),
+    ):
+        payload = {
+            "type": "alert",
+            "key": key,
+            "level": "warning",
+            "title": title,
+            "message": title,
+            "actions": [],
+        }
+        v = _variables(step, {"trigger": _AttrDict({"json": payload})})
+        assert v["buttons"] == [] and v["tag"] == "loadgov-" + key.replace(":", "-")
+        assert title in v["title"] and v["critical"] is False
+
+
 def _route(action):
     (auto,) = load("loadgov_notification_actions.yaml")
     ctx = {"trigger": _AttrDict({"event": {"data": {"action": action}}})}

@@ -172,7 +172,7 @@ class FakeHost:
             cpu_count=CORES,
             clk_tck=100,
             statvfs=lambda _p: os.statvfs_result(
-                (4096, 4096, 10**7, free_blocks, free_blocks, 0, 0, 0, 0, 255)
+                (4096, 4096, free_blocks + 10**7, free_blocks, free_blocks, 0, 0, 0, 0, 255)
             ),
         )
 

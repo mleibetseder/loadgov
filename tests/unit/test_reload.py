@@ -254,3 +254,27 @@ def test_reload_audit_rows_survive_a_failing_after_change(rig, monkeypatch):
     d.reload_config()  # must not raise
     assert d.config.headroom.kinds["gate"]["mem_min_gb"] == 7
     assert [r["op"] for r in audits(d)] == ["reload", "needs restart"]
+
+
+def test_reload_applies_audit_rotation_settings(rig):
+    d, cfg = rig
+    cfg.write_text("[audit]\nmax_mb = 7\nkeep = 2\n")
+    d.reload_config()
+    assert (d.audit.max_mb, d.audit.keep) == (7, 2)
+
+
+def test_reload_applies_the_disk_levels_live_and_a_bad_value_keeps_the_old(rig):
+    d, cfg = rig
+    assert d.sampler.disk_busy.value == d.watch.disk_busy.value == 25.0
+    cfg.write_text('[levels]\ndisk_busy = "80%"\ndisk_limit = 8\n')
+    d.reload_config()
+    for part in (d.sampler, d.watch):
+        assert (part.disk_busy.value, part.disk_busy.pct) == (80.0, True)
+        assert (part.disk_limit.value, part.disk_limit.pct) == (8.0, False)
+    reloads = [r for r in audits(d) if r["op"] == "reload"]
+    assert "levels.disk_busy.value" in reloads[-1]["reason"]
+    assert "levels.disk_limit.value" in reloads[-1]["reason"]
+    cfg.write_text('[levels]\ndisk_busy = "120%"\n')
+    d.reload_config()
+    assert audits(d)[-1]["op"] == "reload refused"
+    assert (d.sampler.disk_busy.value, d.watch.disk_busy.value) == (80.0, 80.0)

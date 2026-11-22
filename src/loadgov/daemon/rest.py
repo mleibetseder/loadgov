@@ -37,7 +37,7 @@ REASONS = {
     429: "Too Many Requests", 500: "Internal Server Error", 503: "Service Unavailable",
 }  # fmt: skip
 SET_KEYS = {
-    "profile", "max_cores", "target_cpu_pct", "load_max", "max_implementers", "max_reviewers",
+    "profile", "max_cores", "target_cpu_pct", "load_max", "max_implementers", "max_reviewers", "max_light",
     "ram_floor_gb",
     "ttl", "until", "reason", "project",
 }  # fmt: skip

@@ -184,6 +184,7 @@ def test_status_carries_limits_and_validates(daemon, fake_host):
     s["rest"] = daemon.rest.status()
     s["slots"] = daemon.slots.summary()
     s["jobs"] = daemon.jobs.summary()
+    s["light"] = daemon.light_status()
     s["job_stats"] = daemon.jobs.stats.summary()
     s["projects"] = daemon.projects.summary()
     s["alerts"], s["ha_push"] = daemon.watch.summary(), daemon.ha.status()

@@ -340,6 +340,13 @@ def test_status_shows_strays_and_there_is_no_kill_tool(daemon):
     assert not [n for n in dir(Tools) if "stray" in n or "kill" in n]
 
 
+def test_status_carries_the_light_lane(daemon):
+    st = status_reply()
+    st["status"]["light"] = {"running": 1, "max": 4, "per_project_max": 2}
+    d = daemon(status=lambda a: st)
+    assert Tools(d.path).get_status()["light"]["max"] == 4
+
+
 def test_wait_headroom_while_starting_respects_a_short_timeout(daemon):
     """A starting daemon must not hold a `timeout_sec` < 30 call to the client's 30 s retry window."""
     h = counting(lambda n: {"ok": False, "error": "starting", "message": "no sample yet"})

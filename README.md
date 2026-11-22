@@ -60,12 +60,14 @@ client shims in `compat/`, and Home Assistant (the integration's options and `se
 | Home Assistant base URL for alert pushes | TOML `[ha] url` | `url = "http://ha.example:8123"` |
 | Home Assistant webhook id | `tokens.env` `LOADGOV_HA_WEBHOOK_ID`; HA secret `loadgov_webhook_id` and the `webhook_id` of the alert automation | `LOADGOV_HA_WEBHOOK_ID=loadgov-alert-<random>` |
 | The projects that run governed work (one `build-work-<project>.slice` each, made by `packaging/install.sh`) | TOML `[projects.<name>]`, `[memguard.projects.<name>]`, or `install.sh --project <name>` | `[projects.web-app]` |
-| Headroom thresholds of a project, per kind (`impl`, `review`, `gate`, `compile`) | TOML `[projects.<name>.kinds.<kind>]` | `load1_max = "nproc"`, `poll_s = 120` |
+| Headroom thresholds of a project, per kind (`impl`, `review`, `gate`, `compile`, `light`) | TOML `[projects.<name>.kinds.<kind>]` | `load1_max = "nproc"`, `poll_s = 120` |
+| Light lane: small checks run with `loadctl run --kind light --project web-app --label lint -- shellcheck x.sh` under hard CPU, memory and runtime limits | TOML `[light]`, profile `max_light` | `memory_max_mb = 512`, `max_runtime_s = 300` |
 | Memory-guard rule of a project, its container names and the working directory of its agents | TOML `[memguard.projects.<name>]` | `low_mb = 2048`, `containers = '^(ci-|test-)'`, `agent_cwd = "/srv/work/web-app"` (or a list of directories) |
 | Containers that are never paused | TOML `[memguard] deny_containers` | `["*-test-db*", "*-review-*"]` (the default) |
 | Implementer trees of a legacy dispatcher (a snapshot shell and its usage line) | TOML `[memguard] legacy_snapshot` | `{ prefix = "/tmp/dispatcher-snap.", marker = "# Usage: dispatch.sh", project = "web-app" }` |
 | A host-wide pause file that another tool reads (`loadctl wait` honours it) | TOML `[memguard] pause_marker` | `{ file = "web-app-guard.paused", project = "web-app" }` |
 | The compile slot's lock file under `/run/lock` (the heavy slot is always `host-heavy-slot.lock`) | TOML `[slots] compile_lock`, or the daemon's environment `LOADGOV_COMPILE_LOCK` | `compile_lock = "compile-slot.lock"` |
+| Disk alert thresholds (warning, critical; alert only, never delays a start): GB free or percent used, per watched path (defaults 25 and 10 GB free) | TOML `[levels] disk_busy`, `disk_limit` | `disk_busy = "80%"`, `disk_limit = 10` |
 | Link template for the issue keys of queue items and jobs (empty: no links) | TOML `[keys] url` | `url = "https://tracker.example/issues/{key}"` |
 | Which crates the `RUSTC_WRAPPER` shim puts behind the compile slot, and their project | environment `LOADGOV_HEAVY_CRATES`, `LOADGOV_COMPILE_PROJECT` | `LOADGOV_HEAVY_CRATES="app_backend app_worker"` |
 | Project and kind of the legacy-compatible wait shims, and the optional legacy fallback script | environment `LOADGOV_HOSTWAIT_PROJECT` (host-wait shim), `LOADGOV_HEADROOM_PROJECT` (wait-headroom shim), `LOADGOV_WAIT_PROJECT` (shared fallback), `LOADGOV_WAIT_KIND`, `LOADGOV_LEGACY_SCRIPT`, `LOADGOV_LEGACY_DIR` | `LOADGOV_WAIT_PROJECT=web-app` |

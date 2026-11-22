@@ -147,6 +147,7 @@ class Holder:
     orphan: bool = False  # the client (`pid`) is gone but the scope lives: the event is raised once
     job_kind: str | None = None  # kind of the job (impl, gate, ...) when the client said so
     key: str | None = None  # issue key the client passed; never derived
+    job_since: float | None = None  # registration time of the bound job (jobs[].since); None until bound
 
     @property
     def ref(self) -> HolderRef:
@@ -626,13 +627,15 @@ class SlotManager:
         return {"ok": True, "slot": name, "released": released}
 
     def bind_scope(self, name: str, owner_pid: int, scope: str, cgroup: str, job_pid: int,
-                   kind: str | None = None, key: str | None = None) -> bool:  # fmt: skip
+                   kind: str | None = None, key: str | None = None,
+                   since: float | None = None) -> bool:  # fmt: skip
         """`loadctl run` (pid `owner_pid`) holds the slot: bind it to the job scope from now on."""
         h = self.slots[name].holder
         if not (h and h.kind == "job" and h.pid == owner_pid):
             return False
         h.scope, h.cgroup, h.job_pid, h.job_start = scope, cgroup, job_pid, self._start(job_pid)
         h.job_kind, h.key = kind or h.job_kind, key or h.key
+        h.job_since = since
         return True
 
     def is_nested(self, name: str, pid: int) -> bool:
@@ -714,7 +717,9 @@ class SlotManager:
 
     def _free_at(self, s: Slot, now: float) -> float | None:
         """When the slot is expected free: now when it is free, the holder job's expected finish while it
-        is not overdue, else unknown (overdue, no statistics, any hold or a legacy holder)."""
+        is not overdue, else unknown (overdue, no statistics, any hold or a legacy holder). The start is the
+        bound job's registration time (the same instant as its `jobs[].eta`),
+        the grant time before it is bound."""
         if s.hold:
             return None  # pending or taken: the hold gets the slot before any waiter
         h = s.holder
@@ -722,7 +727,7 @@ class SlotManager:
             return None if s.legacy else now
         if h.kind != "job" or h.job_kind is None:
             return None
-        eta, overdue = finish_estimate(h.since, self.expected_s(h.project, h.job_kind), now)
+        eta, overdue = finish_estimate(h.job_since or h.since, self.expected_s(h.project, h.job_kind), now)
         return None if overdue else eta
 
     def _waiters(self, s: Slot, now: float) -> list[dict]:
