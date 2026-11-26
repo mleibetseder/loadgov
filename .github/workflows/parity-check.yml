@@ -1,0 +1,37 @@
+# The parity workflow for the hosted side (ILM-26): the same jobs and steps as
+# docs/examples/workflows/parity-check.yml, run by hand only (workflow_dispatch, no push trigger), on a
+# GitHub-hosted runner. Locally `ubuntu-latest` maps to the gate lane (docs/workflows.md, section 5).
+# `loadctl workflow parity` compares the two runs (section 10). It prints nothing site specific.
+name: Parity check
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Check
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compute
+        id: compute
+        run: |
+          echo "sum=$((2 + 3))" >> "$GITHUB_OUTPUT"
+      - name: Tolerated failure
+        continue-on-error: true
+        run: exit 3
+      - name: Always runs
+        if: always()
+        run: echo "sum is ${{ steps.compute.outputs.sum }}"
+
+  report:
+    name: Report
+    needs: check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Final
+        run: echo "done"

@@ -11,7 +11,7 @@ import re
 
 from loadgov.daemon.principal import caller_info, owner_denial
 from loadgov.daemon.slot_ops import _BAD_TEXT, _err, _text
-from loadgov.engines.image import CHANNELS, MAX_QUEUE
+from loadgov.engines.image import CHANNELS, MAX_QUEUE, OVERRIDE_KEYS, check_override
 from loadgov.engines.limits import iso
 from loadgov.engines.slots import pid_alive
 from loadgov.keys import key_error
@@ -68,6 +68,57 @@ def _submission(d, args: dict) -> tuple[dict | None, dict | None]:
             "env": kept}, None  # fmt: skip
 
 
+SET_KEYS = ("image_window", "image_timezone", "image_beta_interval_h", "image_clear")
+
+
+def set_settings(d, args: dict, peer_pid: int | None, rest_peer: str | None = None) -> dict:
+    """`set` with `image_window` / `image_timezone` / `image_beta_interval_h`, or `image_clear`: the owner's
+    runtime override of `[image]` (ILM-32). Owner only; audited as `image_settings` with before and after."""
+    ctx = {**caller_info(d.fs, peer_pid), "op": "set"}
+    if rest_peer is not None:
+        ctx.update(source="rest", peer=rest_peer)
+    else:
+        why = owner_denial(d.fs, peer_pid, d.config.principal)
+        if why or args.get("owner") is not True:
+            why = why or "owner: true is required for this operation"
+            d.audit.append({"ts": iso(d.clock()), **ctx, "op": "image_settings", "principal": "agent",
+                            "result": "refused", "reason": why, "request": args})  # fmt: skip
+            return _err("owner_denied", why)
+    reason, bad = _text(args, "reason")
+    if bad:
+        return bad
+    clear = args.get("image_clear")
+    if clear is not None and not isinstance(clear, bool):
+        return _err("bad_request", "image_clear must be a boolean")
+    given = {k: args.get("image_" + k) for k in OVERRIDE_KEYS}
+    given = {k: v for k, v in given.items() if v is not None}
+    for k in ("window", "timezone"):
+        if k in given and not isinstance(given[k], str):
+            return _err("bad_request", f"image_{k} must be a string")
+    n = given.get("beta_interval_h")
+    if "beta_interval_h" in given and (isinstance(n, bool) or not isinstance(n, int)):
+        return _err("bad_request", "image_beta_interval_h must be an integer")
+    if clear and given:
+        return _err("invalid_args", "image_clear cannot be combined with image settings")
+    if not clear and not given:
+        return _err("invalid_args", "nothing to set")
+    try:
+        new = {} if clear else {**d.image.override, **check_override(given)}
+    except ValueError as e:
+        return _err("invalid_args", f"image {e}")
+    before = d.image.settings(d.image_cfg())
+    d.image.override = new  # queued jobs are planned from the effective config on use; a running job is kept
+    after = d.image.settings(d.image_cfg())
+    d.audit.append({"ts": iso(d.clock()), **ctx, "op": "image_settings", "principal": "owner",
+                    "result": "cleared" if clear else "accepted", "reason": reason,
+                    "before": before, "after": after,
+                    "request": {k: v for k, v in args.items() if k != "reason"}})  # fmt: skip
+    d._after_change({"source": "image"})
+    if rest_peer is None:
+        d.notify_owner_change({**ctx, "reason": reason}, "image settings")
+    return {"ok": True, "cleared": bool(clear), "before": before, "after": after}
+
+
 def _request(j) -> dict:
     """What the audit log keeps of a job: never the environment values, only the program name."""
     return {"id": j.id, "project": j.project, "label": j.label, "channel": j.channel, "key": j.key,
@@ -109,7 +160,7 @@ def rest(d, op: str, args: dict, peer: str) -> dict:
 
 def handle(d, op: str, args: dict, peer_pid: int | None, rest_peer: str | None = None) -> dict:
     """`d` is the Daemon (image, config, fs, limits, audit, clock, jobs, _after_change)."""
-    now, cfg = d.clock(), d.config.image
+    now, cfg = d.clock(), d.image_cfg()
     ctx = {**caller_info(d.fs, peer_pid), "op": op, "request": args}
     if rest_peer is not None:
         ctx.update(source="rest", peer=rest_peer)

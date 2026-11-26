@@ -176,3 +176,20 @@ def test_status_warns_only_when_memory_protection_is_zero(fake_host):
     assert loadctl.format_status(st).splitlines()[-1] == (
         "  warn  memory protection 0 MB: set MemoryMin on system.slice (docs/deployment.md)"
     )
+
+
+def test_status_warns_when_ui_is_enabled_but_not_built(fake_host):
+    st = status(fake_host("calm"))
+    st["ui"] = {
+        "enabled": False,
+        "state": "disabled",
+        "error": None,
+        "bind": None,
+        "port": 7421,
+        "built": False,
+    }
+    assert "warn  ui" not in loadctl.format_status(st)
+    st["ui"]["enabled"] = True
+    assert loadctl.format_status(st).splitlines()[-1].startswith("  warn  ui enabled but no build")
+    st["ui"]["built"] = True
+    assert "warn  ui" not in loadctl.format_status(st)

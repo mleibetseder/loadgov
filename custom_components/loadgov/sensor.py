@@ -19,7 +19,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from homeassistant.util import dt as dt_util
 
-from .const import FEATURE_FREEZE, FEATURE_REAP, LEVELS, PROFILE_LABELS, REQUIRES_FREEZE
+from .const import FEATURE_FREEZE, IMAGE_SOURCES, FEATURE_REAP, LEVELS, PROFILE_LABELS, REQUIRES_FREEZE
 from .coordinator import LoadgovConfigEntry, LoadgovCoordinator
 from .entity import LoadgovEntity, dig
 
@@ -142,6 +142,7 @@ async def async_setup_entry(
             LoadgovDiskUsedSensor(entry.runtime_data),
             LoadgovImageTrainSensor(entry.runtime_data),
             LoadgovImageTrainNextStartSensor(entry.runtime_data),
+            LoadgovImageSettingsSourceSensor(entry.runtime_data),
             *(LoadgovSlotNextSensor(entry.runtime_data, slot) for slot in SLOTS),
             *(LoadgovSlotHolderEtaSensor(entry.runtime_data, slot) for slot in SLOTS),
             LoadgovRunningJobsSensor(entry.runtime_data),
@@ -187,10 +188,13 @@ class LoadgovFeaturesSensor(LoadgovEntity, SensorEntity):
         return ", ".join(on) if on else "none"
 
     @property
-    def extra_state_attributes(self) -> dict[str, str]:
+    def extra_state_attributes(self) -> dict[str, str | None]:
         return {
-            f: "supported" if self.coordinator.supports(f) else REQUIRES_FREEZE
-            for f in (FEATURE_FREEZE, FEATURE_REAP)
+            "host_id": dig(self.status, "host.id"),  # an attribute only: no entity or device id uses it
+            **{
+                f: "supported" if self.coordinator.supports(f) else REQUIRES_FREEZE
+                for f in (FEATURE_FREEZE, FEATURE_REAP)
+            },
         }
 
 
@@ -611,3 +615,26 @@ class LoadgovProjectMemorySensor(_LoadgovProjectSensor):
     def native_value(self) -> int | float | None:
         mem = (self._body or {}).get("mem_mb")
         return mem if isinstance(mem, int | float) else None
+
+
+class LoadgovImageSettingsSourceSensor(LoadgovEntity, SensorEntity):
+    """Where the image window, timezone and beta interval come from: `config` or `override` (the owner's run-time
+    setting). Unavailable when the daemon has no image train, unknown when it does not report `image.source`."""
+
+    _domain = "sensor"
+    _attr_icon = "mdi:cog-sync"
+    _attr_device_class = SensorDeviceClass.ENUM
+    _attr_options = list(IMAGE_SOURCES)
+    _attr_translation_key = "image_settings_source"
+
+    def __init__(self, coordinator: LoadgovCoordinator) -> None:
+        super().__init__(coordinator, "image_settings_source", "Host Image Settings Source")
+
+    @property
+    def available(self) -> bool:
+        return super().available and _image(self.status) is not None
+
+    @property
+    def native_value(self) -> str | None:
+        source = (_image(self.status) or {}).get("source")
+        return source if source in IMAGE_SOURCES else None

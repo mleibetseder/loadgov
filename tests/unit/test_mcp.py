@@ -302,7 +302,7 @@ def test_tool_listing_follows_capabilities(daemon):
     caps = []
     d = daemon(status=lambda a: status_reply(list(caps)))
     srv = build_server(Tools(d.path))
-    base = ["load_explain", "load_get_status", "load_set_limits", "load_wait_headroom"]
+    base = ["load_explain", "load_get_fleet", "load_get_status", "load_set_limits", "load_wait_headroom"]
     assert tool_names(srv) == base
     caps.extend(["reap", "freeze"])
     assert tool_names(srv) == sorted([*base, "load_reap_idle_daemons", "load_freeze", "load_unfreeze"])
@@ -345,6 +345,13 @@ def test_status_carries_the_light_lane(daemon):
     st["status"]["light"] = {"running": 1, "max": 4, "per_project_max": 2}
     d = daemon(status=lambda a: st)
     assert Tools(d.path).get_status()["light"]["max"] == 4
+
+
+def test_status_carries_the_host_id(daemon):
+    st = status_reply()
+    st["status"]["host"] = {"id": "build-a", "mode": "monitor", "cores": 8}
+    d = daemon(status=lambda a: st)
+    assert Tools(d.path).get_status()["host"] == {"id": "build-a", "mode": "monitor"}
 
 
 def test_wait_headroom_while_starting_respects_a_short_timeout(daemon):

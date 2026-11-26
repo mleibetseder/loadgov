@@ -11,6 +11,7 @@ loadgov-mcp                  # speaks MCP on stdin/stdout; --socket or $LOADGOV_
 
 | Tool | What it does |
 |---|---|
+| `load_get_fleet` | Read-only fleet view (docs/protocol.md, Fleet): this host and the `[fleet]` registry hosts, each with mode, level, load per core, light lane, heavy and compile slots, image queue, `reachable`, `fetched_at`, `error`, `id_mismatch` |
 | `load_get_status` | Compact snapshot: cpu/psi/memory/swap/io, levels, effective limits, profile, ceiling and `ceiling_info`, restriction, slots, jobs, `job_stats`, the `light` lane, `capabilities`, memory-guard/paused sections when the daemon reports them |
 | `load_set_limits` | `set` as the agent principal. Needs `reason`; optional `profile`, `max_cores`, `target_cpu_pct`, `load_max`, `max_implementers`, `max_reviewers`, `max_light`, `ram_floor_gb`, `ttl` or `until`, `agent_id`, `project`. `agent_id` is folded into the audit reason. Returns the daemon reply verbatim, including `refused: true`, `restrictedBy` and the owner's reason |
 | `load_wait_headroom` | `kind` (`impl`, `review`, `gate`, `compile`, `light`), `timeout_sec`, optional `project`. Same two-sample rule as `loadctl wait`. Returns `result: ok` or `timeout` with the last decision `reasons`. One call waits at most 1800 s: call again, or use `loadctl wait` for longer waits |

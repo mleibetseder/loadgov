@@ -21,6 +21,12 @@ enforce = false
 #                           # gate`, only below this much MemAvailable, only on IDLE Gradle/Kotlin daemons (outside
 #                           # every job scope). 0 = off; set it if a gate loses a warm daemon it needed
 # log_path = "/var/log/loadgov/memguard.log"   # legacy memory-guard log style lines
+# Early pressure of the global rule (docs/protocol.md "Memory guard", Thresholds and Deficit cover):
+# swap_free_min_mb = 1024   # built-in default: pressure when free swap (SwapTotal - used) is below this while
+#                           # MemAvailable is below the resume level. 0 = off; no effect on a host without swap
+# horizon_samples = 2       # built-in default: pressure when MemAvailable - (fall since the last sample) * this
+#                           # is below LOW. 0 = off. A fall of 512 MB or more per sample also pauses several
+#                           # trees in one sample until they cover the deficit, without the 15 s quiet
 # Containers that are never docker-paused, whatever a project's regex says (fnmatch globs):
 # deny_containers = ["*-test-db*", "*-review-*"]   # the default
 # Implementer trees of a legacy dispatcher: a `bash <prefix>*` whose snapshot file has a line starting with
@@ -46,10 +52,31 @@ enforce = false
 #   # source: backstop_sizing.py over one week of history, peak build-work memory.current 10240 MB, +20 %
 # memory_max_mb must be >= 4096; memory_swap_max_mb >= 0. With enabled = true the daemon also sets
 # memory.oom.group = 1 on every `loadctl run` job scope, so an OOM kill takes that one scope down as a group.
-# Rollback: remove this table (or enabled = false) and restart; the daemon writes `max` back (the only case).
+# The daemon applies the numbers with `systemctl set-property --runtime build-work.slice MemoryMax=… MemorySwapMax=…`
+# (starting the slice first when it is inactive after boot) and checks the cgroup files: systemd overwrites a value
+# written only to the file whenever it re-realizes the slice. Usage already at or above memory_max_mb: the limit
+# starts as a cap at usage + cap_margin_mb and steps down to memory_max_mb as usage falls (one warning alert).
+# Rollback: remove this table (or enabled = false) and restart; the daemon sets MemoryMax=infinity
+# MemorySwapMax=infinity and writes `max` back (the only case).
 enabled = false
 # memory_max_mb = 12288
 # memory_swap_max_mb = 2048
+# cap_margin_mb = 512       # built-in default
+# Per-project caps (OFF: 0). With enabled = true, every build-work-<project>.slice gets
+#   systemctl set-property --runtime build-work-<project>.slice MemoryMax=<cap>M MemoryHigh=<high>M
+# so a runaway is throttled, then confined to its own slice instead of making the kernel kill other projects'
+# jobs. 1024 <= cap <= memory_max_mb. Override per project with `memory_max_mb` in [projects.<name>]
+# (0 = no cap for that project). A nested name (a-b) also sits under its parent's (a) slice and cap.
+# project_memory_max_mb = 0       # built-in default: off
+# project_memory_high_pct = 90    # MemoryHigh as % of the cap (50..100)
+# Read-only, also with enabled = false: tmpfs files (/tmp) a job wrote stay charged to its slice after it
+# ends, and a SIGKILL skips the job's own cleanup. A slice holding more than leak_alert_mb of shmem (file
+# cache is reclaimable and does not count) with no process for leak_alert_min minutes raises one
+# `backstop_leak` warning; tmpfs directories of at
+# least leftover_report_mb are named with the jobs that likely wrote them. Nothing is ever deleted.
+# leak_alert_mb = 1024
+# leak_alert_min = 5
+# leftover_report_mb = 1024
 
 [strays]
 # Stray-process guard (docs/protocol.md "Stray guard"): finds orphaned CPU hogs (the agent that started them
@@ -85,6 +112,24 @@ enforce = false
 # [levels]
 # disk_busy = "80%"
 # disk_limit = 10
+
+[host]
+# The host id: it names this host in the status (host.id), every audit line and every alert, so a fleet view
+# can tell hosts apart. Optional: the default is the hostname, lowercased, reduced to a-z 0-9 - (at most
+# 63 characters), kept in state.json after the first start. A value here wins over the saved id and is
+# audited once as host_id_changed. Restart the daemon to change it.
+# id = "build-a"
+# mode = "govern"   # "monitor": every enforce flag is forced off at run time (WOULD decisions only);
+#                   # a reload may switch it and is audited as host_mode_changed
+
+# The fleet: the OTHER hosts this daemon collects (read-only; docs/protocol.md, Fleet). Empty = this host only.
+# Each daemon still decides only for its own host. token_env names a variable in /etc/loadgov/tokens.env
+# that holds that host's REST bearer token; never put a token here. Live on reload.
+# [[fleet]]
+# id = "build-b"                       # a-z 0-9 -, the id that host reports as [host] id
+# url = "http://192.0.2.20:7420"       # that host's REST surface
+# token_env = "LOADGOV_TOKEN_BUILD_B"
+# mode = "monitor"                     # "monitor" (only watched) or "govern"
 
 [keys]
 # Link template for the issue key of a queue item or job (`loadctl run --key`, LOADGOV_KEY). It must
@@ -164,8 +209,11 @@ io_psi_gate = false      # io PSI some avg60 < 25 blocks only when true; otherwi
 # poll_s = 30
 # max_wait_s = 7200       # 0 = wait forever
 
-# Per-project overrides (there are no built-in projects). A project that waits like a legacy script
-# (every 120 s, forever) and has looser limits:
+# Per-project overrides (there are no built-in projects). The memory cap of the project's slice (see
+# project_memory_max_mb under backstop; 0 = no cap for this project):
+# [projects.example-project]
+# memory_max_mb = 6144
+# A project that waits like a legacy script (every 120 s, forever) and has looser limits:
 # [projects.example-project.kinds.impl]
 # load1_max = 6
 # load5_max = false
@@ -192,6 +240,20 @@ io_psi_gate = false      # io PSI some avg60 < 25 blocks only when true; otherwi
 # allow = []              # source IPs or CIDRs; empty = token only. Add the HA VM IP here later.
 # rate_per_s = 5
 # max_connections = 16    # 1-64; extra connections are closed unread; one source IP may hold half of them
+# allow_private_bridge = false  # a bind in 172.16.0.0/12 (docker bridges) is refused unless this is true
+
+# The per-host web UI (docs/protocol.md "Web UI"): the built Angular app plus read-only JSON, on its own
+# listener, no token. Put a reverse proxy with sign-in in front and list ONLY its address in allow.
+# [ui]
+# enabled = false
+# bind = "192.0.2.10"           # the host's own LAN address (same rules as [rest] bind)
+# port = 7421
+# allow = ["192.0.2.30"]        # the sign-in proxy; required, never a /0 network
+# dir = "/opt/loadgov/ui"       # the built app (index.html at the top); see ui/README.md
+# tempo_url = "https://tempo.example"   # the "Fleet view: in tempo" link; unset hides it
+# runs_dir = "/var/lib/loadgov/runs"    # workflow run records (default: the client default)
+# rate_per_s = 20
+# max_connections = 16          # 1-64; the proxy is the only client and gets half of them
 # allow_private_bridge = false  # a bind in 172.16.0.0/12 (docker bridges) is refused unless this is true
 
 # Push alerts to a Home Assistant webhook (docs/protocol.md "Alerts"). Off by default.
@@ -222,7 +284,8 @@ io_psi_gate = false      # io PSI some avg60 < 25 blocks only when true; otherwi
 # Beta and release container builds queue during the day and run in a night window, one at a time (kind
 # `image`, heavy slot like a gate). A project's beta runs at most once per beta_interval_h; otherwise only
 # when the owner says `loadctl image now ID --owner --reason ...`. The daemon only arbitrates; the runner
-# (loadgov-image-runner.timer) runs the jobs. Uncomment to change (applied on reload):
+# (loadgov-image-runner.timer) runs the jobs. Uncomment to change (applied on reload; the owner can override
+# window, timezone and beta_interval_h at run time with `loadctl set --image-window ...`, see docs/protocol.md):
 # [image]
 # window = "00:00-06:00"       # HH:MM-HH:MM wall-clock times of `timezone`; may cross midnight
 # timezone = "UTC"             # IANA name, e.g. "America/New_York"
@@ -241,3 +304,14 @@ io_psi_gate = false      # io PSI some avg60 < 25 blocks only when true; otherwi
 # max_runtime_s = 600          # loadctl kills the scope after this long (exit 76, LIGHT_OVERRUN), 30-1800
 # max_light_per_project = 2    # registered light jobs of one project, 1-8 (the host-wide cap is the
 #                              # profile's max_light)
+
+# ---- Compile memory admission (the compile slot, docs/protocol.md "Slots") ---------------------------
+# A compile (loadctl run --kind compile --label <crate>) starts only when MemAvailable is at least the
+# crate's expected memory peak plus the memory guard's low floor; until then it waits at the head of the
+# compile queue (FIFO, nobody passes it). The peak is learned from finished compiles. Default off.
+# [compile]
+# memory_admission = false     # true: hold a compile back until it fits
+# default_peak_mb = 1024       # expected peak of a crate without history, 64-262144
+# history = 20                 # last N peaks per crate the percentile is taken over, 1-50
+# percentile = 90              # of those peaks, 50-100 (100 = the maximum)
+# max_memory_wait_s = 900      # a compile held back this long is admitted anyway, 10-86400

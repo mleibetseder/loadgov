@@ -5,13 +5,19 @@ sample and two lazy lists (candidate trees, JVM daemons), executes the returned 
 failures back with `drop`. The clocks are injectable.
 
 Thresholds (global rule): LOW = the effective `ram_floor_gb`, RESUME (HIGH) = max(6 GB, floor + 2 GB)
-(HIGH is always at least 2 GB above LOW, so a resume can never be followed by an immediate pause),
+(HIGH is always at least 2 GB above LOW, so the level rules never pause right after a resume; the trend
+rule does when avail falls fast),
 CRIT = 1500 MB. A project in `[memguard.projects]` (config only, e.g. 2048 / 4096 MB and swap > 2048 MB)
 has its own rule for its own work.
 
 Every sample (a daemon tick, 5 s):
-- pressure = avail < LOW, or swap grew more than 768 MB over the calm baseline (global rule; the project
+- pressure = avail < LOW, or swap grew more than 768 MB over the calm baseline, or (trend) avail minus the
+  fall since the last sample times `horizon_samples` (2) is below LOW, or (swap headroom) free swap
+  (SwapTotal - used) is below `swap_free_min_mb` (1024) while avail < HIGH (global rule; the project
   rule: avail < its LOW, or swap above its limit while avail < its HIGH);
+- deficit cover: under pressure with avail falling by at least 512 MB since the last sample, one sample
+  pauses several eligible trees (largest first, the same exclusions) until their memory covers LOW minus
+  the projected avail, and the quiet period below does not hold the guard while the fall goes on;
 - under pressure, in this order: reap JVM build daemons outside every job scope; else pause the
   largest eligible tree of the first class that has one (registered job scopes by `memory.current`, then
   legacy implementer trees, then project containers), skipping trees whose largest rustc is >= 2048 MB
@@ -20,7 +26,8 @@ Every sample (a daemon tick, 5 s):
 - the abort is also taken in the same sample as the system reap (avail < 1536 MB) when nothing else can be
   paused, and when avail fell by at least 512 MB since the last sample so that the same fall again would
   cross 1500 MB before the next sample (a compile of several GB kills the host faster than 5 s);
-- one action per sample; 15 s of quiet after a pause or abort, 30 s after a resume;
+- one action per sample (except the deficit cover); 15 s of quiet after a pause or abort, 30 s after a
+  resume;
 - LIFO resume after `resume_samples` (3) samples with avail >= HIGH and no pressure;
 - the swap baseline only moves down, or follows swap after 120 calm samples (10 min), and is reset to the
   current swap by a pause, an abort and a resume.
@@ -53,6 +60,8 @@ LOW_MEMORY_EVERY_S = 300.0
 REAPED_KEEP_S = 60.0
 FLOOR_RANGE = (2.0, 6.0)
 CLASS_ORDER = {"scope": 0, "legacy": 1, "container": 2}
+SWAP_FREE_MIN_MB = 1024  # [memguard] swap_free_min_mb
+HORIZON_SAMPLES = 2  # [memguard] horizon_samples
 
 
 def denied(name: str, globs: tuple[str, ...] = DENY_CONTAINERS) -> bool:
@@ -78,15 +87,34 @@ class Rule:
     swap_mb: int | None  # absolute swap that counts as pressure while avail < high_mb
     resume_samples: int
     calm_reset: int
+    swap_free_min_mb: int = 0  # free swap below this while avail < high_mb counts as pressure (0 = off)
+    horizon: int = 0  # avail - fall per sample * horizon below low_mb counts as pressure (0 = off)
 
-    def pressure(self, avail: int, swap: int, baseline: int) -> str | None:
+    def pressure(
+        self, avail: int, swap: int, baseline: int, swap_free: int | None = None, fall: int | None = None
+    ) -> str | None:
         if avail < self.low_mb:
             return f"avail {avail} MB below {self.low_mb} MB"
+        if self.horizon and fall is not None and fall > 0 and avail - fall * self.horizon < self.low_mb:
+            return (f"avail {avail} MB falling {fall} MB per sample, {avail - fall * self.horizon} MB "
+                    f"projected within {self.horizon} samples, below {self.low_mb} MB")  # fmt: skip
         if self.surge_mb is not None and swap - baseline > self.surge_mb:
             return f"swap grew {swap - baseline} MB over the calm {baseline} MB"
         if self.swap_mb is not None and swap > self.swap_mb and avail < self.high_mb:
             return f"swap {swap} MB above {self.swap_mb} MB with avail below {self.high_mb} MB"
+        if (
+            self.swap_free_min_mb and swap_free is not None and swap_free < self.swap_free_min_mb
+            and avail < self.high_mb
+        ):  # fmt: skip
+            return (f"swap free {swap_free} MB below {self.swap_free_min_mb} MB with avail below "
+                    f"{self.high_mb} MB")  # fmt: skip
         return None
+
+    def projected(self, avail: int, fall: int | None) -> int | None:
+        """avail `horizon` samples from now at the current fall (None when not falling or off)."""
+        if not self.horizon or fall is None or fall <= 0:
+            return None
+        return avail - fall * self.horizon
 
     def calm(self, avail: int) -> bool:
         return avail >= self.high_mb
@@ -156,9 +184,15 @@ class MemGuard:
         projects: dict[str, GuardProject] | None = None,
         override: tuple[int, int] | None = None,  # test-only: (LOW, HIGH) MB replace the global rule
         deny_containers: tuple[str, ...] = DENY_CONTAINERS,
+        swap_free_min_mb: int = SWAP_FREE_MIN_MB,
+        horizon_samples: int = HORIZON_SAMPLES,
     ):
         self.clock, self.monotonic = clock, monotonic
         self.deny = tuple(deny_containers)
+        self.swap_free_min_mb, self.horizon_samples = swap_free_min_mb, horizon_samples
+        self.swap_total: int | None = None
+        self._fall: int | None = None  # avail fall since the last sample (MB), whatever its age
+        self._swap_free: int | None = None  # SwapTotal - used of the last sample (None: unknown or no swap)
         self.projects = projects or {}
         self.override = override
         self.paused: list[Entry] = []
@@ -181,7 +215,8 @@ class MemGuard:
 
     def rules(self, floor_gb: float) -> dict[str, Rule]:
         low, high = self.override or thresholds(floor_gb)
-        out = {"global": Rule("global", low, high, SWAP_SURGE_MB, None, RESUME_SAMPLES, CALM_RESET)}
+        out = {"global": Rule("global", low, high, SWAP_SURGE_MB, None, RESUME_SAMPLES, CALM_RESET,
+                              self.swap_free_min_mb, self.horizon_samples)}  # fmt: skip
         for name, p in self.projects.items():
             out[name] = Rule(name, p.low_mb, p.high_mb, None, p.swap_mb, p.resume_samples, CALM_RESET)
         return out
@@ -199,15 +234,21 @@ class MemGuard:
         enforce: bool,
         trees: Callable[[], list[Tree]],
         jvm: Callable[[], list[Jvm]],
+        swap_total_mb: int | None = None,
     ) -> list[Action]:
         mono = self.monotonic()
         self._projected = None
         prev = self._prev
+        self._fall = prev[1] - avail_mb if prev else None
         if prev and 0 < mono - prev[0] <= FALL_WINDOW_S and prev[1] - avail_mb >= FALL_MIN_MB:
             rate = (prev[1] - avail_mb) / (mono - prev[0])
             self._projected = round(avail_mb - rate * SAMPLE_S)
         self._prev = (mono, avail_mb)
         self.avail, self.swap, self.floor = avail_mb, swap_mb, floor_gb
+        self.swap_total = swap_total_mb
+        swap_free = swap_total_mb - swap_mb if swap_total_mb else None  # no swap configured: no headroom rule
+        self._swap_free = swap_free
+        fast = self._fall is not None and self._fall >= FALL_MIN_MB
         self.rule_map = self.rules(floor_gb)
         self.reaped = {k: t for k, t in self.reaped.items() if mono - t < REAPED_KEEP_S}
         actions: list[Action] = []
@@ -221,7 +262,8 @@ class MemGuard:
 
         if avail_mb < REAP_ALL_MB and fresh_jvms():  # the system backstop, whatever the quiet period
             actions.append(self._reap(fresh_jvms(), enforce, f"avail {avail_mb} MB below {REAP_ALL_MB} MB"))
-        if mono < self.cooldown_until:
+        quiet = mono < self.cooldown_until
+        if quiet and not fast:  # while avail keeps falling fast, the quiet period does not hold the guard
             return actions
         acted, pressured = bool(actions), False
         reaped_only, abort_done = bool(actions), False  # after the system reap only an abort may follow
@@ -229,7 +271,9 @@ class MemGuard:
             st = self.state.setdefault(name, RuleState())
             if st.baseline is None:
                 st.baseline = swap_mb
-            why = rule.pressure(avail_mb, swap_mb, st.baseline)
+            why = rule.pressure(avail_mb, swap_mb, st.baseline, swap_free, self._fall)
+            if quiet and not why:
+                continue  # inside the quiet period only pressure acts: no resume, no baseline move
             if why:
                 pressured = True
                 st.good = 0
@@ -279,6 +323,16 @@ class MemGuard:
             return f"falling fast, {self._projected}MB projected below {CRIT_MB}MB within {SAMPLE_S:g}s"
         return None
 
+    def _deficit(self, rule: Rule) -> int | None:
+        """MB to take out of the race when avail falls fast (>= FALL_MIN_MB since the last sample): LOW minus
+        the projected avail (at least 1, so the first pick always counts); None when not falling fast."""
+        if self._fall is None or self._fall < FALL_MIN_MB:
+            return None
+        projected = rule.projected(self.avail, self._fall)
+        if projected is None:
+            projected = self.avail - self._fall  # horizon off: one more sample at the same fall
+        return max(1, rule.low_mb - projected)
+
     def _pressure(self, rule, st, why, enforce, trees, jvms, reaped=False) -> list[Action]:
         mono = self.monotonic()
         out = [] if reaped else [j for j in jvms() if not j.in_scope]  # daemons outside every job scope first
@@ -296,18 +350,27 @@ class MemGuard:
         )
         compiling = [t for t in mine if t.big_rustc_mb >= COMPILE_MB and t.rustc]
         if pausable and not reaped:
-            t = pausable[0]
-            e = Entry(
-                f"g{self.next_id}", "guard", rule.name, t.key, t.how, t.what, t.project, t.targets,
-                t.session, self.clock(), why, "system", real=enforce,
-            )  # fmt: skip
-            self.next_id += 1
-            self.paused.append(e)
-            text = f"PAUSE {t.what} {t.rss_mb}MB; {self._tail()} (calm {st.baseline}MB); {why}"
+            picks, deficit = [pausable[0]], self._deficit(rule)
+            if deficit is not None:  # falling fast: pause until the trees' memory covers the deficit
+                why = f"{why}; deficit {deficit} MB"
+                for t in pausable[1:]:
+                    if sum(p.rss_mb for p in picks) >= deficit:
+                        break
+                    picks.append(t)
+            calm, acts = st.baseline, []
+            for t in picks:
+                e = Entry(
+                    f"g{self.next_id}", "guard", rule.name, t.key, t.how, t.what, t.project, t.targets,
+                    t.session, self.clock(), why, "system", real=enforce,
+                )  # fmt: skip
+                self.next_id += 1
+                self.paused.append(e)
+                text = f"PAUSE {t.what} {t.rss_mb}MB; {self._tail()} (calm {calm}MB); {why}"
+                self._line("PAUSE", text, not enforce, t.project, entry=e.id)
+                acts.append(Action("pause", text, not enforce, entry=e))
             st.baseline = self.swap  # swap does not drain by itself: measure growth from here
             self.cooldown_until = mono + PAUSE_QUIET_S
-            self._line("PAUSE", text, not enforce, t.project, entry=e.id)
-            return [Action("pause", text, not enforce, entry=e)]
+            return acts
         if pausable:  # the system reap took this sample; the pause waits for the next one
             return []
         if compiling:
@@ -320,7 +383,9 @@ class MemGuard:
                 )
                 st.baseline = self.swap
                 self.cooldown_until = mono + PAUSE_QUIET_S
-                self._line("ABORT", text, not enforce, t.project)
+                self._line(
+                    "ABORT", text, not enforce, t.project, **({"unit": t.key} if t.cls == "scope" else {})
+                )
                 return [Action("abort", text, not enforce, tree=t)]
             if reaped:
                 return []
@@ -379,7 +444,8 @@ class MemGuard:
         st = self.state.get(e.rule or "")
         if rule is None or st is None or self.avail is None or st.baseline is None:
             return False
-        return rule.calm(self.avail) and rule.pressure(self.avail, self.swap, st.baseline) is None
+        why = rule.pressure(self.avail, self.swap, st.baseline, self._swap_free, self._fall)
+        return rule.calm(self.avail) and why is None  # the same rules as a sample, the trend included
 
     def drain_events(self) -> list[dict]:
         ev, self.events = self.events, []

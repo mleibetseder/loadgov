@@ -57,3 +57,8 @@ REQUIRES_FREEZE = "requires a loadgovd with freeze support"
 
 # hwmon levels of the status `level` field, best to worst.
 LEVELS = ("OK", "BUSY", "LIMIT")
+
+# Run-time image-train settings (REST /v1/set, docs/protocol.md "The image train").
+IMAGE_SOURCES = ("config", "override")
+IMAGE_BETA_INTERVAL_MAX_H = 336
+IMAGE_WINDOW_PATTERN = r"^([01]\d|2[0-3]):[0-5]\d-([01]\d|2[0-3]):[0-5]\d$"

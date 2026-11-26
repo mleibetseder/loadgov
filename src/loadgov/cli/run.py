@@ -93,11 +93,15 @@ def unit_name(kind: str, label: str, ts: str) -> str:
     return f"loadgov-{kind}-{sanitize(label) or 'job'}-{ts}"
 
 
-def scope_cgroup(slice_: str, unit: str) -> str:
-    """The cgroup path systemd gives a scope: a slice `a-b-c.slice` nests under `a.slice` and `a-b.slice`."""
+def slice_cgroup(slice_: str) -> str:
+    """The cgroup path systemd gives a slice unit: `a-b-c.slice` nests under `a.slice` and `a-b.slice`."""
     parts = slice_.removesuffix(".slice").split("-")
-    chain = ["-".join(parts[: i + 1]) + ".slice" for i in range(len(parts))]
-    return "/" + "/".join([*chain, f"{unit}.scope"])
+    return "/".join("-".join(parts[: i + 1]) + ".slice" for i in range(len(parts)))
+
+
+def scope_cgroup(slice_: str, unit: str) -> str:
+    """The cgroup path systemd gives a scope below its slice (see `slice_cgroup`)."""
+    return f"/{slice_cgroup(slice_)}/{unit}.scope"
 
 
 def light_limits(status: dict) -> dict:
@@ -467,6 +471,7 @@ def _run_held(
     registered = False
     outcome: dict = {}
     cgroup = None
+    job_code = None
     try:
         try:
             proc = d.popen(argv, env=env)
@@ -492,6 +497,11 @@ def _run_held(
         except DaemonUnavailable:
             print("loadctl: daemon went away; the job runs unregistered", file=sys.stderr)
         code = _wait_job(proc, a, d, scope_unit, light, cgroup, outcome)
+        job_code = code  # what the job itself returned (negative: the signal that killed it)
+        if light is None:  # light jobs read this below; the others only to name an OOM kill
+            outcome["oom"] = (
+                d.oom_kills(cgroup) or 0
+            )  # (the scope is usually gone: the daemon also tracks it)
         if light is not None:
             outcome["oom"] = max(outcome.get("oom", 0), d.oom_kills(cgroup) or 0)
             if d.unit_result(scope_unit) == "oom-kill":  # the scope is kept, so this holds even when the
@@ -515,6 +525,14 @@ def _run_held(
             signal.signal(sig, h)
         if registered or "overrun" in outcome:  # an overrun is reported even when job_start failed
             end = {"unit": scope_unit}
+            if job_code is not None:  # how the job ended, so the daemon can name the cause
+                end["exit_code"] = 128 - job_code if job_code < 0 else job_code
+                if job_code < 0:
+                    end["signal"] = -job_code
+            if caught:
+                end["cancelled"] = True
+            if outcome.get("oom"):
+                end["oom_kill"] = True
             if "overrun" in outcome:  # kind/project/label serve a daemon that no longer knows the unit
                 end.update(overrun=outcome["overrun"], kind=a.kind, project=a.project, label=a.label)
             with contextlib.suppress(DaemonUnavailable, OSError, ValueError, KeyError, TypeError):

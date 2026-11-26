@@ -433,7 +433,7 @@ def test_disabled_listens_nowhere(tmp_path, fake_host):
 
     asyncio.run(go())
     assert seen[0]["status"]["rest"] == {
-        "enabled": False, "state": "disabled", "error": None, "bind": "127.0.0.1", "port": 0,
+        "enabled": False, "state": "disabled", "error": None, "bind": "127.0.0.1", "port": 0, "tokens_warning": None,
     }  # fmt: skip
     assert seen[1] == []  # `ss -ltnp`: this process has no TCP listener
 
@@ -658,3 +658,38 @@ def test_image_cancel_is_owner_via_rest(tmp_path, fake_host):
     run_rest(d, scenario)
     line = [a for a in audit(d) if a["op"] == "image_cancel"][-1]
     assert (line["principal"], line["source"]) == ("owner", "rest")
+
+
+def test_image_settings_are_owner_via_rest_set_and_clear(tmp_path, fake_host):
+    d = make(tmp_path, fake_host("calm"))
+    job_id = _queue_image_job(d)
+
+    async def scenario(port):
+        code, body, _ = await http(port, "POST", "/v1/set", {
+            "image_window": "22:00-04:00", "image_timezone": "America/New_York", "image_beta_interval_h": 12,
+            "reason": "move the night"})  # fmt: skip
+        assert (code, body["ok"], body["after"]["source"]) == (200, True, "override")
+        assert body["before"]["window"] == "00:00-06:00"
+        status = {"image": d.image_status()}  # the REST status is the dispatch status (no sample in this rig)
+        assert {k: status["image"][k] for k in ("window", "timezone", "beta_interval_h", "source")} == {
+            "window": "22:00-04:00", "timezone": "America/New_York", "beta_interval_h": 12, "source": "override"}  # fmt: skip
+        for bad in (
+            {"image_window": "03:00-03:00"},
+            {"image_timezone": "Mars/Base"},
+            {"image_beta_interval_h": 400},
+        ):
+            code, body, _ = await http(port, "POST", "/v1/set", bad)
+            assert (code, body["error"]) == (400, "invalid_args")
+        code, body, _ = await http(port, "POST", "/v1/set", {"image_beta_interval_h": 1.5})
+        assert (code, body["error"]) == (400, "bad_request")
+        code, body, _ = await http(port, "POST", "/v1/set", {"image_window": "22:00-04:00", "max_cores": 2})
+        assert code == 400 and "cannot be combined" in body["message"]
+        code, body, _ = await http(port, "POST", "/v1/set", {"image_clear": True, "reason": "back"})
+        assert (code, body["cleared"], body["after"]["source"]) == (200, True, "config")
+
+    run_rest(d, scenario)
+    assert d.image.override == {} and d.image.get(job_id).state == "queued"
+    lines = [a for a in audit(d) if a["op"] == "image_settings"]
+    assert [(x["principal"], x["result"], x["source"]) for x in lines] == [
+        ("owner", "accepted", "rest"), ("owner", "cleared", "rest")]  # fmt: skip
+    assert lines[1]["before"]["window"] == "22:00-04:00" and lines[1]["reason"] == "back"

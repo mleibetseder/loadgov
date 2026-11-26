@@ -47,6 +47,13 @@ by what each part needs:
 
 Do not ask for higher limits to make a check fit: the ranges cap how loose a site may make them.
 
+**Checks as workflow files.** A project that already describes its checks as GitHub or Forgejo Actions
+workflows does not need a second description: `runs-on: [self-hosted, loadgov-light]` puts a job in this lane,
+and `loadctl workflow run .github/workflows/ci.yml` runs each job as one `loadctl run` with the limits above.
+The supported subset, the lane labels (`loadgov-light`, `-gate`, `-compile`, `-image-beta|release`) and the
+run records are in [workflows.md](workflows.md). An image job is queued with `loadctl image submit`, as in
+section 2 below, never run directly.
+
 ## 2. The image train
 
 Beta and release image builds are heavy and not urgent, so they run in a night window (default `00:00-06:00` in
@@ -88,6 +95,12 @@ example `image train: empty, window 00:00-06:00 UTC, opens in 7 h`. A running im
 with its expected finish (`eta`) once the project has finished image jobs.
 
 **Cancel** a queued job with `loadctl image cancel ID --project web-app`. A running job cannot be cancelled.
+
+**The window is the owner's rule and can change at run time.** The default comes from `[image]` in the config;
+the owner changes it without editing the file: `loadctl set --image-window 22:00-04:00 --image-timezone
+America/New_York --image-beta-interval-h 24 --owner --reason "..."`, and `loadctl set --image-clear --owner --reason
+"..."` goes back to the config values. Queued jobs get new planned starts at once; a running job is not affected.
+An agent cannot change it (`owner_denied`). `image.source` in `loadctl status --json` says `config` or `override`.
 
 **Now is owner-only.** Running a job outside the window or inside the beta interval is the human owner's
 decision: `loadctl image now ID --owner --reason "..."`. An agent, or any process inside a governed cgroup, is
@@ -150,3 +163,17 @@ Use the `release` channel for the probe: a `beta` probe would use up the project
       variables.
 - [ ] The submit and cancel probes work, and the script handles exit 4 (a beta inside the interval) by reporting
       `next_allowed` instead of retrying in a loop.
+
+## 4. REST clients: one token each, read scope for readers
+
+A service that only needs to look (a fleet or pipeline service reading this host's workflow runs, a dashboard)
+gets its own token with `scope=read`, never the owner token that Home Assistant uses. A read token may call
+`GET` endpoints only (`/v1/status`, `/v1/fleet`, `/v1/runs`, `/v1/runs/{id}` and a step log); every write path
+answers `403` `read_only` and leaves an audit line with the client name. Create and rotate it as in
+docs/deployment.md "REST clients: tokens and scopes"; the endpoints and shapes are in docs/protocol.md "REST".
+
+- [ ] The client sends `Authorization: Bearer <its own token>` and polls no faster than `[rest] rate_per_s`
+      allows (`429` otherwise); the limit is shared by all clients.
+- [ ] A write attempt with the read token answers `403` and shows in the audit log with `client` set to its name.
+- [ ] The client treats `422` `damaged_record` on one run as that run only: the list skips damaged runs and counts
+      them in `damaged`.

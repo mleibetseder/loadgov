@@ -75,8 +75,9 @@ class MemGuardRuntime:
         self.snapshot_reader = options.get("snapshot_reader", read_snapshot)
         self.restrict: str | None = options.get("restrict_cgroup")
         self.engine = MemGuard(
-            d.clock, self.monotonic, self.cfg.projects, options.get("override"), self.cfg.deny_containers
-        )
+            d.clock, self.monotonic, self.cfg.projects, options.get("override"), self.cfg.deny_containers,
+            self.cfg.swap_free_min_mb, self.cfg.horizon_samples,
+        )  # fmt: skip
         self.dirty = False
         self.foreign: list[dict] = []
         self._seen_foreign: set[int] = set()
@@ -264,7 +265,7 @@ class MemGuardRuntime:
         self._expire_human()
         actions = self.engine.step(
             s["memory"]["avail_mb"], s["swap"]["used_mb"], eff["ram_floor_gb"], self.cfg.enforce,
-            self.collect_trees, self.collect_jvm,
+            self.collect_trees, self.collect_jvm, s["swap"].get("total_mb"),
         )  # fmt: skip
         if any(a.op == "pause" and a.entry.real for a in actions) and not self.d._save_state():
             for a in actions:  # intent first; if it cannot be written, fail closed: pause nothing
@@ -290,6 +291,8 @@ class MemGuardRuntime:
             pid, start = a.tree.rustc
             res = self.signals.send(pid, start, signal.SIGTERM)
             log.info("memguard: SIGTERM rustc %d: %s", pid, res)
+            if res == "sent" and a.tree.cls == "scope":  # gone, changed or refused: not a memguard kill
+                self.d.jobs.note_abort(a.tree.key)  # the join: this job ends as killed_by_memguard
         elif a.op == "reap" and not a.would:
             for j in a.jvm:
                 self.signals.send(j.pid, j.start, signal.SIGTERM)
@@ -481,7 +484,7 @@ class MemGuardRuntime:
                 "ts": iso(ev["at"]), "op": "memguard", "principal": "system", "source": "memguard",
                 "project": ev.get("project"), "reason": text,
                 "result": "would" if ev["would"] else RESULTS.get(ev["kind"], "applied"),
-                "request": {"event": ev["kind"]},
+                "request": {"event": ev["kind"], **({"unit": ev["unit"]} if ev.get("unit") else {})},
             })  # fmt: skip
             if self.cfg.log_path:
                 try:

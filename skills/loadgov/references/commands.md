@@ -12,11 +12,14 @@ loadctl set --max-implementers 3 --until "07:00 Europe/Berlin" --reason "night r
 loadctl slot status [--json]
 loadctl jobs --stats [--json]                                 # what finished jobs used: own, docker and host CPU, peak memory
 loadctl log -n 20                                        # audit lines
+loadctl workflow validate .github/workflows/ci.yml       # load a GitHub/Forgejo-compatible workflow; refusals name file:line:col
+loadctl workflow run .github/workflows/ci.yml [--job J] [--event push] [--key KEY] [--dry-run]   # each job = one governed `loadctl run` in its lane
+loadctl runs                                             # recent workflow runs; `loadctl runs show latest --job J --log`, `--json`
 ```
 
 Limits: `--profile`, `--max-cores`, `--target-cpu`, `--load-max`, `--max-impl`, `--max-reviewers`, `--max-light`, `--ram-floor-gb`; timing `--ttl 90s|15m|2h` or `--until 'HH:MM Zone'`; `--reason` is required.
 
-MCP equivalents: `load_get_status`, `load_explain` (status and limits), `load_wait_headroom` (wait), `load_set_limits` (set). `loadctl run` has no MCP tool.
+MCP equivalents: `load_get_status`, `load_get_fleet` (`loadctl fleet status`, read-only), `load_explain` (status and limits), `load_wait_headroom` (wait), `load_set_limits` (set). `loadctl run` has no MCP tool.
 
 Exit codes: `0` ok, `2` usage, `3` daemon not reachable, `4` refused or owner denied, `5` other daemon error. `loadctl wait`: `1` = `HEADROOM_TIMEOUT`.
 

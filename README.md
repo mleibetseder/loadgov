@@ -25,6 +25,8 @@ See [AGENTS.md](AGENTS.md) for the rules that apply when changing this repo.
 
 Setting it up by hand, step by step with a check after each step: [docs/howto-setup.md](docs/howto-setup.md).
 A project that adopts the light lane or the image train: [docs/adopting.md](docs/adopting.md).
+Checks and pipelines as GitHub/Forgejo-Actions-compatible workflow files, run through the lanes with
+`loadctl workflow run`: [docs/workflows.md](docs/workflows.md).
 
 ## Install the Home Assistant integration
 
@@ -55,6 +57,8 @@ client shims in `compat/`, and Home Assistant (the integration's options and `se
 
 | What | Where | Example |
 |---|---|---|
+| The host id (names this host in status, audit lines and alerts; default: the hostname reduced to `a-z 0-9 -`, kept in `state.json`; restart to change) | TOML `[host] id` | `id = "build-a"` |
+| The other hosts of the fleet (read-only view, `loadctl fleet status`: `id`, `url`, the *name* of the token variable in `tokens.env`, `monitor` or `govern`) and this host's mode | TOML `[[fleet]]`, `[host] mode` | `url = "http://192.0.2.20:7420"` |
 | Address the REST surface listens on (required when REST is on; never `0.0.0.0` or loopback) | TOML `[rest] bind` | `bind = "192.0.2.10"` |
 | REST port, allowed source addresses | TOML `[rest] port`, `allow` | `allow = ["192.0.2.20"]` |
 | REST bearer token | `tokens.env` `LOADGOV_REST_TOKEN`; HA secrets `loadgov_token`, `loadgov_auth_header` | `LOADGOV_REST_TOKEN=<32 random bytes>` |
@@ -94,7 +98,7 @@ client shims in `compat/`, and Home Assistant (the integration's options and `se
 | `ha/` | Home Assistant package, automations and dashboard drafts, and the integration's tests |
 | `skills/loadgov/` | an agent skill that explains `loadctl` and the MCP tools to coding agents |
 | `tools/` | `shadow_compare.py` (observe-mode comparison), `backstop_sizing.py` |
-| `docs/` | deployment guide, adoption guide for projects, protocol reference, MCP server, decisions |
+| `docs/` | deployment guide, adoption guide for projects, workflows, protocol reference, MCP server, decisions |
 
 ## License
 

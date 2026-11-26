@@ -6,8 +6,11 @@ CPUAccounting=yes
 MemoryAccounting=yes
 # Balanced profile (max_cores 3.5). A dead daemon or a daemon-reload still leaves this cap in place.
 CPUQuota=350%
-# Memory backstop: the daemon applies these from loadgov.toml [backstop] when enabled; the static lines
-# below are the same limit surviving a dead daemon. Uncomment only with values from tools/backstop_sizing.py, and
-# remove both again on rollback (then `systemctl daemon-reload`).
+# Memory backstop: the daemon applies these from loadgov.toml [backstop] when enabled, as runtime properties
+# (`systemctl set-property --runtime build-work.slice MemoryMax=… MemorySwapMax=…`). It does not write the cgroup
+# file alone: systemd rewrites memory.max and memory.swap.max of this slice from its unit settings whenever it
+# re-realizes the slice (e.g. when a scope with resource properties starts below it), and a value it does not
+# know becomes `max` again. The static lines below are the same limit surviving a dead daemon. Uncomment only
+# with values from tools/backstop_sizing.py, and remove both again on rollback (then `systemctl daemon-reload`).
 #MemoryMax=12G
 #MemorySwapMax=2G

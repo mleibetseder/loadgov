@@ -30,7 +30,7 @@ nice -n 10 packaging/install.sh --no-start        # /opt/loadgov venv, /usr/loca
 package from the checkout (even at an unchanged version); to check, `grep` a recent change in
 `/opt/loadgov/.venv/lib/python*/site-packages/loadgov`. It installs the daemon into `/opt/loadgov/.venv`
 (pinned interpreter, not editable), links `loadctl`, installs `loadgovd.service` and `build-work.slice`, installs and enables `loadgov-image-runner.timer` (with its service; it starts
-the runner of the image train every 10 minutes and does nothing while the image queue is empty, see `docs/protocol.md` "The image train"), and
+the runner of the image train every 10 minutes and does nothing while the image queue is empty, see `docs/protocol.md` "The image train"; the night window, its time zone and the beta interval are the `[image]` values, which the owner can override at run time with `loadctl set --image-window ... --owner --reason ...` and clear with `--image-clear`; the override lives in `state.json` and survives a restart and a reload), and
 writes one `build-work-<project>.slice` for every project named in `/etc/loadgov/loadgov.toml`
 (`[projects.*]` and `[memguard.projects.*]`) and for every `--project NAME` you pass. Slices are generated
 because systemd cannot template slice units. If a `site/loadgov.toml` exists in the checkout and
@@ -59,6 +59,12 @@ documented, and a missing file means the built-in defaults (all enforce flags of
   `alert_log_paths` and `[memguard] log_path`, each a new file (never a file another tool still writes);
 - optional site rules: `[memguard.projects.<name>]`, `[memguard] deny_containers`, `[principal]`,
   `[compat] mirror_cgroups`, `[slots] compile_lock`.
+
+Compile memory admission (`[compile] memory_admission = true`, default off): a compile waits for
+`expected peak + the memory guard's low floor` of free RAM instead of starting into a full host and being
+killed (at most `max_memory_wait_s`, default 900 s, then it starts anyway). It learns the peak per crate from finished `loadctl run --kind compile --label <crate>` jobs, so
+turn it on after the host has built for a while (until then every crate counts `default_peak_mb`); the
+compile slot stays 1 and the guard floors do not change. See `docs/protocol.md` (Slots).
 
 Defaults to know before you rely on them: the `[principal]` deny lists start empty (only `build-work*` cgroups are
 refused an owner claim, so list your own dispatchers and loops), and with `LOADGOV_HEAVY_CRATES` unset the
@@ -151,6 +157,55 @@ Order, each with a day of watching and its rollback (set the flag back to `false
    that is a legitimate long runner.
 6. **`[backstop]`** (optional, after at least seven days of history): a hard `memory.max` under
    `build-work.slice`, sized from the history with `loadctl history --all --csv | python3 tools/backstop_sizing.py -`.
+   The daemon applies it with `systemctl set-property --runtime build-work.slice MemoryMax=… MemorySwapMax=…`
+   (and starts the slice first when it is inactive after boot), because systemd overwrites a value written only
+   to the cgroup file whenever it re-realizes the slice, for example when a light-lane scope with resource
+   properties starts below it. Check after the restart: `loadctl status` shows `backstop … applied`, `systemctl
+   show build-work.slice -p MemoryMax -p MemorySwapMax` shows the configured sizes and `loadctl status --json`
+   has `backstop.via` `systemd` (`file` means the systemctl call failed; the note says why). When usage is
+   already at or above `memory_max_mb`, the limit starts as a cap at usage + `cap_margin_mb` (default 512) and
+   steps down to the target as usage falls (one `backstop_cap` warning). Rollback as above; the daemon also
+   lifts the runtime properties (`MemoryMax=infinity MemorySwapMax=infinity`).
+
+   **Per-project caps** (optional, off by default): the build-work limit alone lets one runaway project fill
+   build-work.slice, and the kernel then OOM-kills other projects' jobs too. `[backstop] project_memory_max_mb`
+   confines each project to its own `build-work-<project>.slice` (`MemoryMax`, with `MemoryHigh` at
+   `project_memory_high_pct`, default 90 %, so it is throttled first); `[projects.<name>] memory_max_mb`
+   overrides it per project, 0 = no cap. Size it from the per-project peaks in the history and keep it at
+   least 1024 and at most `memory_max_mb`. Check: `loadctl status` shows a `backstop projects:` line, `systemctl
+   show build-work-<project>.slice -p MemoryMax -p MemoryHigh` the sizes. A nested name (`a-b`) is also under
+   its parent's (`a`) cap. Removing the keys (or the flag) lifts the caps with `MemoryMax=infinity
+   MemoryHigh=infinity`.
+
+   **Leaked tmpfs memory** (read-only, also with the flag off): files a job writes to a tmpfs such as `/tmp`
+   stay charged to its slice after it ends, and a job killed by SIGKILL never runs its cleanup. The status shows
+   the `shmem` share of build-work.slice and of each project slice, a `backstop_leak` warning names a slice
+   that holds more than `leak_alert_mb` (1024) of shmem with no process for `leak_alert_min` (5) minutes (page
+   cache, `file_mb`, is reclaimable and does not count), and the leftover scan names big tmpfs directories
+   with the jobs that likely wrote them (`backstop.leftovers`, the `job_end` audit line). The scan is bounded
+   (a job end at most 8 directories and 2000 entries, a tick at most 64 and 20000, 256 top-level entries
+   per mount per step) and resumes on the next tick. The daemon never deletes them: check the named directory and remove it as its
+   owner.
+
+7. **`[ui]`, the per-host web UI** (optional; Queue, Runs, a run's jobs and live log). Read-only, no token, its own
+   listener: protect it with a reverse proxy that does the sign-in, on the LAN only.
+   1. Build the app (the build output is never committed): see `ui/README.md`.
+   2. `sudo packaging/install.sh` copies a build found under `ui/dist/*/browser` to `/opt/loadgov/ui`; or copy
+      the build there yourself (root-owned, `index.html` at the top), or point `[ui] dir` at it.
+   3. In `/etc/loadgov/loadgov.toml` set `[ui] enabled = true`, `bind` (the host's LAN address, as for `[rest]`),
+      `allow = ["<the proxy's address>"]` (required; never a whole network you do not trust) and, optionally,
+      `tempo_url` for the "Fleet view: in tempo" link. `loadgovd --check-config` warns when no build is installed.
+      `[ui]` is read at start: `systemctl restart loadgovd`.
+   4. Configure the proxy to require sign-in and to forward everything (`/` and `/api/`) to `http://<bind>:<port>`
+      (default port 7421), with the app at the root of its host name. Do not expose the port itself beyond the
+      proxy. The daemon trusts the proxy's address and nothing else (`docs/protocol.md` "Web UI": audit-grade, not
+      a security boundary); use `https://` at the proxy.
+      The proxy is the only client, so it may hold `max_connections // 2` connections at once (8 of the default 16);
+      the app's first page load fetches many files at once, so raise `[ui] rate_per_s` and `max_connections`
+      if assets come back `429` or are dropped (ILM-39 sizes the burst).
+   5. Check: `loadctl status` shows no `warn  ui` line, `curl -s http://<bind>:7421/api/config` from the proxy
+      host returns the host id, and the same request from any other address returns `403`.
+   Rollback: `enabled = false` and restart.
 
 ## 5. Panic and rollback
 
@@ -165,3 +220,79 @@ loadgovd --recover --force                      # only with the daemon stopped: 
 client scopes are untouched.
 
 Downgrading to a daemon older than the queue view: the new `key` and `job_kind` fields in `state.json` are unknown to it, so it drops the saved holder and job bookkeeping on start (client locks stay held by their clients).
+
+Downgrading to a daemon older than the job endings (ILM-33): the saved running jobs carry the new `oom0` and `oom` fields, which the older daemon cannot load, so it drops them on start (their scopes keep running; the slot rule frees what they held).
+
+## REST clients: tokens and scopes
+
+Every REST caller has its own token and a scope. Home Assistant keeps the single `LOADGOV_REST_TOKEN` line: it is
+client `default`, scope `owner`, and nothing changes for it. A service that only reads gets a named entry with
+`scope=read`: a read token can call `GET` endpoints only, and every write path answers `403` `read_only`.
+
+**Create a read token for a client** (neutral name `fleet`). Generate the token and keep it out of git and chat:
+
+```bash
+python3 -c 'import secrets; print(secrets.token_urlsafe(32))'
+```
+
+Add one line with that token to `/etc/loadgov/tokens.env` (mode 0600, owner root), next to the existing ones:
+
+```
+LOADGOV_REST_CLIENT=fleet <the-new-token> scope=read
+```
+
+Names are unique and `[a-z0-9-]{1,32}` (`default` belongs to the single-token line); a token is at least 43
+characters and belongs to one client. Then reload the daemon (`systemctl reload loadgovd`, SIGHUP): it re-reads the
+file, and a bad file is refused and logged while the working tokens stay. Check with the client's token:
+`GET /v1/runs?limit=1` answers `200` and `POST /v1/set` answers `403` `read_only`. Give the token to the client
+through its own secret store.
+
+**Rotate it.** Generate a new token and add it as a second entry (`fleet-2`), reload, switch the client over, then
+delete the old line and reload again: there is no gap. (Replacing the token in the one line works too, but the old
+token stops at the reload, before the client has the new one.) The audit log's `client` field shows which names
+still call.
+
+**Remove a client** by deleting its line and reloading. A change of `scope` takes effect the same way.
+
+## Multi-host readiness
+
+loadgov runs one `loadgovd` per host, and each daemon decides only for its own host: its limits, slots, memory
+guard and alerts never look at another machine. Every host has an id (`[host] id`, default the hostname; see
+the README "Configure for your site"), and status, audit lines and alerts carry it. Adding a host is
+configuration: install the package there and set its own `[host] id`, REST and `[ha]` options. The fleet view that collects
+every host is read-only (docs/protocol.md, Fleet); see "Add a host to the fleet" below.
+
+## Add a host to the fleet
+
+The fleet view shows this host and every host listed under `[[fleet]]`; it only reads, each host's own `loadgovd`
+decides for that host (docs/protocol.md, Fleet). Adding a host is configuration, no code change. The addresses
+below are documentation addresses.
+
+1. **Install loadgov on the new host** (sections 1 to 3 above). It runs in observe mode until you turn enforcement
+   on.
+2. **Set its `[host]` table** in `/etc/loadgov/loadgov.toml`: `id = "build-b"` (the id the viewers will use) and
+   `mode = "govern"` for a host whose own daemon enforces, or `"monitor"` for one that is only watched (every
+   enforce flag is forced off). Restart `loadgovd` for a new id.
+3. **Enable its REST surface with a token** (`[rest] enabled = true`, `bind = "192.0.2.20"`, and `allow` containing
+   the viewing host's address), and put a new `LOADGOV_REST_TOKEN` in its `/etc/loadgov/tokens.env` (mode 0600).
+4. **Add it on the viewing host(s):** in the viewer's `loadgov.toml`
+
+   ```toml
+   [[fleet]]
+   id = "build-b"
+   url = "http://192.0.2.20:7420"
+   token_env = "LOADGOV_TOKEN_BUILD_B"
+   mode = "govern"
+   ```
+
+   and, in the viewer's `/etc/loadgov/tokens.env`, `LOADGOV_TOKEN_BUILD_B=<the new host's token>`. The token is never
+   in the TOML. Check with `loadgovd --check-config`, then reload (`systemctl reload loadgovd` or SIGHUP; `[[fleet]]`
+   is live on reload).
+5. **Verify:** `loadctl fleet status` lists the host with its level, load per core, slots and image queue, and `ok`
+   with an age. `DOWN` names the reason (`timeout`, `connection refused`, `HTTP 401` for a wrong token or a source
+   address that is not in `allow`); `id mismatch` means the host reports a different `[host] id` than the registry `id`.
+
+REST is plain HTTP with a bearer token: use `https://` behind a reverse proxy if the path is not trusted.
+
+A future infrastructure role `loadgov` is meant to do steps 1 to 3 and the viewer entry from one inventory. It does
+not exist yet; until then follow the steps above.

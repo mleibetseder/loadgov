@@ -1065,3 +1065,270 @@ def test_status_shows_light_image_and_job_lines_with_the_same_labels(fake_host, 
     # 14 h before the window: too far away to be worth a line
     st["at"] = stamp(ts("2025-11-10 10:00"))
     assert not any(x.startswith("  image train") for x in loadctl.format_status(st).splitlines())
+
+
+# ---- runtime settings: the owner's override of window, timezone and beta interval (ILM-32) --------
+
+
+def setimg(d, pid=OWNER, **kw):
+    kw.setdefault("owner", True)
+    kw.setdefault("reason", "shift the night")
+    return call(d, "set", pid, **kw)
+
+
+def settings(d):
+    st = d.image_status()
+    return {k: st[k] for k in ("window", "timezone", "beta_interval_h", "source")}
+
+
+def saved_override(tmp_path):
+    return json.load(open(tmp_path / "state" / "state.json"))["image"]["override"]
+
+
+def test_owner_sets_the_image_window_and_the_status_shows_it(d):
+    assert settings(d) == {
+        "window": "00:00-06:00",
+        "timezone": "UTC",
+        "beta_interval_h": 48,
+        "source": "config",
+    }
+    r = setimg(d, image_window="22:00-04:00", image_timezone="America/New_York", image_beta_interval_h=24)
+    assert r["ok"] and r["cleared"] is False
+    assert r["before"]["source"] == "config" and r["after"]["window"] == "22:00-04:00"
+    assert settings(d) == {"window": "22:00-04:00", "timezone": "America/New_York", "beta_interval_h": 24,
+                           "source": "override"}  # fmt: skip
+    assert d.config.image.window == "00:00-06:00"  # the config default underneath is untouched
+
+
+def test_a_partial_set_keeps_the_other_override_values(d):
+    setimg(d, image_window="22:00-04:00")
+    setimg(d, image_beta_interval_h=0)
+    assert settings(d) == {
+        "window": "22:00-04:00",
+        "timezone": "UTC",
+        "beta_interval_h": 0,
+        "source": "override",
+    }
+    assert d.image.override == {"window": "22:00-04:00", "beta_interval_h": 0}
+
+
+def test_an_agent_is_refused_and_audited(d):
+    for kw in ({"pid": AGENT, "owner": True}, {"pid": OWNER, "owner": False}, {"pid": AGENT, "owner": False}):
+        assert setimg(d, image_window="22:00-04:00", **kw)["error"] == "owner_denied"
+    assert settings(d)["source"] == "config" and d.image.override == {}
+    lines = [x for x in audit(d) if x["op"] == "image_settings"]
+    assert [(x["principal"], x["result"]) for x in lines] == [("agent", "refused")] * 3
+    assert call(d, "set", AGENT, image_clear=True, reason="x")["error"] == "owner_denied"  # no claim at all
+
+
+@pytest.mark.parametrize(
+    "kw, text",
+    [
+        ({"image_window": "6:00-7:00"}, "HH:MM-HH:MM"), ({"image_window": "24:00-02:00"}, "HH:MM-HH:MM"),
+        ({"image_window": "00:60-02:00"}, "HH:MM-HH:MM"), ({"image_window": "night"}, "HH:MM-HH:MM"),
+        ({"image_window": "03:00-03:00"}, "different start and end"),
+        ({"image_timezone": "Mars/Base"}, "unknown IANA time zone"),
+        ({"image_timezone": "../etc/passwd"}, "unknown"), ({"image_timezone": ""}, "unknown"),
+        ({"image_beta_interval_h": -1}, "0 to 336"), ({"image_beta_interval_h": 337}, "0 to 336"),
+    ],
+)  # fmt: skip
+def test_a_bad_value_is_refused_with_a_clear_message(d, kw, text):
+    r = setimg(d, **kw)
+    assert r["ok"] is False and r["error"] == "invalid_args" and text in r["message"]
+    assert d.image.override == {} and not os.path.exists(d.audit.path)  # nothing changed, nothing audited
+
+
+@pytest.mark.parametrize(
+    "kw",
+    [{"image_window": 600}, {"image_timezone": 1}, {"image_beta_interval_h": 1.5},
+     {"image_beta_interval_h": "48"}, {"image_beta_interval_h": True}, {"image_clear": "yes"}],
+)  # fmt: skip
+def test_a_value_of_the_wrong_type_is_a_bad_request(d, kw):
+    assert setimg(d, **kw)["error"] == "bad_request" and d.image.override == {}
+
+
+def test_a_reason_is_required_and_image_settings_do_not_mix_with_limits(d):
+    assert setimg(d, image_window="22:00-04:00", reason=" ")["error"] == "invalid_args"
+    assert setimg(d, image_window="22:00-04:00", image_clear=True)["error"] == "invalid_args"
+    assert setimg(d, image_clear=False)["error"] == "invalid_args"  # nothing to set
+    r = setimg(d, image_window="22:00-04:00", max_cores=2)
+    assert r["error"] == "invalid_args" and "cannot be combined" in r["message"]
+    assert d.image.override == {}
+
+
+def test_midnight_crossing_window_and_the_boundaries_are_accepted(d, clock):
+    assert setimg(d, image_window="23:30-00:15", image_beta_interval_h=336)["ok"]
+    clock.t = ts("2025-11-11 23:45")
+    assert d.image_status()["in_window"] is True
+    clock.t = ts("2025-11-11 00:20")
+    assert d.image_status()["in_window"] is False
+
+
+def test_clear_restores_the_config_values_and_is_audited(d):
+    setimg(d, image_window="22:00-04:00", image_beta_interval_h=12)
+    r = setimg(d, image_clear=True, reason="back to the rule in the file")
+    assert r["ok"] and r["cleared"] is True and r["after"]["source"] == "config"
+    assert settings(d) == {
+        "window": "00:00-06:00",
+        "timezone": "UTC",
+        "beta_interval_h": 48,
+        "source": "config",
+    }
+    assert d.image.override == {}
+    lines = [x for x in audit(d) if x["op"] == "image_settings"]
+    assert [x["result"] for x in lines] == ["accepted", "cleared"]
+    assert lines[1]["before"]["window"] == "22:00-04:00" and lines[1]["after"]["window"] == "00:00-06:00"
+    assert setimg(d, image_clear=True)["ok"]  # clearing nothing is harmless
+
+
+def test_every_change_is_audited_with_before_after_principal_and_reason(d):
+    setimg(d, image_window="22:00-04:00", reason="owner moved the night")
+    line = [x for x in audit(d) if x["op"] == "image_settings"][-1]
+    assert (line["principal"], line["result"], line["reason"]) == (
+        "owner",
+        "accepted",
+        "owner moved the night",
+    )
+    assert line["before"] == {
+        "window": "00:00-06:00",
+        "timezone": "UTC",
+        "beta_interval_h": 48,
+        "source": "config",
+    }
+    assert line["after"] == {
+        "window": "22:00-04:00",
+        "timezone": "UTC",
+        "beta_interval_h": 48,
+        "source": "override",
+    }
+    assert line["pid"] == OWNER and line["request"] == {"owner": True, "image_window": "22:00-04:00"}
+
+
+def test_the_override_survives_a_restart(tmp_path, proc, clock):
+    d = new_daemon(tmp_path, proc, clock)
+    setimg(d, image_window="22:00-04:00", image_timezone="America/New_York", image_beta_interval_h=24)
+    assert saved_override(tmp_path) == {"window": "22:00-04:00", "timezone": "America/New_York",
+                                        "beta_interval_h": 24}  # fmt: skip
+    d2 = new_daemon(tmp_path, proc, clock)
+    assert settings(d2) == {"window": "22:00-04:00", "timezone": "America/New_York", "beta_interval_h": 24,
+                            "source": "override"}  # fmt: skip
+    setimg(d2, image_clear=True)
+    assert settings(new_daemon(tmp_path, proc, clock))["source"] == "config"
+    assert saved_override(tmp_path) == {}
+
+
+def test_an_unreadable_saved_override_falls_back_to_the_config(tmp_path, proc, clock):
+    d = new_daemon(tmp_path, proc, clock)
+    setimg(d, image_window="22:00-04:00")
+    p = tmp_path / "state" / "state.json"
+    raw = json.load(open(p))
+    raw["image"]["override"] = {"window": "99:99-00:00"}
+    p.write_text(json.dumps(raw))
+    assert settings(new_daemon(tmp_path, proc, clock))["source"] == "config"
+
+
+def test_a_reload_keeps_the_override_and_updates_the_default_underneath(tmp_path, proc, clock):
+    cfg_file = tmp_path / "loadgov.toml"
+    cfg_file.write_text('[image]\nwindow = "00:00-06:00"\nbeta_interval_h = 48\n')
+    d = new_daemon(tmp_path, proc, clock)
+    d.config_path = str(cfg_file)
+    setimg(d, image_window="22:00-04:00")
+    cfg_file.write_text('[image]\nwindow = "12:00-13:00"\nbeta_interval_h = 72\nmax_per_night = 2\n')
+    d.reload_config()
+    st = d.image_status()
+    assert (st["window"], st["source"], st["max_per_night"]) == ("22:00-04:00", "override", 2)  # window kept
+    assert st["beta_interval_h"] == 72  # a field the override does not name follows the new default
+    assert d.config.image.window == "12:00-13:00"
+    setimg(d, image_clear=True)
+    assert settings(d) == {
+        "window": "12:00-13:00",
+        "timezone": "UTC",
+        "beta_interval_h": 72,
+        "source": "config",
+    }
+
+
+def test_planned_starts_are_recomputed_on_a_change(d, clock):
+    submit(d, label="a")
+    submit(d, label="b")
+    assert d.image_status()["queue"][0]["planned_start"] == stamp(NIGHT)  # inside 00:00-06:00
+    setimg(d, image_window="10:00-12:00")
+    st = d.image_status()
+    assert st["in_window"] is False and st["next_window_start"] == stamp(ts("2025-11-11 10:00"))
+    assert [r["planned_start"] for r in st["queue"]] == [
+        stamp(ts("2025-11-11 10:00")),
+        None,
+    ]  # b: no median yet
+    assert next_job(d) is None  # nothing is released outside the new window
+    setimg(d, image_clear=True)
+    assert d.image_status()["queue"][0]["planned_start"] == stamp(NIGHT)
+    assert next_job(d)["label"] == "a"
+
+
+def test_a_running_job_is_not_touched_by_a_change(d):
+    submit(d, label="a", channel="beta")
+    submit(d, label="b")
+    job = next_job(d)
+    run = d.image.get(job["id"])
+    before = (run.started, run.state, dict(d.image.last_beta))
+    setimg(d, image_window="10:00-12:00", image_beta_interval_h=0)
+    assert (run.started, run.state, dict(d.image.last_beta)) == before
+    row = d.image_status()["queue"][0]
+    assert (row["id"], row["state"], row["planned_start"]) == (job["id"], "running", stamp(NIGHT))
+    assert done(d, job)["ok"]  # the runner can still report it
+    assert next_job(d) is None  # b waits for the new window
+
+
+def test_the_beta_interval_override_applies_to_new_betas(d):
+    submit(d, channel="beta", label="b1")
+    done(d, next_job(d))
+    assert submit(d, channel="beta", label="b2")["error"] == "refused"  # 48 h from the config
+    setimg(d, image_beta_interval_h=0)
+    assert submit(d, channel="beta", label="b2")["ok"]
+
+
+def test_loadctl_set_sends_the_image_fields_and_prints_the_result(d, monkeypatch, capsys):
+    sent = []
+
+    def fake_request(_s, op, args=None, **_k):
+        sent.append((op, args))
+        return d.dispatch({"v": VERSION, "op": op, "args": args or {}}, OWNER)
+
+    monkeypatch.setattr(loadctl, "request", fake_request)
+    argv = ["set", "--owner", "--reason", "r", "--image-window", "22:00-04:00", "--image-timezone", "America/New_York",
+            "--image-beta-interval-h", "24"]  # fmt: skip
+    assert loadctl.main(argv) == 0
+    op, args = sent[-1]
+    assert op == "set" and args["image_window"] == "22:00-04:00" and args["image_beta_interval_h"] == 24
+    assert "max_cores" not in args and args["owner"] is True
+    assert (
+        "image set: window 22:00-04:00 America/New_York, beta interval 24 h (override)"
+        in capsys.readouterr().out
+    )
+    assert loadctl.main(["set", "--owner", "--reason", "r", "--image-clear"]) == 0
+    assert "image cleared" in capsys.readouterr().out and d.image.override == {}
+    assert (
+        loadctl.main(["set", "--owner", "--reason", "r", "--image-window", "03:00-03:00"])
+        == loadctl.EXIT_ERROR
+    )
+    err = capsys.readouterr().err
+    assert "different start and end" in err and "Traceback" not in err
+    with pytest.raises(SystemExit):  # argparse: a non-integer interval is a usage error, not a traceback
+        loadctl.main(["set", "--owner", "--reason", "r", "--image-beta-interval-h", "x"])
+
+
+def test_loadctl_set_from_an_agent_is_denied(d, monkeypatch, capsys):
+    monkeypatch.setattr(loadctl, "request", lambda _s, op, args=None, **_k:
+                        d.dispatch({"v": VERSION, "op": op, "args": args or {}}, AGENT))  # fmt: skip
+    argv = ["set", "--owner", "--reason", "r", "--image-window", "22:00-04:00"]
+    assert loadctl.main(argv) == loadctl.EXIT_DENIED
+    assert "owner denied" in capsys.readouterr().err and d.image.override == {}
+
+
+def test_status_line_and_queue_mark_an_override(d):
+    setimg(d, image_window="22:00-04:00")
+    im = d.image_status()
+    assert im["source"] == "override"
+    assert "(override)" in image.format_image_line({**im, "in_window": True}, None)
+    assert "(override)" in image.format_queue(im)
+    assert "(override)" not in image.format_queue({**im, "source": "config"})

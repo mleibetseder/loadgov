@@ -7,7 +7,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
 from .coordinator import LoadgovConfigEntry, LoadgovCoordinator
-from .entity import LoadgovEntity
+from .entity import LoadgovEntity, image_settings
 
 PARALLEL_UPDATES = 1
 
@@ -24,6 +24,7 @@ async def async_setup_entry(
             LoadgovButton(
                 c, "resume_paused_workers", "Host Resume Paused Workers", "/v1/unfreeze", "freeze", "mdi:play"
             ),
+            LoadgovImageResetButton(c),
         ]
     )
 
@@ -44,3 +45,20 @@ class LoadgovButton(LoadgovEntity, ButtonEntity):
     async def async_press(self) -> None:
         self.coordinator.require(self._feature)
         await self.coordinator.async_post(self._path)
+
+
+class LoadgovImageResetButton(LoadgovEntity, ButtonEntity):
+    """Drops the owner's run-time image window, timezone and beta interval (`image_clear`)."""
+
+    _domain = "button"
+    _attr_icon = "mdi:restore"
+
+    def __init__(self, coordinator: LoadgovCoordinator) -> None:
+        super().__init__(coordinator, "image_settings_reset", "Host Image Settings: Reset To Config")
+
+    @property
+    def available(self) -> bool:
+        return super().available and image_settings(self.coordinator.data) is not None
+
+    async def async_press(self) -> None:
+        await self.coordinator.async_set_image({"image_clear": True})

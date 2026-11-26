@@ -150,7 +150,7 @@ def write_memory_limit(fs: HostFS, cgroup: str, name: str, nbytes: int) -> None:
 
 def clear_memory_limit(fs: HostFS, cgroup: str, name: str) -> None:
     """The backstop rollback: write `max` back. The only place that ever writes `max` to a memory file."""
-    if name not in ("memory.max", "memory.swap.max"):
+    if name not in ("memory.max", "memory.swap.max", "memory.high"):
         raise ValueError(f"bad memory limit file {name!r}")
     _write_file(fs, cgroup, name, b"max\n")
 

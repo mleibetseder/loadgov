@@ -1,0 +1,34 @@
+# The parity workflow: two cheap light jobs that behave the same on a hosted runner and through
+# `loadctl workflow run`, used by `loadctl workflow parity` (docs/workflows.md, section 10).
+# It prints nothing site specific and needs no network.
+name: Parity check
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  check:
+    name: Check
+    runs-on: [self-hosted, loadgov-light]
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compute
+        id: compute
+        run: |
+          echo "sum=$((2 + 3))" >> "$GITHUB_OUTPUT"
+      - name: Tolerated failure
+        continue-on-error: true
+        run: exit 3
+      - name: Always runs
+        if: always()
+        run: echo "sum is ${{ steps.compute.outputs.sum }}"
+
+  report:
+    name: Report
+    needs: check
+    runs-on: [self-hosted, loadgov-light]
+    steps:
+      - name: Final
+        run: echo "done"

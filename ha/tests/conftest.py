@@ -17,6 +17,7 @@ BASE = f"http://{HOST}:{PORT}"
 STATUS: dict[str, Any] = {
     "v": 1,
     "at": "2026-11-10T10:00:00Z",
+    "host": {"id": "build-a", "cores": 8},
     "cpu": {"busy_pct": 42.5, "psi_some_avg60": 1.5},
     "memory": {"avail_mb": 9000, "psi_some_avg60": 0.5},
     "swap": {"used_mb": 120},

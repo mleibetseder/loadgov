@@ -75,11 +75,15 @@ class Tools:
             return []
 
     # -- tools ------------------------------------------------------------------------------------
+    def get_fleet(self) -> dict[str, Any]:
+        return self._ok("fleet")["fleet"]
+
     def get_status(self) -> dict[str, Any]:
         s = self._ok("status")["status"]
         lim = s.get("limits", {})
         out: dict[str, Any] = {
             "at": s.get("at"),
+            "host": {"id": (s.get("host") or {}).get("id"), "mode": (s.get("host") or {}).get("mode")},
             "level": s.get("level"),
             "levels": s.get("levels"),
             "cpu": s.get("cpu"),
@@ -277,9 +281,15 @@ def build_server(tools: Tools | None = None):
 
     @srv.tool()
     async def load_get_status() -> dict:
-        """Compact snapshot: cpu/psi/memory/swap/io, levels, effective limits, profile, ceiling,
+        """Compact snapshot: host id, cpu/psi/memory/swap/io, levels, effective limits, profile, ceiling,
         restriction, slots, jobs, capabilities."""
         return await asyncio.to_thread(t.get_status)
+
+    @srv.tool()
+    async def load_get_fleet() -> dict:
+        """Read-only fleet view: one entry per host (this host and the `[fleet]` registry) with mode, level,
+        load per core, light lane, heavy and compile slots, image queue, reachable, fetched_at, error."""
+        return await asyncio.to_thread(t.get_fleet)
 
     @srv.tool()
     async def load_set_limits(

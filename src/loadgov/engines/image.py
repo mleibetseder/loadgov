@@ -15,10 +15,10 @@ from __future__ import annotations
 import datetime as dt
 import os
 from collections.abc import Callable, Iterator
-from dataclasses import asdict, dataclass
-from zoneinfo import ZoneInfo
+from dataclasses import asdict, dataclass, replace
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from loadgov.config import ImageConfig
+from loadgov.config import _WINDOW_RE, ImageConfig
 from loadgov.engines.limits import iso
 from loadgov.host import proctree
 from loadgov.keys import key_url
@@ -28,6 +28,32 @@ MAX_QUEUE = 50  # queued plus running jobs; a submission beyond it is refused
 VIEW_MAX = 20  # entries of the status `image.queue`
 LOOKAHEAD_DAYS = 14  # window instances considered when planning
 KEEP_STARTS_S = 3 * 86400
+OVERRIDE_KEYS = ("window", "timezone", "beta_interval_h")  # the owner's runtime settings (ILM-32)
+INTERVAL_MAX_H = 336  # the runtime override takes 0 (no interval) to this; the config file keeps 1-720
+
+
+def check_override(raw: dict) -> dict:
+    """The validated subset of window / timezone / beta_interval_h; ValueError names the first bad value.
+    The window rules are the config's: HH:MM-HH:MM, may cross midnight, start and end differ."""
+    out = {}
+    if (w := raw.get("window")) is not None:
+        m = _WINDOW_RE.match(w) if isinstance(w, str) else None
+        if not m or m.group(1, 2) == m.group(3, 4):
+            raise ValueError("window: expected HH:MM-HH:MM with different start and end, e.g. 22:00-04:00")
+        out["window"] = w
+    if (tz := raw.get("timezone")) is not None:
+        try:
+            if not isinstance(tz, str) or not tz or tz.startswith(("/", ".")):
+                raise ValueError
+            ZoneInfo(tz)
+        except (ZoneInfoNotFoundError, ValueError, OSError):
+            raise ValueError(f"timezone: unknown IANA time zone {str(tz)[:60]!r}") from None
+        out["timezone"] = tz
+    if (n := raw.get("beta_interval_h")) is not None:
+        if isinstance(n, bool) or not isinstance(n, int) or not 0 <= n <= INTERVAL_MAX_H:
+            raise ValueError(f"beta_interval_h: expected an integer from 0 to {INTERVAL_MAX_H}")
+        out["beta_interval_h"] = n
+    return out
 
 
 # ---- window math ----------------------------------------------------------------------------------
@@ -108,6 +134,16 @@ class ImageTrain:
         self.next_id = 1
         self.last_beta: dict[str, float] = {}  # project -> start of its last beta job
         self.starts: list[float] = []  # starts inside a window (for max_per_night)
+        self.override: dict = {}  # owner's runtime values over the [image] config (OVERRIDE_KEYS subset)
+
+    def effective(self, cfg: ImageConfig) -> ImageConfig:
+        """The config the train runs on: the override on top of the `[image]` values (also after a reload)."""
+        return replace(cfg, **self.override) if self.override else cfg
+
+    def settings(self, cfg: ImageConfig) -> dict:
+        """window, timezone, beta_interval_h and where they come from, for `cfg` (the effective config)."""
+        return {"window": cfg.window, "timezone": cfg.timezone, "beta_interval_h": cfg.beta_interval_h,
+                "source": "override" if self.override else "config"}  # fmt: skip
 
     # ---- lookups ---------------------------------------------------------------------------------
 
@@ -291,6 +327,7 @@ class ImageTrain:
         in_win, _, _, nxt = window_state(cfg, now)
         return {
             "window": cfg.window, "timezone": cfg.timezone, "in_window": in_win,
+            "source": "override" if self.override else "config",
             "next_window_start": iso(nxt),
             "max_runtime_min": cfg.max_runtime_min, "beta_interval_h": cfg.beta_interval_h,
             "max_per_night": cfg.max_per_night, "env_allow": list(cfg.env_allow),
@@ -302,7 +339,8 @@ class ImageTrain:
 
     def to_state(self) -> dict:
         return {"next_id": self.next_id, "jobs": [asdict(j) for j in self.jobs],
-                "last_beta": self.last_beta, "starts": self.starts}  # fmt: skip
+                "last_beta": self.last_beta, "starts": self.starts,
+                "override": self.override}  # fmt: skip
 
     def restore(self, raw) -> None:
         if not isinstance(raw, dict):
@@ -318,6 +356,10 @@ class ImageTrain:
             self.starts = [float(t) for t in raw.get("starts") or []]
         except (TypeError, ValueError, AttributeError):
             pass
+        try:  # an unreadable override is dropped: the config values apply
+            self.override = check_override(raw.get("override") or {})
+        except (ValueError, AttributeError):
+            self.override = {}
 
 
 # ---- out-of-window detection (observe only) ------------------------------------------------------

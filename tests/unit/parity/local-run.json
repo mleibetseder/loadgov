@@ -1,0 +1,171 @@
+{
+  "schema": 1,
+  "id": "20261123T145551Z-c1a2db",
+  "workflow": {
+    "name": "Parity check",
+    "file": ".github/workflows/parity-check.yml",
+    "stem": "parity-check"
+  },
+  "event": "push",
+  "project": "web-app",
+  "key": null,
+  "host_id": "build-host",
+  "sha": "",
+  "ref": "",
+  "workspace": "/srv/web-app",
+  "created_at": "2026-11-23T14:55:51Z",
+  "notes": [
+    "host-only: actions/checkout is a no-op; the steps run in the existing local checkout"
+  ],
+  "finished_at": "2026-11-23T14:55:51Z",
+  "jobs": [
+    {
+      "schema": 1,
+      "run_id": "20261123T145551Z-c1a2db",
+      "order": 0,
+      "key": "check",
+      "id": "check",
+      "name": "Check",
+      "matrix": {},
+      "lane": "light",
+      "channel": null,
+      "runs_on": [
+        "self-hosted",
+        "loadgov-light"
+      ],
+      "label": "parity-check-check",
+      "needs": [],
+      "status": "success",
+      "reason": null,
+      "exit_code": 0,
+      "loadctl_exit": 0,
+      "started_at": "2026-11-23T14:55:51Z",
+      "finished_at": "2026-11-23T14:55:51Z",
+      "duration_s": 0.01,
+      "host_id": "build-host",
+      "continue_on_error": false,
+      "notes": [],
+      "steps": [
+        {
+          "index": 1,
+          "id": null,
+          "name": "actions/checkout@v4",
+          "kind": "uses",
+          "status": "success",
+          "exit_code": 0,
+          "started_at": "2026-11-23T14:55:51Z",
+          "finished_at": "2026-11-23T14:55:51Z",
+          "duration_s": 0.0,
+          "timed_out": false,
+          "continue_on_error": false,
+          "log": "logs/check-1.log",
+          "log_truncated": false,
+          "outputs": {},
+          "note": null
+        },
+        {
+          "index": 2,
+          "id": "compute",
+          "name": "Compute",
+          "kind": "run",
+          "status": "success",
+          "exit_code": 0,
+          "started_at": "2026-11-23T14:55:51Z",
+          "finished_at": "2026-11-23T14:55:51Z",
+          "duration_s": 0.003,
+          "timed_out": false,
+          "continue_on_error": false,
+          "log": "logs/check-2.log",
+          "log_truncated": false,
+          "outputs": {
+            "sum": "5"
+          },
+          "note": null
+        },
+        {
+          "index": 3,
+          "id": null,
+          "name": "Tolerated failure",
+          "kind": "run",
+          "status": "failure",
+          "exit_code": 3,
+          "started_at": "2026-11-23T14:55:51Z",
+          "finished_at": "2026-11-23T14:55:51Z",
+          "duration_s": 0.002,
+          "timed_out": false,
+          "continue_on_error": true,
+          "log": "logs/check-3.log",
+          "log_truncated": false,
+          "outputs": {},
+          "note": null
+        },
+        {
+          "index": 4,
+          "id": null,
+          "name": "Always runs",
+          "kind": "run",
+          "status": "success",
+          "exit_code": 0,
+          "started_at": "2026-11-23T14:55:51Z",
+          "finished_at": "2026-11-23T14:55:51Z",
+          "duration_s": 0.003,
+          "timed_out": false,
+          "continue_on_error": false,
+          "log": "logs/check-4.log",
+          "log_truncated": false,
+          "outputs": {},
+          "note": null
+        }
+      ]
+    },
+    {
+      "schema": 1,
+      "run_id": "20261123T145551Z-c1a2db",
+      "order": 1,
+      "key": "report",
+      "id": "report",
+      "name": "Report",
+      "matrix": {},
+      "lane": "light",
+      "channel": null,
+      "runs_on": [
+        "self-hosted",
+        "loadgov-light"
+      ],
+      "label": "parity-check-report",
+      "needs": [
+        "check"
+      ],
+      "status": "success",
+      "reason": null,
+      "exit_code": 0,
+      "loadctl_exit": 0,
+      "started_at": "2026-11-23T14:55:51Z",
+      "finished_at": "2026-11-23T14:55:51Z",
+      "duration_s": 0.002,
+      "host_id": "build-host",
+      "continue_on_error": false,
+      "notes": [],
+      "steps": [
+        {
+          "index": 1,
+          "id": null,
+          "name": "Final",
+          "kind": "run",
+          "status": "success",
+          "exit_code": 0,
+          "started_at": "2026-11-23T14:55:51Z",
+          "finished_at": "2026-11-23T14:55:51Z",
+          "duration_s": 0.001,
+          "timed_out": false,
+          "continue_on_error": false,
+          "log": "logs/report-1.log",
+          "log_truncated": false,
+          "outputs": {},
+          "note": null
+        }
+      ]
+    }
+  ],
+  "status": "success"
+}

@@ -75,6 +75,14 @@ class LoadgovCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if not self.supports(feature):
             raise HomeAssistantError(f"{REQUIRES_FREEZE} ({feature} is not supported by this daemon)")
 
+    async def async_set_image(self, body: dict[str, Any]) -> dict[str, Any]:
+        """Write run-time image settings. A daemon that does not report `image.source` has no such settings and
+        would reject the fields, so nothing is sent to it."""
+        image = (self.data or {}).get("image")
+        if not (isinstance(image, dict) and "source" in image):
+            raise HomeAssistantError("this loadgovd has no run-time image settings (it reports no image.source)")
+        return await self.async_post("/v1/set", body)
+
     # --- writes ---
 
     async def async_post(self, path: str, body: dict | None = None) -> dict[str, Any]:

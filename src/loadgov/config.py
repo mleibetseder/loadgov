@@ -229,6 +229,84 @@ def _parse_rest(raw) -> RestConfig:
 
 
 @dataclass(frozen=True)
+class UiConfig:
+    """The per-host web UI: a separate listener that serves the built app and read-only JSON."""
+
+    enabled: bool = False
+    bind: str | None = None  # required when enabled: the host's own LAN address
+    port: int = 7421
+    allow: tuple[str, ...] = ()  # source IPs or CIDRs (the sign-in proxy); required when enabled
+    dir: str = "/opt/loadgov/ui"  # the built app (index.html at the top)
+    tempo_url: str | None = None  # the "Fleet view: in tempo" link; hidden when unset
+    runs_dir: str | None = None  # workflow run records; None = the client default (see workflows)
+    rate_per_s: float = 20.0
+    max_connections: int = 16
+    allow_private_bridge: bool = False
+
+
+def _parse_ui(raw) -> UiConfig:
+    if not isinstance(raw, dict):
+        raise ConfigError("ui: expected a table")
+    for key in raw:
+        if key not in (
+            "enabled", "bind", "port", "allow", "dir", "tempo_url", "runs_dir", "rate_per_s",
+            "max_connections", "allow_private_bridge",
+        ):  # fmt: skip
+            raise ConfigError(f"ui: unknown key {key!r}")
+    d = UiConfig()
+    enabled = raw.get("enabled", d.enabled)
+    if not isinstance(enabled, bool):
+        raise ConfigError("ui.enabled: expected a boolean")
+    bridge = raw.get("allow_private_bridge", d.allow_private_bridge)
+    if not isinstance(bridge, bool):
+        raise ConfigError("ui.allow_private_bridge: expected a boolean")
+    bind = raw.get("bind")
+    if bind is None and enabled:
+        raise ConfigError("ui.bind: required when ui.enabled = true (the host's own LAN address)")
+    if bind is not None:
+        try:
+            bind = check_rest_bind(bind, bridge)
+        except ConfigError as e:
+            raise ConfigError(str(e).replace("rest.bind", "ui.bind", 1)) from None
+    port = raw.get("port", d.port)
+    if not _is_int(port) or not 1 <= port <= 65535:
+        raise ConfigError("ui.port: expected an integer 1..65535")
+    allow = raw.get("allow", [])
+    if not isinstance(allow, list) or not all(isinstance(a, str) for a in allow):
+        raise ConfigError("ui.allow: expected a list of IP addresses or CIDRs")
+    for a in allow:
+        try:
+            net = ipaddress.ip_network(a, strict=False)
+        except ValueError:
+            raise ConfigError(f"ui.allow: {a!r} is not an IP address or CIDR") from None
+        if net.prefixlen == 0:
+            raise ConfigError(f"ui.allow: {a!r} matches every address; list the proxy")
+    if enabled and not allow:
+        raise ConfigError("ui.allow: required when ui.enabled = true (the sign-in proxy's address)")
+    path = {}
+    for k in ("dir", "runs_dir"):
+        v = raw.get(k)
+        if v is not None and (not isinstance(v, str) or not os.path.isabs(v) or "\0" in v):
+            raise ConfigError(f"ui.{k}: expected an absolute path")
+        path[k] = v
+    tempo = raw.get("tempo_url")
+    if tempo is not None and (
+        not isinstance(tempo, str) or not re.fullmatch(r"https?://[^\s\"'<>]+", tempo) or len(tempo) > 256
+    ):
+        raise ConfigError("ui.tempo_url: expected an http:// or https:// URL without spaces (256 chars max)")
+    rate = raw.get("rate_per_s", d.rate_per_s)
+    if isinstance(rate, bool) or not isinstance(rate, int | float) or rate <= 0:
+        raise ConfigError("ui.rate_per_s: expected a number > 0")
+    maxc = raw.get("max_connections", d.max_connections)
+    if not _is_int(maxc) or not 1 <= maxc <= 64:
+        raise ConfigError("ui.max_connections: expected an integer 1..64")
+    return UiConfig(
+        enabled, bind, port, tuple(allow), path["dir"] or d.dir, tempo, path["runs_dir"],
+        float(rate), maxc, bridge,
+    )  # fmt: skip
+
+
+@dataclass(frozen=True)
 class HaConfig:
     enabled: bool = False  # push alerts to a Home Assistant webhook (the id lives in tokens.env)
     url: str = "http://homeassistant.local:8123"
@@ -421,6 +499,10 @@ class MemguardConfig:
     deny_containers: tuple[str, ...] = DENY_CONTAINERS  # fnmatch globs, never paused whatever a regex says
     legacy_snapshot: LegacySnapshot | None = None
     pause_marker: PauseMarker | None = None
+    # global rule: pressure when free swap is below this while avail < HIGH (0 = off; no rule without swap)
+    swap_free_min_mb: int = 1024
+    # global rule: pressure when avail - (fall since the last sample) * this < LOW (0 = off)
+    horizon_samples: int = 2
 
 
 @dataclass(frozen=True)
@@ -459,6 +541,19 @@ class BackstopConfig:
     enabled: bool = False  # the enforce flag: off = nothing is written to any cgroup file
     memory_max_mb: int | None = None
     memory_swap_max_mb: int | None = None
+    # usage at or above memory_max_mb: memory.max is held at usage + this, lowered each tick to the target
+    cap_margin_mb: int = 512
+    # per-project caps on build-work-<project>.slice: the default cap (0 = off) and MemoryHigh as % of a cap
+    project_memory_max_mb: int = 0
+    project_memory_high_pct: int = 90
+    # (project, [projects.<name>] memory_max_mb or None = the default) for every configured project
+    projects: tuple[tuple[str, int | None], ...] = ()
+    # leaked-memory alert: shmem (only; page cache is reclaimable) above this with no process in the
+    # slice's subtree for this long
+    leak_alert_mb: int = 1024
+    leak_alert_min: int = 5
+    # tmpfs directories at least this big are named, with the jobs whose run window matches their times
+    leftover_report_mb: int = 1024
 
 
 # [light]: hard limits of the light lane, applied by `loadctl run --kind light` to the scope it creates.
@@ -490,6 +585,40 @@ def _parse_light(raw) -> LightConfig:
             raise ConfigError(f"light.{name}: expected an integer from {lo} to {hi}")
         out[name] = v
     return LightConfig(**out)
+
+
+# [compile]: memory admission of the compile slot (docs/protocol.md "Compile memory admission").
+@dataclass(frozen=True)
+class CompileConfig:
+    memory_admission: bool = (
+        False  # a compile starts only when MemAvailable >= its expected peak + the guard floor
+    )
+    default_peak_mb: int = 1024  # expected peak of a crate without history and without project statistics
+    history: int = 20  # last N finished peaks per (project, crate) the percentile is taken over (1..50)
+    percentile: int = 90  # of those peaks; 100 = the maximum
+    max_memory_wait_s: int = 900  # a compile held back for memory this long is admitted anyway
+
+
+def _parse_compile(raw) -> CompileConfig:
+    d = CompileConfig()
+    names = [f.name for f in fields(CompileConfig)]
+    if not isinstance(raw, dict) or set(raw) - set(names):
+        raise ConfigError(f"compile: allowed keys are {', '.join(names)}")
+    adm = raw.get("memory_admission", d.memory_admission)
+    if not isinstance(adm, bool):
+        raise ConfigError("compile.memory_admission: expected a boolean")
+    out = {}
+    for name, lo, hi in (
+        ("default_peak_mb", 64, 262144),
+        ("history", 1, 50),
+        ("percentile", 50, 100),
+        ("max_memory_wait_s", 10, 86400),
+    ):
+        v = raw.get(name, getattr(d, name))
+        if not _is_int(v) or not lo <= v <= hi:
+            raise ConfigError(f"compile.{name}: expected an integer from {lo} to {hi}")
+        out[name] = v
+    return CompileConfig(adm, **out)
 
 
 # [image]: the image train (beta and release container builds run in a night window; docs/protocol.md).
@@ -547,6 +676,114 @@ class AuditConfig:
     keep: int = 5  # rotated files audit.jsonl.1 .. .keep
 
 
+HOST_ID_MAX = 63
+_HOST_ID_RE = re.compile(r"^[a-z0-9-]{1,63}$")
+FALLBACK_HOST_ID = "host"  # a hostname with no usable character
+
+
+def derive_host_id(hostname: str) -> str:
+    """The default host id: lowercase, every run of characters outside `[a-z0-9-]` becomes one `-`, no
+    leading or trailing `-`, at most 63 characters; `host` when nothing is left."""
+    text = re.sub(r"[^a-z0-9-]+", "-", hostname.lower()).strip("-")[:HOST_ID_MAX].strip("-")
+    return text or FALLBACK_HOST_ID
+
+
+def check_host_id(value) -> str:
+    if not isinstance(value, str) or not _HOST_ID_RE.match(value):
+        raise ConfigError("host.id: expected 1 to 63 characters of a-z 0-9 -")
+    return value
+
+
+HOST_MODES = ("govern", "monitor")
+
+
+@dataclass(frozen=True)
+class HostConfig:
+    id: str | None = None  # None = derived from the hostname (and then kept in state.json)
+    mode: str = "govern"  # monitor: the daemon forces every enforce flag off and only reports WOULD decisions
+
+
+def _parse_host(raw) -> HostConfig:
+    if not isinstance(raw, dict) or set(raw) - {"id", "mode"}:
+        raise ConfigError("host: expected a table with only the keys 'id' and 'mode'")
+    mode = raw.get("mode", "govern")
+    if mode not in HOST_MODES:
+        raise ConfigError(f"host.mode: expected one of {', '.join(HOST_MODES)}")
+    return HostConfig(check_host_id(raw["id"]) if "id" in raw else None, mode)
+
+
+FLEET_MAX = 64
+_ENV_VAR_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
+
+
+@dataclass(frozen=True)
+class FleetHost:
+    """One host of the fleet registry: where its REST surface is and how it is run (DEC-2)."""
+
+    id: str
+    url: str  # http(s)://host[:port] of that host's loadgov REST surface
+    token_env: str  # the variable in tokens.env that holds that host's bearer token (never the token)
+    mode: str = "monitor"  # monitor: only watched; govern: its own loadgovd decides for it
+
+
+def check_fleet_url(value) -> str:
+    if not isinstance(value, str):
+        raise ConfigError("fleet.url: expected a string")
+    try:
+        u = urlsplit(value)
+        port = u.port
+    except ValueError:
+        raise ConfigError("fleet.url: expected http(s)://host[:port]") from None
+    if (
+        u.scheme not in ("http", "https")
+        or not u.hostname
+        or u.username is not None
+        or u.password is not None
+        or u.path not in ("", "/")
+        or u.query
+        or u.fragment
+        or (port is not None and port < 1)
+    ):
+        raise ConfigError("fleet.url: expected http(s)://host[:port] without credentials or path")
+    return value.rstrip("/")
+
+
+def _parse_fleet(raw) -> tuple[FleetHost, ...]:
+    if not isinstance(raw, list) or len(raw) > FLEET_MAX:
+        raise ConfigError(f"fleet: expected a list of up to {FLEET_MAX} host tables")
+    out, seen = [], set()
+    for i, h in enumerate(raw):
+        if not isinstance(h, dict) or set(h) - {"id", "url", "token_env", "mode"}:
+            raise ConfigError(f"fleet[{i}]: expected a table with id, url, token_env and mode")
+        for k in ("id", "url", "token_env", "mode"):
+            if k not in h:
+                raise ConfigError(f"fleet[{i}].{k}: required")
+        try:
+            hid = check_host_id(h["id"])
+        except ConfigError:
+            raise ConfigError(f"fleet[{i}].id: expected 1 to 63 characters of a-z 0-9 -") from None
+        if hid in seen:
+            raise ConfigError(f"fleet[{i}].id: duplicate host id {hid!r}")
+        seen.add(hid)
+        if not isinstance(h["token_env"], str) or not _ENV_VAR_RE.match(h["token_env"]):
+            raise ConfigError(f"fleet[{i}].token_env: expected an environment variable name")
+        if h["mode"] not in HOST_MODES:
+            raise ConfigError(f"fleet[{i}].mode: expected one of {', '.join(HOST_MODES)}")
+        out.append(FleetHost(hid, check_fleet_url(h["url"]), h["token_env"], h["mode"]))
+    return tuple(out)
+
+
+def apply_host_mode(c: Config) -> Config:
+    """The config the engines run on: in monitor mode every enforce flag is off, whatever the file says."""
+    if c.host.mode != "monitor":
+        return c
+    return replace(
+        c, slots_enforce=False, governor_enforce=False, memguard=replace(c.memguard, enforce=False),
+        reaper=replace(c.reaper, enforce=False), backstop=replace(c.backstop, enabled=False),
+        strays=replace(c.strays, enforce=False),
+    )  # fmt: skip
+
+
 @dataclass(frozen=True)
 class Config:
     default_profile: str = "balanced"
@@ -567,7 +804,11 @@ class Config:
     audit: AuditConfig = field(default_factory=AuditConfig)
     light: LightConfig = field(default_factory=LightConfig)
     image: ImageConfig = field(default_factory=ImageConfig)
+    compile: CompileConfig = field(default_factory=CompileConfig)
     levels: LevelsConfig = field(default_factory=LevelsConfig)
+    host: HostConfig = field(default_factory=HostConfig)
+    fleet: tuple[FleetHost, ...] = ()  # other hosts to collect; empty = a fleet of one (this host)
+    ui: UiConfig = field(default_factory=UiConfig)
 
 
 def eval_nproc(value, nproc: int) -> float:
@@ -709,6 +950,8 @@ _MEMGUARD_KEYS = {
     "deny_containers",
     "legacy_snapshot",
     "pause_marker",
+    "swap_free_min_mb",
+    "horizon_samples",
 }
 _GUARD_KEYS = ("low_mb", "high_mb", "swap_mb", "resume_samples", "containers", "agent_cwd")
 
@@ -776,7 +1019,15 @@ def _parse_memguard(raw) -> MemguardConfig:
         if "/" in marker["file"] or marker["file"] in (".", ".."):
             raise ConfigError("memguard.pause_marker.file: expected a plain file name")
         marker = PauseMarker(**marker)
-    return MemguardConfig(enforce, float(gb), log_path, projects, tuple(deny), snap, marker)
+    swap_free = raw.get("swap_free_min_mb", MemguardConfig.swap_free_min_mb)
+    if not _is_int(swap_free) or not 0 <= swap_free <= 1048576:
+        raise ConfigError("memguard.swap_free_min_mb: expected an integer 0..1048576 (0 = off)")
+    horizon = raw.get("horizon_samples", MemguardConfig.horizon_samples)
+    if not _is_int(horizon) or not 0 <= horizon <= 12:
+        raise ConfigError("memguard.horizon_samples: expected an integer 0..12 (0 = off)")
+    return MemguardConfig(
+        enforce, float(gb), log_path, projects, tuple(deny), snap, marker, swap_free, horizon
+    )
 
 
 def _table_of_strings(where: str, raw, keys: tuple[str, ...]) -> dict:
@@ -815,8 +1066,12 @@ def _parse_reaper(raw) -> ReaperConfig:
     return ReaperConfig(raw.get("enforce", False))
 
 
-def _parse_backstop(raw) -> BackstopConfig:
-    keys = ("enabled", "memory_max_mb", "memory_swap_max_mb")
+PROJECT_CAP_MIN_MB = 1024  # a per-project cap below 1 GB would kill ordinary builds
+
+
+def _parse_backstop(raw, projects=None, guard_projects=None) -> BackstopConfig:
+    keys = ("enabled", "memory_max_mb", "memory_swap_max_mb", "cap_margin_mb", "project_memory_max_mb",
+            "project_memory_high_pct", "leak_alert_mb", "leak_alert_min", "leftover_report_mb")  # fmt: skip
     if not isinstance(raw, dict) or set(raw) - set(keys):
         raise ConfigError(f"backstop: allowed keys are {', '.join(keys)}")
     enabled = raw.get("enabled", False)
@@ -831,7 +1086,37 @@ def _parse_backstop(raw) -> BackstopConfig:
         raise ConfigError(
             "backstop.enabled needs both memory_max_mb and memory_swap_max_mb (no built-in values)"
         )
-    return BackstopConfig(enabled, mem, swap)
+    margin = raw.get("cap_margin_mb", BackstopConfig.cap_margin_mb)
+    if not _is_int(margin) or not 0 <= margin <= 65536:
+        raise ConfigError("backstop.cap_margin_mb: expected an integer 0..65536")
+    d = BackstopConfig()
+
+    def cap(where: str, value) -> int:
+        if not _is_int(value) or value < 0 or 0 < value < PROJECT_CAP_MIN_MB:
+            raise ConfigError(f"{where}: expected 0 (no cap) or an integer >= {PROJECT_CAP_MIN_MB}")
+        if value and mem is None:
+            raise ConfigError(f"{where}: a per-project cap needs backstop.memory_max_mb")
+        if value and value > mem:
+            raise ConfigError(f"{where}: expected at most backstop.memory_max_mb ({mem})")
+        return value
+
+    default_cap = cap("backstop.project_memory_max_mb", raw.get("project_memory_max_mb", 0))
+    overrides = {}
+    for name, body in (projects or {}).items():
+        if isinstance(body, dict) and "memory_max_mb" in body:
+            overrides[name] = cap(f"projects.{name}.memory_max_mb", body["memory_max_mb"])
+    names = sorted(set(projects or {}) | set(guard_projects or {}))
+    pct = raw.get("project_memory_high_pct", d.project_memory_high_pct)
+    if not _is_int(pct) or not 50 <= pct <= 100:
+        raise ConfigError("backstop.project_memory_high_pct: expected an integer 50..100")
+    vals = {}
+    for k, hi in (("leak_alert_mb", 1048576), ("leak_alert_min", 1440), ("leftover_report_mb", 1048576)):
+        vals[k] = raw.get(k, getattr(d, k))
+        if not _is_int(vals[k]) or not 1 <= vals[k] <= hi:
+            raise ConfigError(f"backstop.{k}: expected an integer 1..{hi}")
+    return BackstopConfig(
+        enabled, mem, swap, margin, default_cap, pct, tuple((n, overrides.get(n)) for n in names), **vals
+    )
 
 
 def _parse_strays(raw) -> StraysConfig:
@@ -884,6 +1169,7 @@ def parse_config(text: str) -> Config:
             "projects",
             "slots",
             "rest",
+            "ui",
             "ha",
             "compat",
             "governor",
@@ -896,7 +1182,10 @@ def parse_config(text: str) -> Config:
             "audit",
             "light",
             "image",
+            "compile",
             "levels",
+            "host",
+            "fleet",
         ):
             raise ConfigError(f"unknown key {key!r}")
     profiles = dict(BUILTIN_PROFILES)
@@ -928,12 +1217,18 @@ def parse_config(text: str) -> Config:
         _parse_rest(raw.get("rest", {})),
         _parse_ha(raw.get("ha", {})), _parse_compat(raw.get("compat", {})), governor.get("enforce", False),
         _parse_memguard(raw.get("memguard", {})), _parse_reaper(raw.get("reaper", {})),
-        _parse_backstop(raw.get("backstop", {})), _parse_principal(raw.get("principal", {})),
+        _parse_backstop(raw.get("backstop", {}), raw.get("projects", {}),
+                        (raw.get("memguard") or {}).get("projects")),
+        _parse_principal(raw.get("principal", {})),
         _parse_strays(raw.get("strays", {})), _parse_keys(raw.get("keys", {})),
         _parse_audit(raw.get("audit", {})),
         light=_parse_light(raw.get("light", {})),
         image=_parse_image(raw.get("image", {})),
+        compile=_parse_compile(raw.get("compile", {})),
         levels=_parse_levels(raw.get("levels", {})),
+        host=_parse_host(raw.get("host", {})),
+        fleet=_parse_fleet(raw.get("fleet", [])),
+        ui=_parse_ui(raw.get("ui", {})),
     )  # fmt: skip
 
 

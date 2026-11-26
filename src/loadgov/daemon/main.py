@@ -41,17 +41,21 @@ from loadgov.config import (
     KINDS,
     Config,
     ConfigError,
+    apply_host_mode,
     changed_keys,
+    derive_host_id,
     load_config,
     thresholds,
 )
 from loadgov.daemon import backstop_ops, image_ops, job_ops, memguard_ops, recover, slot_ops, stray_ops
 from loadgov.daemon.audit import AuditLog
 from loadgov.daemon.compat import render_env, write_env
+from loadgov.daemon.fleet import FleetCollector, build_view
 from loadgov.daemon.ha_push import HaPush
 from loadgov.daemon.principal import caller_info, owner_denial
 from loadgov.daemon.rest import DEFAULT_TOKENS_FILE, RestServer
 from loadgov.daemon.state import StateStore
+from loadgov.daemon.ui import UiServer
 from loadgov.engines import slots as slots_engine
 from loadgov.engines.governor import PRIMARY, Governor, event_line
 from loadgov.engines.headroom import decide, decide_light, decide_review, paused_reasons, profile_factor
@@ -59,6 +63,7 @@ from loadgov.engines.history import COLUMNS, SOCKET_MAX, History, row_for
 from loadgov.engines.image import VIEW_MAX, ImageTrain, find_builds, window_state
 from loadgov.engines.jobs import JobTable
 from loadgov.engines.limits import Limits, iso
+from loadgov.engines.memguard import thresholds as guard_thresholds
 from loadgov.engines.projects import ProjectMeter
 from loadgov.engines.slots import SlotManager
 from loadgov.engines.timers import parse_ttl, parse_until
@@ -166,20 +171,36 @@ class Daemon:
         clock=time.time,
         tokens_file: str = DEFAULT_TOKENS_FILE,
         rest_options: dict | None = None,  # test-only RestServer arguments
+        ui_options: dict | None = None,  # test-only UiServer arguments
         memguard_options: dict | None = None,  # test-only MemGuardRuntime arguments (fake signals, docker)
         backstop_options: dict | None = None,  # test-only BackstopRuntime arguments (target slice)
         stray_options: dict | None = None,  # test-only StrayRuntime arguments (fake signals)
         config_path: str | None = None,  # re-read on SIGHUP
+        hostname: str | None = None,  # test-only: the name the default host id is derived from
     ):
         self.fs = fs
         self.clock = clock
         config = config or Config()
+        self.raw_config = config  # as written; self.config is what the engines run on
+        config = apply_host_mode(config)
         self.config, self.config_path, self._reload = config, config_path, False
-        self.store, self.audit, self.env_file = (
-            StateStore(state_dir),
-            AuditLog(log_dir, config.audit.max_mb, config.audit.keep),
+        self.store = StateStore(state_dir)
+        saved_host = self.store.load_host_id()
+        # configured id, else the one saved by an earlier start, else derived from the hostname
+        self.host_id = config.host.id or saved_host or derive_host_id(hostname or socket.gethostname())
+        self.audit, self.env_file = (
+            AuditLog(log_dir, config.audit.max_mb, config.audit.keep, self.host_id),
             env_file,
         )
+        if self.store.rejected_host_id is not None:  # the next state save writes a valid id: audited once
+            self.audit.append({"ts": iso(clock()), "op": "host_id_invalid", "principal": "system",
+                               "source": "state", "before": self.store.rejected_host_id,
+                               "after": self.host_id,
+                               "reason": "the saved host id is not valid; ignored"})  # fmt: skip
+        if saved_host and saved_host != self.host_id:  # the next state save keeps the new id: audited once
+            self.audit.append({"ts": iso(clock()), "op": "host_id_changed", "principal": "system",
+                               "source": "config", "before": saved_host, "after": self.host_id,
+                               "reason": "host.id in the config differs from the saved id"})  # fmt: skip
         self.limits = Limits(
             config.profiles,
             self.store.load(config.default_profile, set(config.profiles)),
@@ -192,6 +213,10 @@ class Daemon:
         self.jobs = JobTable(fs, clock, pattern=self._project_containers)
         self.slots.docker_cpu = self.jobs.docker_cpu
         self.slots.expected_s = self.jobs.stats.expected_s
+        self.slots.compile_cfg = config.compile
+        self.slots.expected_peak = self.jobs.expected_peak_mb
+        self.slots.memory = self._memory_view
+        self.slots.work_running = self._work_running
         self.slots.url_template = self.jobs.url_template = config.keys.url
         self.projects = ProjectMeter(
             fs, lambda: self.jobs.jobs, self._waiting_projects, self._configured_projects, clock
@@ -200,20 +225,25 @@ class Daemon:
         self.runner = slot_ops.run_argv
         self.jobs.restore(self.store.load_jobs())
         self.jobs.stats.restore(self.store.load_job_stats())
+        self.jobs.endings.restore(self.store.load_job_endings())
+        self.jobs.peaks.restore(self.store.load_compile_peaks())
         self.image = ImageTrain(clock)
         self.image.restore(self.store.load_image())
         self.memguard = memguard_ops.MemGuardRuntime(self, **(memguard_options or {}))
         self.memguard.restore(self.store.load_memguard())  # paused work stays paused: re-adopt
+        # systemctl for the backstop: refused on an injected cgroup root (backstop_ops.trusted_runner)
         self.backstop = backstop_ops.BackstopRuntime(
             fs, config.backstop, clock, state_dir, self.emit_event, self.audit.append,
-            lambda: self.jobs.jobs, **(backstop_options or {}),
+            lambda: self.jobs.jobs, **{"runner": self.runner, **(backstop_options or {})},
         )  # fmt: skip
+        self.jobs.on_end = self.backstop.job_ended  # read-only tmpfs leftover scan at a job's end
         self.history = History(os.path.join(state_dir, "history.csv"), clock)
         self.strays = stray_ops.StrayRuntime(self, **(stray_options or {}))
         if self.slots.owner_hold_reason() and not self.limits.state.hold:
             self.limits.set_flag("hold", self.slots.owner_hold_reason())  # the flag follows the saved hold
         self._env_key: str | None = None
         self.sampler = Sampler(fs, config.compat.mirror_cgroups, config.headroom.psi_busy_gate_pct)
+        self.sampler.host_id, self.sampler.host_mode = self.host_id, config.host.mode
         self.sampler.disk_busy, self.sampler.disk_limit = config.levels.disk_busy, config.levels.disk_limit
         self.socket_path = socket_path
         self.run_dir = run_dir
@@ -223,8 +253,13 @@ class Daemon:
         self.started_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         self.status: dict | None = None
         self._stop = asyncio.Event()
-        self.rest = RestServer(self, config.rest, tokens_file, fs, **(rest_options or {}))
+        self.rest = RestServer(
+            self, config.rest, tokens_file, fs, **{"runs_dir": config.ui.runs_dir, **(rest_options or {})}
+        )
+        self.ui = UiServer(self, config.ui, **(ui_options or {}))
         self.watch, self.tee = Watch(clock), LegacyTee(clock)
+        self.watch.host = self.host_id
+        self.fleet = FleetCollector(lambda: self.config.fleet, lambda: self.host_id, tokens_file, clock=clock)
         self.watch.disk_busy, self.watch.disk_limit = config.levels.disk_busy, config.levels.disk_limit
         self.ha = HaPush(config.ha, tokens_file, clock=clock)
         self._watch_every = max(1, round(WATCH_EVERY_S / tick_s))
@@ -240,6 +275,7 @@ class Daemon:
         """Re-read the config file; on any error keep the running config. Restart-only settings keep their
         running value and are audited as `needs restart`."""
         self._reload = False
+        self.rest.reload_tokens()  # the tokens file is part of the reload; a bad one keeps the current tokens
         try:
             if not self.config_path or not os.path.exists(self.config_path):
                 raise ConfigError(f"config file {self.config_path!r} not found")  # never reload to defaults
@@ -248,17 +284,21 @@ class Daemon:
             self._audit_reload("reload refused", str(e))
             log.error("reload refused: %s", e)
             return
-        old = self.config
+        old = self.raw_config
         pinned = replace(
             new,
             default_profile=old.default_profile, profiles=old.profiles, compile_lock=old.compile_lock,
-            rest=old.rest, ha=old.ha,
+            rest=old.rest, ui=old.ui, ha=old.ha, host=replace(new.host, id=old.host.id),
             compat=replace(new.compat, mirror_cgroups=old.compat.mirror_cgroups),
             memguard=replace(new.memguard, projects=old.memguard.projects),
         )  # fmt: skip
         restart = [k for k in changed_keys(old, new) if k not in changed_keys(old, pinned)]
         changed = changed_keys(old, pinned)
         self._apply_config(pinned)
+        if old.host.mode != pinned.host.mode:  # a mode switch changes what the daemon may do: always audited
+            self.audit.append({"ts": iso(self.clock()), "op": "host_mode_changed", "principal": "system",
+                               "source": "reload", "before": old.host.mode, "after": pinned.host.mode,
+                               "reason": "[host] mode switched (monitor forces enforce off)"})  # fmt: skip
         if changed or not restart:  # audit first: the new config is live even if the step below fails
             self._audit_reload("reload", ", ".join(changed) or "no changes")
         if restart:
@@ -277,24 +317,52 @@ class Daemon:
         """Hand the new config to every engine that holds a part of it. Engines read their flags on use, so
         a flag that goes off stops new actions and the resume rule releases paused work (undo is always
         allowed); a backstop that goes off is rolled back by its next tick, as after a restart."""
+        self.raw_config, c = c, apply_host_mode(c)
         self.config = c
+        self.sampler.host_mode = c.host.mode
+        self.fleet.poke()
         self.audit.configure(c.audit.max_mb, c.audit.keep)
         self.slots.set_enforce(c.slots_enforce)
+        self.slots.compile_cfg = c.compile  # live: the next slot decision uses it
         self.slots.url_template = self.jobs.url_template = c.keys.url
         self.governor.enforce = c.governor_enforce
         self.sampler.psi_busy_gate_pct = c.headroom.psi_busy_gate_pct
         self.sampler.disk_busy = self.watch.disk_busy = c.levels.disk_busy
         self.sampler.disk_limit = self.watch.disk_limit = c.levels.disk_limit
-        self.backstop.cfg = c.backstop
+        self.backstop.configure(c.backstop)  # project caps are asserted again
         mg = self.memguard
         mg.cfg, mg.reaper_cfg = c.memguard, c.reaper
         mg.signals.enforce = mg.docker.enforce = c.memguard.enforce
         mg.reap_signals.enforce = c.reaper.enforce
         mg.engine.deny = tuple(c.memguard.deny_containers)
+        mg.engine.swap_free_min_mb = c.memguard.swap_free_min_mb
+        mg.engine.horizon_samples = c.memguard.horizon_samples
         st = self.strays
         st.cfg = st.detector.cfg = c.strays
         st.signals.enforce = c.strays.enforce
         st.detector.project_cwds = {n: g.agent_cwd for n, g in c.memguard.projects.items() if g.agent_cwd}
+
+    def _memory_view(self) -> tuple[int, int, int] | None:
+        """(MemAvailable, MemTotal, the memory guard's low floor) in MB from the last sample, for the
+        compile slot's memory admission; None before the first sample."""
+        m = (self.status or {}).get("memory")
+        if not m:
+            return None
+        return m["avail_mb"], m["total_mb"], guard_thresholds(self.limits.effective()["ram_floor_gb"])[0]
+
+    def _work_running(self, pid: int) -> bool:
+        """Build work other than the compile of `pid` and its own ancestry: a registered job but a light one,
+        or a held heavy slot (also a legacy holder), unless the waiter runs inside it (its gate or impl job:
+        the job whose scope holds the pid or an ancestor, the heavy holder that is an ancestor)."""
+        chain = self.slots.ancestry(pid)
+        for j in self.jobs.jobs.values():
+            if j.kind == "light" or j.pid in chain or any(self.slots._in_scope(c, j.cgroup) for c in chain):
+                continue
+            return True
+        heavy = self.slots.slots["heavy"]
+        if heavy.holder:
+            return self.slots._ancestor_holder(heavy.holder, [pid]) is None
+        return bool(heavy.legacy) and heavy.legacy.get("pid") not in chain
 
     def _waiting_projects(self) -> list[str]:
         return [w.project for sl in self.slots.slots.values() for w in sl.queue]
@@ -318,6 +386,7 @@ class Daemon:
         self._history_step(s)
         s["limits"] = self.limits_summary()
         s["rest"] = self.rest.status()
+        s["ui"] = self.ui.status()
         s["slots"] = self.slots.summary()
         if "heavy_slot" in s:  # the same stuck rule (held long and no CPU progress) as the slot status
             s["heavy_slot"] = {**s["heavy_slot"], "stuck": s["slots"]["heavy"]["stuck"]}
@@ -464,7 +533,8 @@ class Daemon:
         try:
             self.store.save(self.limits.state, self.slots.to_state(), self.jobs.to_state(),
                             self.memguard.engine.to_state(), self.jobs.stats.to_state(),
-                            self.image.to_state())  # fmt: skip
+                            self.image.to_state(), self.host_id, self.jobs.endings.to_state(),
+                            compile_peaks=self.jobs.peaks.to_state())  # fmt: skip
         except OSError as e:
             log.error("cannot save state: %s", e)
             return False
@@ -529,17 +599,21 @@ class Daemon:
         """An owner hold or the drain profile: no new image job starts and no start time is planned."""
         return bool(self.limits.state.hold) or bool(self.limits.effective()["hold_heavy_slot"])
 
+    def image_cfg(self):
+        """`[image]` with the owner's runtime override on top: what the train runs on."""
+        return self.image.effective(self.config.image)
+
     def image_status(self, limit: int = VIEW_MAX) -> dict:
         """The image train: the window, and the queue with planned starts (bounded to `limit` entries)."""
         expected = lambda p: self.jobs.stats.expected_s(p, "image")  # noqa: E731
         return self.image.status(
-            self.config.image, self.clock(), expected, self.image_hold(), self.config.keys.url, limit
+            self.image_cfg(), self.clock(), expected, self.image_hold(), self.config.keys.url, limit
         )
 
     def _image_alerts(self) -> dict:
         """Alerts of the image train for the watch: a running image job past `max_runtime_min` (never a kill)
         and container build activity outside the window that is no image job (observe only)."""
-        cfg, now, found = self.config.image, self.clock(), {}
+        cfg, now, found = self.image_cfg(), self.clock(), {}
         jobs = [j for j in self.jobs.jobs.values() if j.kind == "image"]
         for j in jobs:
             if now - j.since > cfg.max_runtime_min * 60:
@@ -680,6 +754,7 @@ class Daemon:
                 "ok": True,
                 "status": {
                     **self.status,
+                    "host": {**self.status["host"], "mode": self.config.host.mode},
                     **({"heavy_slot": heavy} if heavy else {}),
                     "limits": self.limits_summary(),
                     "slots": slots,
@@ -689,6 +764,7 @@ class Daemon:
                     "job_stats": self.jobs.stats.summary(),
                     "projects": self.projects.summary(),
                     "rest": self.rest.status(),
+                    "ui": self.ui.status(),
                     "alerts": self.watch.summary(),
                     "ha_push": self.ha.status(),
                     "governor": self.governor.status(),
@@ -699,6 +775,10 @@ class Daemon:
                     "capabilities": list(memguard_ops.CAPABILITIES),
                 },
             }
+        if op == "fleet":
+            return {"ok": True, "fleet": self.fleet_view()}
+        if op == "job_endings":
+            return job_ops.endings(self, req.get("args"))
         if op in ("slot_acquire", "slot_release", "slot_status", "hold", "cancel_holder"):
             args = req.get("args")
             if args is not None and not isinstance(args, dict):
@@ -745,6 +825,12 @@ class Daemon:
                 return {"ok": False, "error": "invalid_args", "message": "n must be an integer >= 0"}
             return {"ok": True, "lines": self.audit.tail(min(n, 1000))}
         return {"ok": False, "error": "unknown_op", "message": f"unknown op {op!r}"}
+
+    def fleet_view(self) -> dict:
+        """This host from its own status plus the last result of every `[fleet]` host (read-only)."""
+        local = self.dispatch({"v": VERSION, "op": "status"})
+        return build_view(self.host_id, local.get("status") if local.get("ok") else None,
+                          self.config.fleet, self.fleet.results(), self.clock())  # fmt: skip
 
     def headroom_status(self) -> dict:
         """Decisions whose io PSI was over its limit, with the io gate on or off (trial counter)."""
@@ -849,8 +935,31 @@ class Daemon:
             return "owner must be a boolean"
         return None
 
-    def rest_call(self, op: str, args: dict, peer: str) -> dict:
-        """A REST request: always the owner (the token was checked by the listener), source `rest`."""
+    def rest_refused(self, client: str, peer: str, method: str, path: str) -> None:
+        """Audit a write attempt with a read-only token (the listener refused it with 403 `read_only`)."""
+        self.audit.append({
+            "ts": iso(self.clock()), "op": "rest_write", "principal": "agent", "source": "rest",
+            "peer": peer, "client": client, "result": "refused",
+            "request": {"method": method, "path": path}, "reason": "read-only token on a write path",
+        })  # fmt: skip
+
+    def rest_tokens_refused(self, reason: str) -> None:
+        """Audit a reload that refused the tokens file (the listener keeps its current tokens)."""
+        self.audit.append({
+            "ts": iso(self.clock()), "op": "rest_tokens", "principal": "system", "source": "reload",
+            "result": "refused", "reason": reason,
+        })  # fmt: skip
+
+    def rest_call(self, op: str, args: dict, peer: str, client: str = "default") -> dict:
+        """A REST request: the owner (the token and its scope were checked by the listener), source `rest`.
+        Every audit line written while it runs carries the client's name."""
+        self.audit.client = client
+        try:
+            return self._rest_call(op, args, peer)
+        finally:
+            self.audit.client = None
+
+    def _rest_call(self, op: str, args: dict, peer: str) -> dict:
         if op == "cancel_holder":
             return slot_ops.cancel_holder(self, args, None, rest_peer=peer)
         if op == "hold":
@@ -867,6 +976,11 @@ class Daemon:
         bad = self._bad_types(args)
         if bad:
             return {"ok": False, "error": "bad_request", "message": bad}
+        if op == "set" and any(k in args for k in image_ops.SET_KEYS):
+            if any(args.get(k) is not None for k in (*PARAM_ARGS, "profile", "ttl", "until", "project")):
+                return {"ok": False, "error": "invalid_args",
+                        "message": "image settings cannot be combined with limit settings"}  # fmt: skip
+            return image_ops.set_settings(self, args, peer_pid, rest_peer)
         self._expire()  # replies and decisions use exact expiry, not the last tick's
         ctx = {**caller_info(self.fs, peer_pid), "op": op, "project": args.get("project"), "request": args}
         principal = "agent"
@@ -932,11 +1046,13 @@ class Daemon:
         finally:
             os.umask(old_umask)
         rest_task = asyncio.create_task(self.rest.supervise()) if self.config.rest.enabled else None
+        ui_task = asyncio.create_task(self.ui.supervise()) if self.config.ui.enabled else None
         ha_task = asyncio.create_task(self.ha.run()) if self.config.ha.enabled else None
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGTERM, signal.SIGINT):
             loop.add_signal_handler(sig, self._stop.set)
         loop.add_signal_handler(signal.SIGHUP, self.request_reload)
+        self.fleet.start()
         heartbeat = Heartbeat(watchdog_interval_s())
         sd_notify("READY=1")  # the first sample and tick come after this: nothing slow delays the start
         heartbeat.start()
@@ -961,7 +1077,8 @@ class Daemon:
                 except Exception:  # keep the loop alive; the heartbeat stops if no tick succeeds
                     log.exception("tick failed")
         heartbeat.stop()
-        tasks = [t for t in (rest_task, ha_task) if t]
+        self.fleet.stop()
+        tasks = [t for t in (rest_task, ui_task, ha_task) if t]
         for t in tasks:
             t.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
@@ -997,10 +1114,16 @@ def main(argv: list[str] | None = None) -> int:
     a = ap.parse_args(argv)
     if a.check_config:
         try:
-            load_config(a.check_config)
+            cfg = load_config(a.check_config)
         except (ConfigError, OSError, ValueError) as e:  # ValueError: not UTF-8
             print(f"loadgovd: bad config {a.check_config}: {e}", file=sys.stderr)
             return 1
+        if cfg.ui.enabled and not os.path.isfile(os.path.join(cfg.ui.dir, "index.html")):
+            print(
+                f"loadgovd: warning: [ui] is enabled but no build is at {cfg.ui.dir} "
+                "(the UI answers 503 until it is installed, see ui/README.md)",
+                file=sys.stderr,
+            )
         return 0
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s", stream=sys.stderr)
     fs = HostFS(

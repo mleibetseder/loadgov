@@ -21,6 +21,13 @@ def dig(data: dict[str, Any] | None, path: str, default: Any = None) -> Any:
     return default if cur is None else cur
 
 
+def image_settings(data: dict[str, Any] | None) -> dict[str, Any] | None:
+    """The status `image` object when the daemon has the run-time image settings (it reports `image.source`),
+    else None: an older daemon has the train but would reject the new `set` fields."""
+    image = (data or {}).get("image")
+    return image if isinstance(image, dict) and "source" in image else None
+
+
 class LoadgovEntity(CoordinatorEntity[LoadgovCoordinator]):
     """Entity ids are fixed by the design (`select.host_load_profile`, ...), so `has_entity_name` is off
     and `_attr_name` is the full name."""
@@ -43,6 +50,7 @@ class LoadgovEntity(CoordinatorEntity[LoadgovCoordinator]):
             manufacturer="loadgov",
             model="loadgovd",
             sw_version=dig(coordinator.data, "daemon.version"),
+            serial_number=dig(coordinator.data, "host.id"),  # a note only: the identifier stays the entry id
         )
 
     @property

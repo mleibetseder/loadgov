@@ -1,8 +1,9 @@
 """REST control surface for Home Assistant: a minimal HTTP/1.1 server on asyncio, stdlib only.
 
-One request per connection (`Connection: close`), JSON bodies only. Every caller acts as the owner,
-through the same `Daemon._mutate` path as the socket, so restriction rules and the audit apply
-identically. The listener is a supervised task: a bind or token problem never stops the daemon.
+One request per connection (`Connection: close`), JSON bodies only. Every caller holds a named token:
+scope `owner` acts as the owner through the same `Daemon._mutate` path as the socket, so restriction rules
+and the audit apply identically; scope `read` may only GET. The client name is in the audit line and the
+log lines. The listener is a supervised task: a bind or token problem never stops the daemon.
 """
 
 from __future__ import annotations
@@ -16,14 +17,22 @@ import logging
 import os
 import re
 import time
+from dataclasses import dataclass
+from urllib.parse import parse_qs, unquote
 
 from loadgov.config import ConfigError, RestConfig, check_rest_bind
+from loadgov.daemon import runs_api
 from loadgov.host.procfs import HostFS
+from loadgov.workflow.records import RunStore, default_runs_dir
 
 log = logging.getLogger("loadgovd.rest")
 
 DEFAULT_TOKENS_FILE = "/etc/loadgov/tokens.env"
 TOKEN_VAR = "LOADGOV_REST_TOKEN"
+CLIENT_VAR = "LOADGOV_REST_CLIENT"  # one line per named client: `<name> <token> scope=owner|read`
+DEFAULT_CLIENT = "default"  # the client of the single LOADGOV_REST_TOKEN line (scope owner)
+CLIENT_NAME = re.compile(r"^[a-z0-9-]{1,32}$")
+SCOPES = ("owner", "read")
 MIN_TOKEN_CHARS = 43  # secrets.token_urlsafe(32): 32 random bytes
 MAX_HEADER_BYTES = 8 * 1024
 MAX_BODY_BYTES = 16 * 1024
@@ -34,12 +43,14 @@ BACKOFF_S = (2.0, 60.0)
 REASONS = {
     200: "OK", 400: "Bad Request", 401: "Unauthorized", 403: "Forbidden", 404: "Not Found",
     405: "Method Not Allowed", 408: "Request Timeout", 409: "Conflict", 413: "Payload Too Large",
+    422: "Unprocessable Entity",
     429: "Too Many Requests", 500: "Internal Server Error", 503: "Service Unavailable",
 }  # fmt: skip
 SET_KEYS = {
     "profile", "max_cores", "target_cpu_pct", "load_max", "max_implementers", "max_reviewers", "max_light",
     "ram_floor_gb",
     "ttl", "until", "reason", "project",
+    "image_window", "image_timezone", "image_beta_interval_h", "image_clear",
 }  # fmt: skip
 POST_KEYS = {
     "/v1/set": SET_KEYS,
@@ -55,6 +66,7 @@ POST_KEYS = {
     "/v1/image/now": {"id", "reason"},
     "/v1/image/cancel": {"id"},
 }
+GET_PATHS = ("/v1/status", "/v1/fleet")  # plus /v1/runs and below (runs_api): all a `read` token may use
 ACTION_RE = re.compile(r"^profile=([a-z][a-z0-9_-]*)$")
 
 
@@ -62,8 +74,8 @@ class TokenError(Exception):
     pass
 
 
-def read_env_value(path: str, var: str) -> str | None:
-    """Read `var` from a 0600 env file (None when unset); raise TokenError when it cannot be read."""
+def read_env_values(path: str, var: str) -> list[str]:
+    """Every value of `var` in a 0600 env file, in file order; raise TokenError when it cannot be read."""
     try:
         fd = os.open(path, os.O_RDONLY)
     except OSError as e:
@@ -76,15 +88,27 @@ def read_env_value(path: str, var: str) -> str | None:
             lines = f.read().splitlines()
         except (OSError, UnicodeDecodeError) as e:
             raise TokenError(f"cannot read tokens file {path}: {e}") from None
-    value = None
+    values = []
     for line in lines:
         line = line.strip().removeprefix("export ").strip()
         if line.startswith("#") or "=" not in line:
             continue
         key, _, val = line.partition("=")
         if key.strip() == var:
-            value = val.strip().strip("\"'")
-    return value
+            values.append(val.strip().strip("\"'"))
+    return values
+
+
+def read_env_value(path: str, var: str) -> str | None:
+    """The last value of `var` (None when unset); raise TokenError when the file cannot be read."""
+    values = read_env_values(path, var)
+    return values[-1] if values else None
+
+
+def _check_token(value: str, what: str) -> bytes:
+    if len(value) < MIN_TOKEN_CHARS or not value.isascii() or any(c.isspace() for c in value):
+        raise TokenError(f"{what} must be at least 32 random bytes ({MIN_TOKEN_CHARS}+ URL-safe characters)")
+    return value.encode()
 
 
 def load_token(path: str) -> bytes:
@@ -92,11 +116,46 @@ def load_token(path: str) -> bytes:
     value = read_env_value(path, TOKEN_VAR)
     if value is None:
         raise TokenError(f"{TOKEN_VAR} is not set in {path}")
-    if len(value) < MIN_TOKEN_CHARS or not value.isascii() or any(c.isspace() for c in value):
-        raise TokenError(
-            f"{TOKEN_VAR} must be at least 32 random bytes ({MIN_TOKEN_CHARS}+ URL-safe characters)"
-        )
-    return value.encode()
+    return _check_token(value, TOKEN_VAR)
+
+
+@dataclass(frozen=True)
+class Client:
+    name: str
+    token: bytes
+    scope: str
+
+
+def load_clients(path: str) -> list[Client]:
+    """The REST clients of a 0600 env file: the single `LOADGOV_REST_TOKEN` line is client `default` (scope
+    `owner`); each `LOADGOV_REST_CLIENT=<name> <token> scope=owner|read` line is a named one. Names and tokens
+    are unique. A bad entry raises TokenError (the message never holds a token)."""
+    clients, labels = [], []
+    if read_env_value(path, TOKEN_VAR) is not None:
+        clients.append(Client(DEFAULT_CLIENT, load_token(path), "owner"))
+        labels.append(TOKEN_VAR)
+    for i, raw in enumerate(read_env_values(path, CLIENT_VAR), 1):
+        parts = raw.split()
+        where = f"{CLIENT_VAR} entry {i}"
+        if len(parts) != 3 or not parts[2].startswith("scope="):
+            raise TokenError(f"{where}: expected `<name> <token> scope=owner|read`")
+        name, token, scope = parts[0], parts[1], parts[2][len("scope=") :]
+        if not CLIENT_NAME.match(name):
+            raise TokenError(f"{where}: the name must match [a-z0-9-]{{1,32}}")
+        if scope not in SCOPES:
+            raise TokenError(f"{where}: scope must be one of {', '.join(SCOPES)}")
+        clients.append(Client(name, _check_token(token, f"{where} token"), scope))
+        labels.append(where)
+    if not clients:
+        raise TokenError(f"{TOKEN_VAR} is not set in {path}")
+    for field, what in (("name", "duplicate client name {v!r}"), ("token", "a token shared by two clients")):
+        first: dict = {}
+        for c, label in zip(clients, labels, strict=True):
+            v = getattr(c, field)
+            if v in first:
+                raise TokenError(f"{what.format(v=v if field == 'name' else '')}: {label} repeats {first[v]}")
+            first[v] = label
+    return clients
 
 
 class RateLimiter:
@@ -149,6 +208,7 @@ class RestServer:
         own_addresses: set[str] | None = None,
         allow_loopback: bool = False,
         peer_addr: str | None = None,
+        runs_dir: str | None = None,  # the run records (`[ui] runs_dir`); None: the default directory
     ):
         self.daemon, self.cfg, self.tokens_file = daemon, cfg, tokens_file
         self.fs = fs or getattr(daemon, "fs", None) or HostFS()
@@ -156,7 +216,9 @@ class RestServer:
         self._own, self._allow_loopback, self._peer_override = own_addresses, allow_loopback, peer_addr
         self._allow = [ipaddress.ip_network(a, strict=False) for a in cfg.allow]
         self._limiter = RateLimiter(cfg.rate_per_s, clock)
-        self._token = b""
+        self._clients: list[Client] = []
+        self.tokens_warning: str | None = None  # why the last reload refused the tokens file (no token in it)
+        self.runs_dir = runs_dir
         self._active = 0
         self._per_source: dict[str, int] = {}
         self.state, self.error, self.port = ("down" if cfg.enabled else "disabled"), None, cfg.port
@@ -173,6 +235,7 @@ class RestServer:
             "error": self.error,
             "bind": self.cfg.bind,
             "port": self.port,
+            "tokens_warning": self.tokens_warning,
         }
 
     def _down(self, error: str) -> None:
@@ -187,7 +250,7 @@ class RestServer:
             try:
                 if not self._allow_loopback:
                     check_rest_bind(self.cfg.bind, self.cfg.allow_private_bridge)
-                self._token = load_token(self.tokens_file)
+                self._clients = load_clients(self.tokens_file)
                 server = await asyncio.start_server(
                     self._handle, self.cfg.bind, self.cfg.port, limit=MAX_HEADER_BYTES
                 )
@@ -238,14 +301,38 @@ class RestServer:
             return "source address is not allowed"
         return None
 
-    def _authorized(self, header: str | None) -> bool:
+    def reload_tokens(self) -> None:
+        """Re-read the tokens file (SIGHUP). A file that cannot be read keeps the clients in use. Only while
+        the listener is up: otherwise `supervise` loads the file on its next start anyway."""
+        if self.state != "up":
+            return
+        try:
+            clients = load_clients(self.tokens_file)
+        except TokenError as e:
+            log.error("rest: tokens not reloaded, keeping the current ones: %s", e)
+            self.tokens_warning = f"tokens file refused at reload, current tokens kept: {e}"
+            self.daemon.rest_tokens_refused(str(e))
+            return
+        self.tokens_warning = None
+        if clients != self._clients:
+            log.info("rest: tokens reloaded: %s", ", ".join(f"{c.name}({c.scope})" for c in clients))
+        self._clients = clients
+
+    def _authorize(self, header: str | None) -> Client | None:
+        """The client whose token the request presents. Every entry is compared and the match is picked
+        after the loop, so the time does not say which entry (if any) matched."""
         scheme, _, given = (header or "").partition(" ")
         if scheme.lower() != "bearer":
-            return False
+            return None
         try:
-            return hmac.compare_digest(given.strip().encode("latin-1"), self._token)
+            given_b = given.strip().encode("latin-1")
         except UnicodeEncodeError:
-            return False
+            return None
+        found = None
+        for c in self._clients:
+            if hmac.compare_digest(given_b, c.token) and found is None:
+                found = c
+        return found
 
     async def _handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         peername = writer.get_extra_info("peername")
@@ -322,17 +409,30 @@ class RestServer:
             return self._err(400, "bad_request", "malformed request")
         if not version.startswith("HTTP/1."):
             return self._err(400, "bad_request", "HTTP/1.x only")
-        if not self._authorized(headers.get("authorization")):
+        client = self._authorize(headers.get("authorization"))
+        if client is None:
             log.warning("rest: 401 from %s", peer)  # never the presented token
             return self._err(401, "unauthorized", "bearer token required", {"WWW-Authenticate": "Bearer"})
         if not self._limiter.allow():
             return self._err(429, "rate_limited", "too many requests", {"Retry-After": "1"})
-        path = target.split("?", 1)[0]
-        if path == "/v1/status":
+        path, _, query = target.partition("?")
+        log.debug("rest: %s %s from %s client=%s", method, path, peer, client.name)
+        if client.scope == "read" and method != "GET":  # before routing: every non-GET, known path or not
+            log.warning("rest: 403 read_only: %s %s from %s client=%s", method, path, peer, client.name)
+            self.daemon.rest_refused(client.name, peer, method, path)
+            return self._err(403, "read_only", "this token may only read (GET)")
+        if path in GET_PATHS:
             if method != "GET":
                 return self._err(405, "method_not_allowed", "use GET", {"Allow": "GET"})
-            reply = self.daemon.dispatch({"v": 1, "op": "status"})
+            reply = self.daemon.dispatch({"v": 1, "op": path.rsplit("/", 1)[1]})
             return status_for(reply), reply, {}
+        if path == "/v1/runs" or path.startswith("/v1/runs/"):
+            if method != "GET":
+                return self._err(405, "method_not_allowed", "use GET", {"Allow": "GET"})
+            parts = [unquote(s) for s in path[len("/v1/") :].split("/")]
+            store = RunStore(self.runs_dir or default_runs_dir())
+            code, body = await asyncio.to_thread(runs_api.serve, store, parts, parse_qs(query), "rest")
+            return code, body, {}
         if path not in POST_KEYS:
             return self._err(404, "not_found", f"no such path {path}")
         if method != "POST":
@@ -346,7 +446,7 @@ class RestServer:
         op = self._op_for(path, args, peer)
         if len(op) == 3:  # an error response
             return op
-        reply = self.daemon.rest_call(op[0], op[1], peer)
+        reply = self.daemon.rest_call(op[0], op[1], peer, client.name)
         return status_for(reply), reply, {}
 
     async def _read_json(self, reader: asyncio.StreamReader, headers: dict):

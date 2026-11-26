@@ -7,7 +7,7 @@ import logging
 import os
 from dataclasses import asdict
 
-from loadgov.config import PARAMS
+from loadgov.config import PARAMS, ConfigError, check_host_id
 from loadgov.engines.limits import Ceiling, Flag, LimitState, Override
 
 log = logging.getLogger("loadgovd")
@@ -31,6 +31,7 @@ def atomic_write_text(path: str, text: str) -> None:
 class StateStore:
     def __init__(self, state_dir: str):
         self.path = os.path.join(state_dir, "state.json")
+        self.rejected_host_id: str | None = None  # a saved host id that failed the check (load_host_id)
 
     def save(
         self,
@@ -40,6 +41,9 @@ class StateStore:
         memguard: dict | None = None,
         job_stats: list | None = None,
         image: dict | None = None,
+        host_id: str | None = None,
+        job_endings: list | None = None,
+        compile_peaks: dict | None = None,
     ) -> None:
         os.makedirs(os.path.dirname(self.path), exist_ok=True)
         body = {
@@ -49,8 +53,27 @@ class StateStore:
             "memguard": memguard or {},
             "job_stats": job_stats or [],
             "image": image or {},
+            "host_id": host_id,
+            "job_endings": job_endings or [],
+            "compile_peaks": compile_peaks or {},
         }
         atomic_write_text(self.path, json.dumps(body, indent=1))
+
+    def load_host_id(self) -> str | None:
+        """The host id saved by an earlier start (None when missing, unreadable or an old file without it)."""
+        self.rejected_host_id = None
+        try:
+            with open(self.path) as f:
+                raw = json.load(f).get("host_id")
+        except (OSError, ValueError, AttributeError):
+            return None
+        if raw is None:
+            return None
+        try:
+            return check_host_id(raw)  # the same check as the config
+        except ConfigError:
+            self.rejected_host_id = repr(raw)[:64]  # the daemon audits it once and derives a new id
+            return None
 
     def load_jobs(self) -> list:
         """The saved `loadctl run` jobs (empty when missing or unreadable)."""
@@ -69,6 +92,24 @@ class StateStore:
         except (OSError, ValueError, AttributeError):
             return []
         return raw if isinstance(raw, list) else []
+
+    def load_job_endings(self) -> list:
+        """The saved ring of recent job endings (empty when missing or unreadable)."""
+        try:
+            with open(self.path) as f:
+                raw = json.load(f).get("job_endings")
+        except (OSError, ValueError, AttributeError):
+            return []
+        return raw if isinstance(raw, list) else []
+
+    def load_compile_peaks(self) -> dict:
+        """The saved per-(project, crate) compile memory peaks (empty when missing or unreadable)."""
+        try:
+            with open(self.path) as f:
+                raw = json.load(f).get("compile_peaks")
+        except (OSError, ValueError, AttributeError):
+            return {}
+        return raw if isinstance(raw, dict) else {}
 
     def load_image(self) -> dict:
         """The saved image train: queued jobs, last beta starts (empty when missing or unreadable)."""

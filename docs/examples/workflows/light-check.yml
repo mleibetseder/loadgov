@@ -1,0 +1,34 @@
+# A light check: runs in the light lane (1 core, 1 GB, 10 minutes), never waits behind a build.
+# Copy to .github/workflows/ or .forgejo/workflows/ of the project; replace the commands with yours.
+name: Checks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CI: "true"
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: [self-hosted, loadgov-light]
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Workspace is a directory
+        run: test -d "$GITHUB_WORKSPACE"
+      - name: Pick a message
+        id: pick
+        run: |
+          echo "msg=checked on $GITHUB_EVENT_NAME" >> "$GITHUB_OUTPUT"
+          echo "FLAVOUR=plain" >> "$GITHUB_ENV"
+      - name: Use the output and the env
+        env:
+          MSG: ${{ steps.pick.outputs.msg }}
+        run: echo "$MSG ($FLAVOUR)"
+      - name: Only on push
+        if: github.event_name == 'push'
+        run: echo "pushed to $GITHUB_REF"

@@ -37,6 +37,9 @@ HOOK_KINDS = {  # emit_event kind -> (level, title, actions)
     "reap": ("warning", "Build daemons stopped by the memory guard", []),
     "stuck_paused": ("critical", "Orphaned paused work cannot be thawed", []),
     "backstop": ("critical", "Memory backstop killed a build job", []),
+    "backstop_cap": ("warning", "Memory backstop capped above its target", []),
+    "backstop_oom": ("critical", "OOM kill in a project slice", []),  # key `backstop_oom:<project>`
+    "backstop_leak": ("warning", "Memory held by a slice with no processes", []),  # `backstop_leak:<unit>`
     "stray": ("warning", "Stray process", []),  # key `stray:<pid>` (payload `key`), actions from the payload
 }
 ACTIONS = {
@@ -103,6 +106,7 @@ class Watch:
         self.clock, self.dedupe_s = clock, dedupe_s
         self.disk_busy: DiskThreshold = DISK_BUSY  # from [levels]; the daemon sets them, also on reload
         self.disk_limit: DiskThreshold = DISK_LIMIT
+        self.host: str | None = None  # the host id (set by the daemon) is on every event and active alert
         self.active: dict[str, dict] = {}
         self.events: deque[dict] = deque(maxlen=KEEP_EVENTS)
         self._last_sent: dict[str, float] = {}
@@ -244,6 +248,7 @@ class Watch:
                 "profile": c["profile"], "ceiling": c["ceiling"]}  # fmt: skip
 
     def _record(self, ev: dict) -> dict:
+        ev["host"] = self.host
         self.events.append(ev)
         return ev
 
@@ -286,5 +291,5 @@ class Watch:
 
     def summary(self) -> dict:
         keys = ("key", "level", "since", "title", "message")
-        return {"active": [{k: r[k] for k in keys} for r in self.active.values()],
+        return {"active": [{**{k: r[k] for k in keys}, "host": self.host} for r in self.active.values()],
                 "events": list(self.events)}  # fmt: skip

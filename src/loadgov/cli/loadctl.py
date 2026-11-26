@@ -107,15 +107,37 @@ def format_jobs(rows: list) -> str:
     )
 
 
+def format_endings(rows: list) -> str:
+    """One line per ended job, newest first: when, project kind key-or-label, duration, exit, cause."""
+    if not rows:
+        return "no jobs ended in that time"
+    out = []
+    for r in rows:
+        exit_ = "-" if r.get("exit_code") is None else str(r["exit_code"])
+        sig = f" signal {r['signal']}" if r.get("signal") else ""
+        dur = "-" if r.get("duration_s") is None else _span(int(r["duration_s"]))
+        out.append(
+            f"{r['ended_at']} {r['project']} {r['kind']} {r.get('key') or r['label']} "
+            f"took {dur} exit {exit_}{sig} {r['cause']}"
+        )
+    return "\n".join(out)
+
+
+def _slot_why(reply: dict) -> str:
+    """What a waiting client reports: the daemon's reason (memory admission), else the holder."""
+    return reply.get("reason") or f"held by {reply.get('holder', 'unknown')}"
+
+
 def format_waiters(sl: dict) -> list[str]:
     """One line per waiter: `next: 1. project kind KEY waiting 3m eta 18:40` (eta = expected start)."""
     lines = []
     for w in sl.get("waiters") or []:
         what = " ".join(x for x in (w["project"], w.get("kind"), w.get("key") or w["label"]) if x)
         eta = f" eta {_hm(w['eta'])}" if w.get("eta") else ""
+        why = f" ({w['reason']})" if w.get("reason") else ""
         lines.append(
             f"{'next:' if w['position'] == 1 else '     '} {w['position']}. {what} "
-            f"waiting {_span(w['wait_s'])}{eta}"
+            f"waiting {_span(w['wait_s'])}{eta}{why}"
         )
     return lines
 
@@ -139,12 +161,42 @@ def format_job_stats(rows: list) -> str:
     return "\n".join("  ".join(c.ljust(w[i]) for i, c in enumerate(row)).rstrip() for row in (head, *body))
 
 
+def format_shmem(bs: dict) -> str:
+    """`, shmem N MB in build-work.slice` once the shmem share exceeds `leak_alert_mb`, else ''."""
+    over = (bs.get("shmem_mb") or 0) > bs.get("leak_alert_mb", 1024)
+    return f", shmem {bs['shmem_mb']} MB in build-work.slice" if over else ""
+
+
+def format_backstop_projects(bs: dict) -> str:
+    """`  backstop projects: a 8192 MB, b 8192 MB capped 9000 MB (not applied), c shmem 2048 MB`: capped
+    projects and those whose shmem share exceeds `leak_alert_mb`; '' when there is none."""
+    parts = []
+    for name, p in sorted((bs.get("projects") or {}).items()):
+        bits = []
+        if p.get("cap_mb"):
+            bits.append(f"{p['cap_mb']} MB")
+            if p.get("capped_mb"):
+                bits.append(f"capped {p['capped_mb']} MB")
+            if not p.get("applied"):
+                bits.append("(not applied)")
+        if (p.get("shmem_mb") or 0) > bs.get("leak_alert_mb", 1024):
+            bits.append(f"shmem {p['shmem_mb']} MB")
+        if bits:
+            parts.append(f"{name} " + " ".join(bits))
+    return "  backstop projects: " + ", ".join(parts) if parts else ""
+
+
 def format_status(s: dict) -> str:
-    lines = format_hwmon(s).replace("hwmon ", "loadgov ", 1).split("\n")
+    host = s["host"].get("id")  # an older daemon has no host id
+    lines = format_hwmon(s).replace("hwmon ", f"loadgov {host} " if host else "loadgov ", 1).split("\n")
     if (
         "used_pct" in s["disk"]
     ):  # the legacy five-line format stays as it was; an older daemon has no used_pct
         lines[4] = lines[4].replace(" on ", f", {s['disk']['used_pct']:.0f} % used on ", 1)
+    if s["host"].get("mode") == "monitor":  # an older daemon has no mode
+        lines.append(
+            "  mode  monitor: every enforce flag is forced off, decisions are only reported as WOULD"
+        )
     c, m, io = s["cpu"], s["memory"], s["io"]
     cpu_psi = f"cpu {c['psi_some_avg10']:.0f}/{c['psi_some_avg60']:.0f}"
     if c.get("psi_effective", c["psi_some_avg60"]) != c["psi_some_avg60"]:
@@ -188,7 +240,12 @@ def format_status(s: dict) -> str:
             + (f", {bs['max_events']} max hit(s)" if bs.get("max_events") else "")
             + (f", {bs['swap_fail_events']} swap fail(s)" if bs.get("swap_fail_events") else "")
             + (f", last {bs['last_event']}" if bs["last_event"] else "")
+            + format_shmem(bs)
         )
+    elif bs and (bs.get("shmem_mb") or 0) > bs.get("leak_alert_mb", 1024):
+        lines.append(f"  backstop off{format_shmem(bs)}")
+    if bs and (line := format_backstop_projects(bs)):
+        lines.append(line)
     strays = (s.get("strays") or {}).get("items") or []
     if strays:
         lines.append(f"  strays: {len(strays)}")
@@ -222,7 +279,58 @@ def format_status(s: dict) -> str:
     lines.append(f"  daemon {dmn['version']} pid {dmn['pid']} mode {dmn['mode']}{detail}")
     if dmn.get("memory_protection_mb") == 0:
         lines.append("  warn  memory protection 0 MB: set MemoryMin on system.slice (docs/deployment.md)")
+    if tw := (s.get("rest") or {}).get("tokens_warning"):
+        lines.append(f"  warn  rest {tw} (fix tokens.env before a restart: docs/deployment.md)")
+    ui = s.get("ui") or {}
+    if ui.get("enabled") and not ui.get("built"):
+        lines.append("  warn  ui enabled but no build is installed (ui/README.md, docs/deployment.md)")
     return "\n".join(lines)
+
+
+def _slot_cell(sl: dict) -> str:
+    if sl.get("state") is None:
+        return "-"
+    out = "free" if sl["state"] == "free" else (sl.get("holder") or "held")
+    return out + (f" +{sl['queue']}" if sl.get("queue") else "")
+
+
+def _age_text(seconds: int | None) -> str:
+    if seconds is None:
+        return "never"
+    return (
+        f"{seconds}s" if seconds < 120 else f"{seconds // 60}m" if seconds < 7200 else f"{seconds // 3600}h"
+    )
+
+
+def format_fleet(fleet: dict) -> str:
+    """One row per host. A host that cannot be reached shows its last data aged, and the error below."""
+    head = ("host", "mode", "level", "load/core", "light", "heavy", "compile", "image", "reach")
+    rows, notes = [], []
+    for h in fleet["hosts"]:
+        load = (h.get("cpu") or {}).get("load1_per_core")
+        lt, im = h.get("light") or {}, h.get("image") or {}
+        if h["reachable"]:
+            reach = "local" if h.get("local") else f"ok {_age_text(h.get('age_s'))}"
+        else:
+            reach = "DOWN" + ("" if h.get("age_s") is None else f" (last {_age_text(h['age_s'])} ago)")
+        rows.append((
+            h["id"] + (" (id mismatch)" if h.get("id_mismatch") else ""), h["mode"], h.get("level") or "-",
+            "-" if load is None else f"{load:.2f}",
+            "-" if lt.get("running") is None or lt.get("max") is None else f"{lt['running']}/{lt['max']}",
+            _slot_cell(h.get("heavy") or {}), _slot_cell(h.get("compile") or {}),
+            "-" if im.get("queued") is None else f"{im['queued']} queued"
+            + (f", next {_hm(im['next_start'])}" if im.get("next_start") else ""),
+            reach,
+        ))  # fmt: skip
+        if h.get("id_mismatch"):
+            notes.append(
+                f"{h['id']}: the host reports id {h.get('reported_id')!r}; check its [host] id and the url"
+            )
+        if h.get("error"):
+            notes.append(f"{h['id']}: {h['error']}")
+    w = [max(len(r[i]) for r in (head, *rows)) for i in range(len(head))]
+    table = ["  ".join(c.ljust(w[i]) for i, c in enumerate(r)).rstrip() for r in (head, *rows)]
+    return "\n".join([*table, *notes])
 
 
 def format_projects(projects: dict | None) -> str:
@@ -271,6 +379,11 @@ def format_limits(lim: dict) -> str:
 def format_reply(op: str, reply: dict) -> str:
     if op == "stray_kill":
         return f"refused: {reply['reason']}"
+    if op == "set" and "after" in reply:  # image settings
+        b, n = reply["before"], reply["after"]
+        return (f"image {'cleared' if reply['cleared'] else 'set'}: window {n['window']} {n['timezone']}, "
+                f"beta interval {n['beta_interval_h']} h ({n['source']}); "
+                f"was {b['window']} {b['timezone']}, {b['beta_interval_h']} h ({b['source']})")  # fmt: skip
     if reply.get("restrictedBy") == "system":
         return f"refused: the memory guard holds the pause ({reply['reason']})"
     if reply.get("refused"):
@@ -303,8 +416,14 @@ def _parser() -> argparse.ArgumentParser:
     fmt = st.add_mutually_exclusive_group()
     fmt.add_argument("--json", action="store_true", help="print the raw status JSON")
     fmt.add_argument("--hwmon", action="store_true", help="print legacy hwmon's five-line format")
+    fl = sub.add_parser("fleet", help="every host of the fleet (read-only; see docs/protocol.md, Fleet)")
+    fls = fl.add_subparsers(dest="fleet_cmd", required=True)
+    fst = fls.add_parser("status", help="one row per host: mode, level, load, light, slots, image, reachable")
+    fst.add_argument("--json", action="store_true", help="print the raw fleet JSON")
     jb = sub.add_parser("jobs", help="running `loadctl run` jobs, or with --stats what finished jobs used")
     jb.add_argument("--stats", action="store_true", help="per project and kind: count, duration, CPU, memory")
+    jb.add_argument("--ended", action="store_true", help="recent job endings with exit code and cause")
+    jb.add_argument("--since", metavar="DURATION", help="with --ended: only endings in the last 90s, 15m, 2h")
     jb.add_argument("--json", action="store_true")
     se = sub.add_parser("set", help="change the profile or single limits")
     se.add_argument("--profile")
@@ -315,6 +434,14 @@ def _parser() -> argparse.ArgumentParser:
     se.add_argument("--max-reviewers", type=int, dest="max_reviewers")
     se.add_argument("--max-light", type=int, dest="max_light")
     se.add_argument("--ram-floor-gb", type=float, dest="ram_floor_gb")
+    se.add_argument("--image-window", dest="image_window", metavar="HH:MM-HH:MM",
+                    help="owner: image night window (may cross midnight), over [image] window")  # fmt: skip
+    se.add_argument("--image-timezone", dest="image_timezone", metavar="ZONE",
+                    help="owner: IANA time zone of the image window")  # fmt: skip
+    se.add_argument("--image-beta-interval-h", type=int, dest="image_beta_interval_h", metavar="N",
+                    help="owner: a project's beta starts at most every N hours (0-336)")  # fmt: skip
+    se.add_argument("--image-clear", action="store_true", dest="image_clear",
+                    help="owner: drop the image overrides, back to the [image] config values")  # fmt: skip
     se.add_argument("--owner", action="store_true", help="act as the human owner (checked by the daemon)")
     se.add_argument("--project")
     _timing(se)
@@ -407,6 +534,10 @@ def _parser() -> argparse.ArgumentParser:
 
     add_image_parser(sub)
     add_history_parser(sub)
+    from loadgov.workflow.cli import add_runs_parser, add_workflow_parser
+
+    add_workflow_parser(sub)
+    add_runs_parser(sub)
     lg = sub.add_parser("log", help="last audit lines")
     lg.add_argument("-n", type=int, default=20)
     return ap
@@ -533,7 +664,7 @@ def slot_acquire(a: argparse.Namespace, out=None, sleep=None) -> int:
             return 0
         if reply["status"] == "timeout" or not a.wait or (a.timeout_s and waited >= a.timeout_s):
             print(
-                f"{tag}_SLOT_WAIT {who}: held by {reply.get('holder', 'unknown')} waited={waited}s",
+                f"{tag}_SLOT_WAIT {who}: {_slot_why(reply)} waited={waited}s",
                 file=sys.stderr,
             )
             if a.wait:  # leave the queue now rather than after the daemon notices
@@ -542,7 +673,7 @@ def slot_acquire(a: argparse.Namespace, out=None, sleep=None) -> int:
             return 1
         if waited >= next_note:
             print(
-                f"{tag}_SLOT_WAIT {who}: held by {reply.get('holder', 'unknown')} waited={waited}s",
+                f"{tag}_SLOT_WAIT {who}: {_slot_why(reply)} waited={waited}s",
                 file=sys.stderr,
             )
             next_note = waited + SLOT_NOTE_S
@@ -720,6 +851,14 @@ def main(argv: list[str] | None = None, sleep=time.sleep) -> int:
         from loadgov.cli.image import image_command
 
         return image_command(a)
+    if a.cmd == "workflow":
+        from loadgov.workflow.cli import workflow_command
+
+        return workflow_command(a)
+    if a.cmd == "runs":
+        from loadgov.workflow.cli import runs_command
+
+        return runs_command(a)
     if a.cmd == "history" and wants_file(a):
         return from_file(a)
     if a.cmd == "level-wait":
@@ -754,6 +893,11 @@ def main(argv: list[str] | None = None, sleep=time.sleep) -> int:
         )
         args = {k: getattr(a, k) for k in (*keys, "ttl", "until", "reason", "project")}
         args["owner"] = a.owner
+        for k in ("image_window", "image_timezone", "image_beta_interval_h"):
+            if getattr(a, k) is not None:
+                args[k] = getattr(a, k)
+        if a.image_clear:
+            args["image_clear"] = True
     elif a.cmd == "reset":
         op = "reset"
         args = {"params": a.params, "all": a.all, "reason": a.reason, "owner": a.owner}
@@ -773,8 +917,14 @@ def main(argv: list[str] | None = None, sleep=time.sleep) -> int:
     elif a.cmd == "stray" and a.kill is not None:
         op = "stray_kill"
         args = {"pid": a.kill, "start_time": a.start_time, "owner": a.owner, "reason": a.reason}
+    elif a.cmd == "jobs" and a.ended:
+        op = "job_endings"
+        args = {"since": a.since}
     elif a.cmd == "stray" or a.cmd == "jobs":
         op = "status"
+        args = {}
+    elif a.cmd == "fleet":
+        op = "fleet"
         args = {}
     elif a.cmd == "hold":
         op = "hold"
@@ -813,6 +963,9 @@ def main(argv: list[str] | None = None, sleep=time.sleep) -> int:
             print(format_stray(it))
     elif op == "stray_kill":
         print(reply["message"])
+    elif op == "job_endings":
+        rows = reply["endings"]
+        print(json.dumps(rows, indent=2) if a.json else format_endings(rows))
     elif a.cmd == "jobs":
         rows = reply["status"].get("job_stats" if a.stats else "jobs") or []
         if a.json:
@@ -827,6 +980,8 @@ def main(argv: list[str] | None = None, sleep=time.sleep) -> int:
             print(format_hwmon(s))
         else:
             print(format_status(s))
+    elif op == "fleet":
+        print(json.dumps(reply["fleet"], indent=2) if a.json else format_fleet(reply["fleet"]))
     elif op == "limits":
         print(json.dumps(reply["limits"], indent=2) if a.json else format_limits(reply["limits"]))
     elif op == "slot_status":

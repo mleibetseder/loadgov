@@ -5,12 +5,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from homeassistant.components.number import NumberEntity, NumberEntityDescription, NumberMode
-from homeassistant.const import PERCENTAGE, UnitOfInformation
+from homeassistant.const import PERCENTAGE, UnitOfInformation, UnitOfTime
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
+from .const import IMAGE_BETA_INTERVAL_MAX_H
 from .coordinator import LoadgovConfigEntry, LoadgovCoordinator
-from .entity import LoadgovEntity, dig
+from .entity import LoadgovEntity, dig, image_settings
 
 PARALLEL_UPDATES = 1
 
@@ -57,6 +58,7 @@ async def async_setup_entry(
     hass: HomeAssistant, entry: LoadgovConfigEntry, async_add_entities: AddConfigEntryEntitiesCallback
 ) -> None:
     async_add_entities(LoadgovNumber(entry.runtime_data, d) for d in NUMBERS)
+    async_add_entities([LoadgovImageBetaIntervalNumber(entry.runtime_data)])
 
 
 class LoadgovNumber(LoadgovEntity, NumberEntity):
@@ -77,3 +79,31 @@ class LoadgovNumber(LoadgovEntity, NumberEntity):
     async def async_set_native_value(self, value: float) -> None:
         sent = int(value) if self._param in ("max_implementers", "max_light") else float(value)
         await self.coordinator.async_post("/v1/set", {self._param: sent})
+
+
+class LoadgovImageBetaIntervalNumber(LoadgovEntity, NumberEntity):
+    """Hours between two beta image builds of a project (0 = no interval), `image.beta_interval_h`.
+    Unavailable on a daemon without the run-time image settings."""
+
+    _domain = "number"
+    _attr_mode = NumberMode.BOX
+    _attr_native_min_value = 0
+    _attr_native_max_value = IMAGE_BETA_INTERVAL_MAX_H
+    _attr_native_step = 1
+    _attr_native_unit_of_measurement = UnitOfTime.HOURS
+    _attr_icon = "mdi:timer-sand"
+
+    def __init__(self, coordinator: LoadgovCoordinator) -> None:
+        super().__init__(coordinator, "image_beta_interval", "Host Image Beta Interval")
+
+    @property
+    def available(self) -> bool:
+        return super().available and image_settings(self.coordinator.data) is not None
+
+    @property
+    def native_value(self) -> float | None:
+        value = (image_settings(self.status) or {}).get("beta_interval_h")
+        return float(value) if isinstance(value, int | float) and not isinstance(value, bool) else None
+
+    async def async_set_native_value(self, value: float) -> None:
+        await self.coordinator.async_set_image({"image_beta_interval_h": int(value)})

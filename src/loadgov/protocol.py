@@ -20,6 +20,8 @@ STATUS_SCHEMA: dict[str, tuple] = {
     "v": (int,),
     "at": (str,),
     "at_ms": (int,),
+    "host.id": (str,),
+    "host.mode": (str,),
     "host.cores": (int,),
     "cpu.busy_pct": NUM,
     "cpu.psi_some_avg10": NUM,
@@ -115,6 +117,11 @@ STATUS_SCHEMA: dict[str, tuple] = {
     "slots.compile.waiters[].wait_s": (int,),
     "slots.compile.waiters[].expected_s": OPT_NUM,
     "slots.compile.waiters[].eta": OPT_STR,
+    "slots.compile.waiters[].reason": OPT_STR,
+    "slots.compile.waiters[].needs_mb": OPT_NUM,
+    "slots.compile.waiters[].free_mb": OPT_NUM,
+    "slots.compile.waiters[].peak_mb": OPT_NUM,
+    "slots.compile.memory_admission": (bool,),
     "jobs": (list,),
     "jobs[].kind": (str,),
     "jobs[].project": (str,),
@@ -137,6 +144,7 @@ STATUS_SCHEMA: dict[str, tuple] = {
     "light.max_runtime_s": (int,),
     "image.window": (str,),
     "image.timezone": (str,),
+    "image.source": (str,),
     "image.in_window": (bool,),
     "image.next_window_start": OPT_STR,
     "image.max_runtime_min": (int,),
@@ -175,6 +183,7 @@ STATUS_SCHEMA: dict[str, tuple] = {
     "job_stats[].mem_peak_max_mb": OPT_NUM,
     "job_stats[].cpu_total_s": NUM,
     "job_stats[].docker_cpu_total_s": NUM,
+    "job_stats[].causes": (dict,),
     "projects": (dict,),
     "projects{}.cpu_pct": OPT_NUM,
     "projects{}.cores": OPT_NUM,
@@ -206,13 +215,22 @@ STATUS_SCHEMA: dict[str, tuple] = {
     "rest.enabled": (bool,),
     "rest.state": (str,),
     "rest.error": OPT_STR,
+    "rest.tokens_warning": OPT_STR,
     "rest.bind": OPT_STR,
     "rest.port": (int,),
+    "ui.enabled": (bool,),
+    "ui.state": (str,),
+    "ui.error": OPT_STR,
+    "ui.bind": OPT_STR,
+    "ui.port": (int,),
+    "ui.built": (bool,),
     "alerts.active": (list,),
+    "alerts.active[].host": (str,),
     "alerts.active[].key": (str,),
     "alerts.active[].level": (str,),
     "alerts.active[].since": (str,),
     "alerts.events": (list,),
+    "alerts.events[].host": (str,),
     "alerts.events[].type": (str,),
     "alerts.events[].key": (str,),
     "alerts.events[].at": (str,),
@@ -266,11 +284,30 @@ STATUS_SCHEMA: dict[str, tuple] = {
     "backstop.applied": (bool,),
     "backstop.memory_max_mb": OPT_INT,
     "backstop.memory_swap_max_mb": OPT_INT,
+    "backstop.capped_mb": OPT_INT,
+    "backstop.via": OPT_STR,
     "backstop.oom_kills": (int,),
     "backstop.max_events": (int,),
     "backstop.swap_fail_events": (int,),
     "backstop.last_event": OPT_STR,
     "backstop.note": OPT_STR,
+    "backstop.shmem_mb": OPT_INT,
+    "backstop.file_mb": OPT_INT,
+    "backstop.leak_alert_mb": (int,),
+    "backstop.leak_alerts": (int,),
+    "backstop.projects": (dict,),
+    "backstop.projects{}.unit": (str,),
+    "backstop.projects{}.cap_mb": (int,),
+    "backstop.projects{}.high_mb": (int,),
+    "backstop.projects{}.capped_mb": OPT_INT,
+    "backstop.projects{}.usage_mb": OPT_INT,
+    "backstop.projects{}.shmem_mb": OPT_INT,
+    "backstop.projects{}.file_mb": OPT_INT,
+    "backstop.projects{}.applied": (bool,),
+    "backstop.leftovers": (list,),
+    "backstop.leftovers[].path": (str,),
+    "backstop.leftovers[].mb": (int,),
+    "backstop.leftovers[].candidates": (list,),
     "strays.enabled": (bool,),
     "strays.enforce": (bool,),
     "strays.check_s": (int,),
@@ -298,6 +335,62 @@ STATUS_SCHEMA: dict[str, tuple] = {
     "daemon.tick_s": NUM,
     "daemon.memory_protection_mb": (int,),
 }
+
+
+# The fleet object (`fleet` op, `GET /v1/fleet`): top level and, with "hosts[]", every host entry.
+FLEET_SCHEMA: dict[str, tuple] = {
+    "v": (int,),
+    "at": (str,),
+    "host": (str,),
+    "hosts": (list,),
+    "hosts[].id": (str,),
+    "hosts[].local": (bool,),
+    "hosts[].mode": (str,),
+    "hosts[].reachable": (bool,),
+    "hosts[].fetched_at": OPT_STR,
+    "hosts[].age_s": OPT_INT,
+    "hosts[].error": OPT_STR,
+    "hosts[].id_mismatch": (bool,),
+    "hosts[].reported_id": OPT_STR,
+    "hosts[].level": OPT_STR,
+    "hosts[].cores": OPT_INT,
+    "hosts[].cpu.busy_pct": OPT_NUM,
+    "hosts[].cpu.load1_per_core": OPT_NUM,
+    "hosts[].memory.avail_mb": OPT_INT,
+    "hosts[].memory.total_mb": OPT_INT,
+    "hosts[].disk.used_pct": OPT_NUM,
+    "hosts[].disk.free_gb": OPT_NUM,
+    "hosts[].light.running": OPT_INT,
+    "hosts[].light.max": OPT_INT,
+    "hosts[].heavy.state": OPT_STR,
+    "hosts[].heavy.holder": OPT_STR,
+    "hosts[].heavy.queue": OPT_INT,
+    "hosts[].compile.state": OPT_STR,
+    "hosts[].compile.holder": OPT_STR,
+    "hosts[].compile.queue": OPT_INT,
+    "hosts[].image.queued": OPT_INT,
+    "hosts[].image.next_start": OPT_STR,
+}
+
+
+def validate_fleet(fleet: dict) -> list[str]:
+    """Return a list of schema violations of a fleet object (empty = valid)."""
+    errors = []
+    for path, types in FLEET_SCHEMA.items():
+        if path.startswith("hosts[]."):
+            items = [(f"hosts[{i}]", h) for i, h in enumerate(fleet.get("hosts") or [])]
+            sub = path.removeprefix("hosts[].")
+        else:
+            items, sub = [("", fleet)], path
+        for name, item in items:
+            try:
+                v = _get(item, sub)
+            except KeyError:
+                errors.append(f"{name + '.' if name else ''}{sub}: missing")
+                continue
+            if not isinstance(v, types) or (isinstance(v, bool) and bool not in types):
+                errors.append(f"{name + '.' if name else ''}{sub}: {type(v).__name__}")
+    return errors
 
 
 def _get(d, path: str):

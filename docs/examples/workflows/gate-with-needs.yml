@@ -1,0 +1,52 @@
+# A pipeline over three lanes: a light check first, then a matrix of tests in the gate lane (one heavy
+# slot at a time, so the combinations queue), then a compile job that needs them all.
+name: Pipeline
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: [self-hosted, loadgov-light]
+    steps:
+      - run: echo "quick checks"
+
+  test:
+    needs: check
+    runs-on: [self-hosted, loadgov-gate]
+    timeout-minutes: 30
+    strategy:
+      max-parallel: 1
+      matrix:
+        suite: [unit, integration]
+        include:
+          - suite: unit
+            flags: -q
+    env:
+      SUITE: ${{ matrix.suite }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run the suite
+        run: echo "running $SUITE ${{ matrix.flags }}"
+      - name: Informational step that may fail
+        continue-on-error: true
+        run: "false"
+      - name: Runs even after a failure
+        if: always()
+        run: echo "cleanup"
+
+  build:
+    needs: [check, test]
+    runs-on: [self-hosted, loadgov-compile]
+    steps:
+      - name: Build
+        shell: bash
+        run: echo "building"
+
+  report:
+    needs: build
+    if: always()
+    runs-on: ubuntu-latest   # host-only: no loadgov-* label, so the gate lane
+    steps:
+      - run: echo "pipeline finished"

@@ -10,7 +10,7 @@ import time
 from collections import deque
 from dataclasses import dataclass
 
-from loadgov.config import DiskThreshold
+from loadgov.config import FALLBACK_HOST_ID, DiskThreshold
 from loadgov.engines.levels import DISK_BUSY, DISK_LIMIT, disk_check, effective_psi, evaluate
 from loadgov.host.procfs import HostFS
 
@@ -226,6 +226,8 @@ class Sampler:
         self, fs: HostFS | None = None, mirrors: tuple[str, ...] = (), psi_busy_gate_pct: float = 80.0
     ):
         self.psi_busy_gate_pct = psi_busy_gate_pct
+        self.host_id = FALLBACK_HOST_ID  # the daemon sets the real one
+        self.host_mode = "govern"  # and the mode
         self._bad_disks: set[str] = set()
         self.disk_busy: DiskThreshold = DISK_BUSY  # [levels] disk_busy / disk_limit, set by the daemon
         self.disk_limit: DiskThreshold = DISK_LIMIT
@@ -300,7 +302,7 @@ class Sampler:
             "v": 1,
             "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)),
             "at_ms": int(now * 1000),
-            "host": {"cores": fs.cpu_count},
+            "host": {"id": self.host_id, "mode": self.host_mode, "cores": fs.cpu_count},
             "cpu": {
                 "busy_pct": busy,
                 "psi_some_avg10": psi["cpu"].get("some_avg10", 0.0),

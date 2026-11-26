@@ -48,6 +48,15 @@ install_tree() {
 # point at them (e.g. RUSTC_WRAPPER=$prefix/compat/rustc-slot.sh). Rebuilt on every install.
 install_tree "$src/compat" "$prefix/compat"
 
+# The web UI build (ui/README.md; never committed): installed to $prefix/ui when the checkout carries one,
+# served by loadgovd when [ui] is enabled.
+for d in "$src"/ui/dist/*/browser; do
+  if [ -f "$d/index.html" ]; then
+    install_tree "$d" "$prefix/ui"
+    break
+  fi
+done
+
 # Optional fallback copies for the compat shims (they exec these when the daemon is down). Only when this
 # checkout carries legacy scripts; the originals are never touched.
 if [ -d "$src/legacy" ]; then

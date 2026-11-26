@@ -63,6 +63,7 @@ def tokens(tmp_path):
 
 def cpu_alert():
     w = Watch(lambda: T0)
+    w.host = "build-a"
     sample = {
         "memory": {"avail_mb": 7000}, "swap": {"used_mb": 120}, "disk": {"free_gb": 48.0},
         "slots": {}, "heavy_slot": {"stuck": False},

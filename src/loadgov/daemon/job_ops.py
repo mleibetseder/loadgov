@@ -10,6 +10,7 @@ from loadgov.daemon.slot_ops import _err, _text
 from loadgov.engines.jobs import Job
 from loadgov.engines.limits import iso
 from loadgov.engines.slots import SLOT_FILES, pid_alive
+from loadgov.engines.timers import parse_ttl
 from loadgov.keys import key_error
 
 OVERRUNS = ("runtime", "memory")  # what `loadctl run --kind light` reports with job_end
@@ -35,6 +36,44 @@ def _unit(args: dict) -> tuple[str | None, dict | None]:
     if len(unit) > 200 or not _UNIT.match(unit):
         return None, _err("invalid_args", "unit must be a loadgov-*.scope unit name")
     return unit, None
+
+
+def _report(args: dict) -> tuple[dict | None, dict | None]:
+    """The outcome a client puts on `job_end`: exit_code (0..255), signal (1..64), cancelled, timeout,
+    oom_kill (booleans). Anything else of these is `invalid_args`; absent keys (old clients) are left out."""
+    rep: dict = {}
+    for key, lo, hi in (("exit_code", 0, 255), ("signal", 1, 64)):
+        v = args.get(key)
+        if v is None:
+            continue
+        if isinstance(v, bool) or not isinstance(v, int) or not lo <= v <= hi:
+            return None, _err("invalid_args", f"{key} must be an integer from {lo} to {hi}")
+        rep[key] = v
+    for key in ("cancelled", "timeout", "oom_kill"):
+        v = args.get(key)
+        if v is None:
+            continue
+        if not isinstance(v, bool):
+            return None, _err("invalid_args", f"{key} must be a boolean")
+        rep[key] = v
+    return rep, None
+
+
+def endings(d, args) -> dict:
+    """`job_endings`: recent endings, newest first. `since` is a duration (90s, 15m, 2h), `limit` an int."""
+    args = args if isinstance(args, dict) else {}
+    since = args.get("since")
+    cut = None
+    if since is not None:
+        try:
+            cut = d.clock() - parse_ttl(since)
+        except ValueError as e:
+            return _err("invalid_args", str(e))
+    limit = args.get("limit", 500)
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+        return _err("invalid_args", "limit must be an integer >= 1")
+    rows = [{**r, "ended_at": iso(r["ended_at"])} for r in d.jobs.endings.recent(cut, limit)]
+    return {"ok": True, "endings": rows}
 
 
 def _unregistered(d, unit: str, args: dict, peer_pid: int | None) -> Job | str | None:
@@ -67,6 +106,11 @@ def handle(d, op: str, args: dict, peer_pid: int | None) -> dict:
         overrun = args.get("overrun")
         if overrun is not None and overrun not in OVERRUNS:
             return _err("invalid_args", f"overrun must be one of: {', '.join(OVERRUNS)}")
+        rep, bad = _report(args)
+        if bad:
+            return bad
+        if overrun:
+            rep["overrun"] = overrun
         running = d.jobs.jobs.get(unit)
         reason = "job_end"
         if overrun:
@@ -89,7 +133,22 @@ def handle(d, op: str, args: dict, peer_pid: int | None) -> dict:
             if hit:
                 d.jobs.overrun(hit, why)
                 d.watch.note_overrun(hit.project, hit.label)
-        j = d.jobs.end(unit, reason)
+            else:
+                rep.pop("overrun")  # not a light job, or nothing to report: ignored
+        j = d.jobs.end(unit, reason, rep)
+        am = (
+            d.jobs.amend(unit, rep) if j is None else None
+        )  # the tick ended it first: the report names the cause
+        if am is not None:
+            d.audit.append({
+                "ts": iso(d.clock()), **ctx, "op": "job_end_amended", "principal": "agent",
+                "project": am["project"], "result": "amended",
+                "reason": f"cause {am['before']} -> {am['after']}",
+                "request": {
+                    "unit": unit, "cause_before": am["before"], "cause": am["after"],
+                    "exit_code": rep.get("exit_code"), "signal": rep.get("signal"),
+                },
+            })  # fmt: skip
         released = False
         if j and j.slot and not (d.jobs.scope_reader(j.cgroup) or "").strip():
             # a scope that still has processes keeps the slot; the tick frees it when the scope empties

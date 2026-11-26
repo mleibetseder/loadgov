@@ -22,6 +22,7 @@ PLATFORMS = [
     Platform.SELECT,
     Platform.SENSOR,
     Platform.SWITCH,
+    Platform.TEXT,
 ]
 
 ATTR_ENTRY = "config_entry_id"

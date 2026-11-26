@@ -44,6 +44,27 @@
       }
     }
   },
+  "entity": {
+    "sensor": {
+      "image_settings_source": {
+        "name": "Image settings source",
+        "state": {
+          "config": "Config file",
+          "override": "Owner override"
+        }
+      }
+    },
+    "number": {
+      "image_beta_interval": { "name": "Image beta interval" }
+    },
+    "text": {
+      "image_window": { "name": "Image window" },
+      "image_timezone": { "name": "Image timezone" }
+    },
+    "button": {
+      "image_settings_reset": { "name": "Image settings: reset to config" }
+    }
+  },
   "services": {
     "set_profile": {
       "name": "Set profile",

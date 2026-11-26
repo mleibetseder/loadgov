@@ -1,0 +1,13 @@
+# This workflow is REFUSED at load: `uses:` is limited to actions with a local equivalent
+# (actions/checkout, actions/setup-python, actions/setup-node). `loadctl workflow validate` says:
+#   refused-uses.yml:13:9: jobs.build.steps[0].uses: `uses: some-org/some-action@v1` is not supported ...
+# Run the equivalent commands with `run:` instead.
+name: Refused
+
+on: push
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: some-org/some-action@v1

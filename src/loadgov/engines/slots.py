@@ -28,6 +28,7 @@ import time
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 
+from loadgov.config import CompileConfig
 from loadgov.engines.eta import finish_estimate, queue_starts
 from loadgov.host.procfs import HostFS
 from loadgov.keys import key_url
@@ -170,6 +171,9 @@ class Waiter:
     since: float = 0.0  # first request time (`seen` is the last poll)
     kind: str | None = None
     key: str | None = None
+    mem_noted: bool = False  # the memory wait is audited once per blocked period (reset when it fits)
+    mem_since: float | None = None  # when the current memory wait began
+    admitted: tuple[str, str] | None = None  # (audit op, reason) when idle escape or timeout admitted it
 
 
 @dataclass
@@ -208,6 +212,7 @@ class Slot:
     progress: Progress | None = None
     hold: dict | None = None  # {reason, since, origin}
     legacy: dict | None = None  # {line, pid, since} when someone loadgov did not grant holds the lock
+    mem_block: dict | None = None  # the head waiter held back for memory (compile admission), else None
 
 
 class SlotManager:
@@ -223,6 +228,12 @@ class SlotManager:
         # (project, kind) -> median duration of finished jobs in seconds, None when unknown; set by the daemon
         self.expected_s: Callable[[str, str], float | None] = lambda project, kind: None
         self.url_template = ""  # [keys] url
+        # compile memory admission (docs/protocol.md "Compile memory admission"); wired by the daemon
+        self.compile_cfg = CompileConfig()
+        self.expected_peak: Callable[[str, str, int, int], float | None] = lambda p, label, h, q: None
+        self.memory: Callable[[], tuple[int, int, int] | None] = lambda: None  # (avail, total, low floor) MB
+        # does build work run that is not the waiter's own ancestry (its gate or impl job)? arg: waiter pid
+        self.work_running: Callable[[int], bool] = lambda pid: False
 
     # ---- events ----------------------------------------------------------------------------------
 
@@ -334,6 +345,7 @@ class SlotManager:
         """Free slot: a pending hold takes it first, else the head of the queue. Never preempts."""
         if s.holder is not None:
             return
+        s.mem_block = None
         s.legacy = self._detect_legacy(s)
         if s.legacy is not None:
             return
@@ -348,6 +360,9 @@ class SlotManager:
             return
         while s.queue:
             w = s.queue[0]
+            s.mem_block = self._memory_block(s, w)
+            if s.mem_block:
+                return  # FIFO: the head waits for memory and so does everyone behind it
             h = Holder(
                 w.project, w.label, w.pid, now, "job", self._start(w.pid), client_lock=w.client_lock,
                 job_kind=w.kind, key=w.key,
@@ -360,7 +375,61 @@ class SlotManager:
                 "slot_acquire", "granted", "slot granted", s, "agent", w.project, w.pid, after=h.line(),
                 key=w.key,
             )  # fmt: skip
+            if w.admitted:
+                self._ev(
+                    w.admitted[0], "granted", w.admitted[1], s, "agent", w.project, w.pid,
+                    after=h.line(), key=w.key,
+                )  # fmt: skip
             return
+
+    def _memory_block(self, s: Slot, w: Waiter) -> dict | None:
+        """Compile admission: why the head waiter `w` may not start now (None = admit). A compile needs
+        MemAvailable >= its expected peak + the memory guard's low floor. A crate whose need exceeds
+        MemTotal can never be met; it is admitted when no other build work runs (`compile_admitted_idle`)."""
+        cfg = self.compile_cfg
+        if s.name != "compile" or not cfg.memory_admission or w.kind != "compile":
+            return None
+        mem = self.memory()
+        if mem is None:
+            return None  # no sample yet: nothing to compare with
+        avail, total, low = mem
+        peak = self.expected_peak(w.project, w.label, cfg.history, cfg.percentile)
+        peak = float(cfg.default_peak_mb if peak is None else peak)
+        need = peak + low
+        now = self.clock()
+        if avail >= need:
+            w.admitted, w.mem_since, w.mem_noted = None, None, False
+            return None
+        if w.mem_since is None:
+            w.mem_since = now
+        waited = now - w.mem_since
+        if need > total and not self.work_running(w.pid):
+            why = f"needs ~{need:.0f} MB, more than the {total} MB of the host"
+            w.admitted = ("compile_admitted_idle", f"{why}; admitted, no other build work runs")
+            return None
+        if waited >= cfg.max_memory_wait_s:
+            w.admitted = (
+                "compile_admitted_timeout",
+                f"needs ~{need:.0f} MB, {avail} MB free after {int(waited)} s "
+                f"(max_memory_wait_s {cfg.max_memory_wait_s}): admitted anyway",
+            )
+            return None
+        w.admitted = None
+        mins = max(1, -(-int(cfg.max_memory_wait_s - waited) // 60))
+        reason = f"waiting for memory: needs ~{need:.0f} MB, {avail} MB free, admitted anyway in {mins} min"
+        if not w.mem_noted:
+            w.mem_noted = True
+            self._ev(
+                "compile_wait_memory", "waiting", reason, s, "agent", w.project, w.pid, key=w.key
+            )  # fmt: skip
+        return {"pid": w.pid, "project": w.project, "label": w.label, "reason": reason,
+                "needs_mb": round(need), "free_mb": avail, "peak_mb": round(peak)}  # fmt: skip
+
+    def _block_reason(self, s: Slot, pid: int, project: str, label: str) -> dict:
+        b = s.mem_block
+        if b and (b["pid"], b["project"], b["label"]) == (pid, project, label):
+            return {"reason": b["reason"]}
+        return {}
 
     def _start(self, pid: int) -> int | None:
         st = parse_stat(self.stat_reader(pid))
@@ -462,6 +531,22 @@ class SlotManager:
         except OSError:
             pass
         return False
+
+    def ancestry(self, pid: int) -> list[int]:
+        """`pid` and its parents upwards (64 levels at most, stopping at init or a gone process)."""
+        out, cur = [], pid
+        for _ in range(MAX_DEPTH):
+            if cur <= 1 or cur in out:
+                break
+            text = self.stat_reader(cur)
+            if parse_stat(text) is None:
+                break
+            out.append(cur)
+            nxt = parse_ppid(text)
+            if nxt is None:
+                break
+            cur = nxt
+        return out
 
     def _ancestor_holder(self, h: Holder, pids: list[int | None]) -> str | None:
         """How a request from `pids` (the claimed pid and the socket peer) descends from the holder `h`,
@@ -603,13 +688,15 @@ class SlotManager:
         if not wait:
             if fresh:
                 s.queue.remove(w)
-            return {**reply, "status": "busy", "holder": self._describe(s), "queue": len(s.queue)}
+            return {**reply, "status": "busy", "holder": self._describe(s), "queue": len(s.queue),
+                    **self._block_reason(s, pid, project, label)}  # fmt: skip
         if fresh:
             self._ev(
                 "slot_acquire", "queued", f"queued behind {self._describe(s)}", s, "agent", project, pid,
                 key=key,
             )  # fmt: skip
-        return {**reply, "status": "queued", "position": s.queue.index(w) + 1, "holder": self._describe(s)}
+        return {**reply, "status": "queued", "position": s.queue.index(w) + 1, "holder": self._describe(s),
+                **self._block_reason(s, pid, project, label)}  # fmt: skip
 
     def release(self, name: str, pid: int) -> dict:
         """Release the slot a job holds for `pid` (a hold ends with `hold_off`) and leave the queue."""
@@ -712,6 +799,7 @@ class SlotManager:
                 and idle_s >= STUCK_IDLE_S,
                 "hold": s.hold["reason"] if s.hold else None,
                 "hold_origin": s.hold["origin"] if s.hold else None,
+                **({"memory_admission": self.compile_cfg.memory_admission} if n == "compile" else {}),
             }
         return out
 
@@ -733,6 +821,7 @@ class SlotManager:
     def _waiters(self, s: Slot, now: float) -> list[dict]:
         expected = [self.expected_s(w.project, w.kind) if w.kind else None for w in s.queue]
         starts = queue_starts(self._free_at(s, now), expected)
+        b = s.mem_block if s.name == "compile" else None
         return [
             {
                 "position": i,
@@ -746,9 +835,16 @@ class SlotManager:
                 "wait_s": max(0, int(now - w.since)),
                 "expected_s": e,
                 "eta": None if t is None else _stamp(t),
+                **(self._mem_fields(b, w) if s.name == "compile" else {}),
             }
             for i, (w, e, t) in enumerate(zip(s.queue, expected, starts, strict=True), 1)
         ]
+
+    @staticmethod
+    def _mem_fields(b: dict | None, w: Waiter) -> dict:
+        mine = b is not None and (b["pid"], b["project"], b["label"]) == (w.pid, w.project, w.label)
+        keys = ("reason", "needs_mb", "free_mb", "peak_mb")
+        return {k: (b[k] if mine else None) for k in keys}
 
     def queues(self) -> dict:
         return {

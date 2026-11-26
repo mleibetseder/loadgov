@@ -1,0 +1,17 @@
+{
+  "schema": 1,
+  "deterministic": [
+    {
+      "job": "Check",
+      "step": "Compute",
+      "output": "sum"
+    }
+  ],
+  "hosted": {
+    "Check": {
+      "Compute": {
+        "sum": "5"
+      }
+    }
+  }
+}

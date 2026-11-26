@@ -92,12 +92,13 @@ def format_image_line(im: dict | None, now: str | None = None) -> str | None:
     if not im:
         return None
     tz, rows = im["timezone"], im.get("queue") or []
+    mark = " (override)" if im.get("source") == "override" else ""  # the owner changed it at run time
     if not rows and not im.get("running"):
         if im.get("in_window"):
-            return f"image train: empty, window {im['window']} {tz}, open"
+            return f"image train: empty, window {im['window']} {tz}, open{mark}"
         if (opens := _opens_in(im.get("next_window_start"), now)) is None:
             return None
-        return f"image train: empty, window {im['window']} {tz}, opens in {opens}"
+        return f"image train: empty, window {im['window']} {tz}, opens in {opens}{mark}"
     waiting = [r for r in rows if r["state"] != "running"]
     parts = [f"{im['queued']} queued"] if im["queued"] or not im.get("running") else []
     if im.get("running"):
@@ -106,13 +107,15 @@ def format_image_line(im: dict | None, now: str | None = None) -> str | None:
         nxt = waiting[0]
         start = nxt["planned_start"] or im.get("next_window_start")
         parts.append(f"next {_at(start, tz)} ({nxt['project']} {nxt['channel']})")
-    return "image train: " + ", ".join(parts)
+    return "image train: " + ", ".join(parts) + (f", window {im['window']} {tz} (override)" if mark else "")
 
 
 def format_queue(im: dict) -> str:
     tz = im["timezone"]
     state = "open" if im["in_window"] else "closed, next " + _at(im["next_window_start"], tz)
-    head = f"window {im['window']} {tz}, {state}"
+    head = f"window {im['window']} {tz}, {state}, beta every {im['beta_interval_h']} h"
+    if im.get("source") == "override":
+        head += " (override)"
     lines = [head]
     for r in im["queue"]:
         when = (

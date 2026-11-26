@@ -218,6 +218,30 @@ async def test_401_on_write_starts_reauth(hass, aioclient_mock, mock_entry, stat
     assert any(f["context"]["source"] == "reauth" for f in hass.config_entries.flow.async_progress())
 
 
+async def test_host_id_is_an_attribute_and_changes_no_entity_or_device_id(
+    hass, aioclient_mock, mock_entry, status
+):
+    from homeassistant.helpers import device_registry as dr
+    from homeassistant.helpers import entity_registry as er
+
+    from custom_components.loadgov.const import DOMAIN
+
+    await setup(hass, mock_entry, aioclient_mock, status)
+    assert hass.states.get("sensor.host_daemon_features").attributes["host_id"] == "build-a"
+    ent = er.async_get(hass).async_get("sensor.host_daemon_features")
+    assert ent.unique_id == f"{mock_entry.entry_id}_daemon_features"
+    device = dr.async_get(hass).async_get(ent.device_id)
+    assert device.identifiers == {(DOMAIN, mock_entry.entry_id)}  # the host id is not an identifier
+    assert device.serial_number == "build-a"
+    assert hass.states.get("select.host_load_profile") is not None  # entity ids keep their form
+
+
+async def test_an_older_daemon_without_a_host_id_still_works(hass, aioclient_mock, mock_entry, status):
+    del status["host"]
+    await setup(hass, mock_entry, aioclient_mock, status)
+    assert hass.states.get("sensor.host_daemon_features").attributes["host_id"] is None
+
+
 FREEZE_ENTITIES = (
     "switch.host_instant_quiet_freeze",
     "button.host_kill_build_daemons",

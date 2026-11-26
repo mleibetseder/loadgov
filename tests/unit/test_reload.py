@@ -240,6 +240,17 @@ def test_memguard_projects_are_restart_only(rig):
     assert row["op"] == "needs restart" and "memguard.projects.proj-a" in row["reason"]
 
 
+def test_ui_is_restart_only(rig):
+    d, cfg = rig
+    cfg.write_text(
+        "[memguard]\nenforce = true\n[ui]\nenabled = true\nbind = '192.0.2.10'\nallow = ['192.0.2.30']\n"
+    )
+    d.reload_config()
+    assert d.config.ui.enabled is False and d.ui.cfg.enabled is False  # still the running value
+    row = audits(d)[-1]
+    assert row["op"] == "needs restart" and "ui.enabled" in row["reason"]
+
+
 def test_reload_audit_rows_survive_a_failing_after_change(rig, monkeypatch):
     d, cfg = rig
     cfg.write_text(

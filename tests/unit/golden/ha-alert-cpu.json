@@ -11,5 +11,6 @@
   "profile": "balanced",
   "ceiling": null,
   "actions": ["profile=silent", "freeze"],
+  "host": "build-a",
   "at": "2025-11-10T18:40:00Z"
 }

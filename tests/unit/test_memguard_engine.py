@@ -50,13 +50,13 @@ def test_out_of_range_floors_are_clamped_not_fatal():
     assert thresholds(8.0) == thresholds(6.0)
 
 
-def make_engine(projects=None, override=None):
+def make_engine(projects=None, override=None, **kw):
     t = [0.0]
 
     def clock():
         return t[0]
 
-    return MemGuard(clock, clock, projects or {}, override), t
+    return MemGuard(clock, clock, projects or {}, override, **kw), t
 
 
 def a_tree(key="legacy:1", rss=900, **kw):
@@ -65,8 +65,9 @@ def a_tree(key="legacy:1", rss=900, **kw):
 
 @pytest.mark.parametrize("floor", FLOORS)
 def test_no_second_pause_within_five_minutes_after_a_resume_for_every_floor(floor):
-    """On the low-mem fixture (swap 3000 MB): the resume level is always above the pause level."""
-    g, t = make_engine()
+    """On the low-mem fixture (swap 3000 MB): the resume level is always above the pause level. The trend
+    rule is off here: a jump from HIGH to LOW in one sample is a fast fall, which it treats as pressure."""
+    g, t = make_engine(horizon_samples=0)
     low, high = thresholds(floor)
     tree = a_tree()
 
@@ -117,7 +118,163 @@ def test_class_order_scopes_before_legacy_before_containers():
     assert acts[0].entry.key == "s"
 
 
-def test_a_compile_tree_is_skipped_hold_then_abort_below_crit():
+# ---- early pressure: trend, swap headroom, deficit cover ----------------------------------------------
+
+
+def a_scope(key, rss, **kw):
+    return Tree("scope", key, "freeze", f"scope {key}", "proj-a", rss, [{"cgroup": f"/b/{key}"}], **kw)
+
+
+# An incident replayed from the daemon's sample history (MemAvailable, swap used; SwapTotal 8191 MB, LOW 3072
+# MB): seconds after the first row, MemAvailable, swap used MB. The old guard paused one tree at the last row.
+INCIDENT = [(0, 10475, 7081), (19, 7080, 7096), (34, 4793, 7096), (50, 2572, 7096)]
+INCIDENT_SWAP_TOTAL = 8191
+
+
+def incident_trees():
+    return [
+        a_scope("impl-a.scope", 1491),
+        a_scope("impl-b.scope", 1200),
+        a_scope("gate-c.scope", 900),
+        a_scope("impl-d.scope", 600),
+        a_scope("compile-e.scope", 4000, big_rustc_mb=2600, rustc=(90, 1)),  # never paused
+        Tree(
+            "container",
+            "x-test-db-1",
+            "docker",
+            "container x-test-db-1",
+            "proj-a",
+            0,
+            [{"name": "x-test-db-1"}],
+        ),  # denied by default  # fmt: skip
+    ]
+
+
+def replay(g, t, trees):
+    out = []
+    for at, avail, swap in INCIDENT:
+        t[0] = 1000.0 + at
+        acts = g.step(avail, swap, 3.0, True, lambda: [x for x in trees if x.key not in g_held(g)], lambda: [],
+                      INCIDENT_SWAP_TOTAL)  # fmt: skip
+        out.append((at, avail, [a.entry.key for a in acts if a.op == "pause"]))
+    return out
+
+
+def g_held(g):
+    return {e.key for e in g.paused}
+
+
+def test_incident_replay_pauses_at_the_second_sample_and_covers_the_deficit():
+    g, t = make_engine()
+    trees = incident_trees()
+    got = replay(g, t, trees)
+    at, avail, keys = next(r for r in got if r[2])
+    assert (at, avail) == (19, 7080)  # 16:56:35, not 16:57:06
+    # fall 3395 MB, projected 7080 - 2 * 3395 = 290 MB, deficit 3072 - 290 = 2782 MB: largest first until covered
+    assert keys == ["impl-a.scope", "impl-b.scope", "gate-c.scope"]
+    assert sum(x.rss_mb for x in trees if x.key in keys) >= 2782
+    pauses = [e for e in g.drain_events() if e["kind"] == "PAUSE"]
+    assert "falling 3395 MB per sample" in pauses[0]["text"] and "deficit 2782 MB" in pauses[0]["text"]
+    # the fall went on at the next sample: the last pausable tree follows, the compile and the container never
+    assert got[2][2] == ["impl-d.scope"]
+    assert {e.key for e in g.paused} == {"impl-a.scope", "impl-b.scope", "gate-c.scope", "impl-d.scope"}
+
+
+def test_incident_replay_with_the_new_rules_off_pauses_only_at_the_last_row():
+    """Without the trend and headroom rules the guard waits until avail < LOW (the incident's 16:57:06)."""
+    g, t = make_engine(swap_free_min_mb=0, horizon_samples=0)
+    got = replay(g, t, incident_trees())
+    assert [at for at, _, keys in got if keys] == [50]
+
+
+def test_trend_rule_fires_on_a_fall_that_would_cross_low_within_the_horizon():
+    g, t = make_engine()
+    tree = a_tree()
+
+    def step(avail):
+        t[0] += 5
+        return [a.op for a in g.step(avail, 0, 3.0, True, lambda: [tree], lambda: [], 8192)]
+
+    assert step(9000) == []
+    assert step(8900) == []  # a slow fall: 8900 - 200 is far above LOW
+    assert step(8000) == []  # fall 900: 8000 - 1800 = 6200, still above LOW 3072
+    assert step(5500) == ["pause"]  # fall 2500: 5500 - 5000 = 500 < 3072, although 5500 is above LOW
+    assert "projected within 2 samples" in g.drain_events()[-1]["text"]
+
+
+def test_trend_rule_off_with_horizon_zero():
+    g, t = make_engine(horizon_samples=0)
+    tree = a_tree()
+    for avail in (9000, 8000, 5500):
+        t[0] += 5
+        assert g.step(avail, 0, 3.0, True, lambda: [tree], lambda: [], 8192) == []
+
+
+@pytest.mark.parametrize(
+    "avail, total, used, paused",
+    [
+        (5000, 8192, 7300, True),  # free 892 < 1024 with avail below HIGH (6144)
+        (5000, 8192, 7100, False),  # free 1092: headroom left
+        (7000, 8192, 7300, False),  # avail at or above HIGH: no pressure from swap alone
+        (5000, None, 7300, False),  # SwapTotal unknown
+        (5000, 0, 0, False),  # no swap at all: no headroom rule
+    ],
+)
+def test_swap_headroom_rule(avail, total, used, paused):
+    g, t = make_engine(horizon_samples=0)
+    tree = a_tree()
+    t[0] += 5
+    acts = g.step(avail, used, 3.0, True, lambda: [tree], lambda: [], total)  # baseline = swap: no surge
+    assert [a.op for a in acts] == (["pause"] if paused else [])
+    if paused:
+        assert "swap free 892 MB below 1024 MB" in g.drain_events()[-1]["text"]
+
+
+def test_swap_headroom_rule_off_with_zero():
+    g, t = make_engine(swap_free_min_mb=0, horizon_samples=0)
+    for _ in range(2):
+        t[0] += 5
+        assert g.step(5000, 7300, 3.0, True, lambda: [a_tree()], lambda: [], 8192) == []
+
+
+def test_may_release_honours_the_trend_rule_like_a_sample_does():
+    g, t = make_engine()
+    trees = [a_scope("s1.scope", 800), a_scope("s2.scope", 700)]
+
+    def step(avail):
+        t[0] += 5
+        return g.step(
+            avail, 0, 3.0, True, lambda: [x for x in trees if x.key not in g_held(g)], lambda: [], 8192
+        )
+
+    step(2900)  # pauses s1
+    e = g.paused[0]
+    for _ in range(3):
+        step(9000)  # back at the resume level, inside the quiet period
+    assert g.may_release(e) is True
+    step(6500)  # still above HIGH (6144), but fell 2500: 6500 - 5000 = 1500 projected, below LOW
+    assert g.may_release(e) is False  # no early release into a fast fall
+    step(6500)
+    assert g.may_release(e) is True
+
+
+def test_a_fast_fall_acts_inside_the_quiet_period_but_never_resumes_there():
+    g, t = make_engine()
+    trees = [a_scope("s1.scope", 800), a_scope("s2.scope", 700), a_scope("s3.scope", 600)]
+
+    def step(avail):
+        t[0] += 5
+        acts = g.step(
+            avail, 0, 3.0, True, lambda: [x for x in trees if x.key not in g_held(g)], lambda: [], 8192
+        )
+        return [(a.op, a.entry.key) for a in acts]
+
+    assert step(2900) == [("pause", "s1.scope")]  # below LOW, no fall known yet: one tree
+    assert step(2850) == []  # inside the 15 s quiet, a slow fall: quiet holds
+    assert step(2200) == [("pause", "s2.scope"), ("pause", "s3.scope")]  # fall 650 in the quiet: acts at once
+    for _ in range(3):  # back up while still in the quiet: no resume from the quiet period
+        assert step(9000) == []
+
     g, t = make_engine()
     comp = a_tree(big_rustc_mb=2500, rustc=(77, 5))
 
@@ -220,6 +377,31 @@ def test_low_mem_pauses_the_larger_non_compiling_tree_and_never_claude(rig):
     s = rig.d.status["memguard"]
     assert [p["how"] for p in s["paused"]] == ["sigstop"] and s["last_decision"] == "PAUSE"
     assert [e["principal"] for e in rig.events("PAUSE")] == ["system"]
+
+
+def test_the_daemon_hands_swap_total_to_the_headroom_rule_and_never_stops_claude(rig):
+    b = rig.impl_tree(400, rss_work=1500)
+    rig.step(avail=5000, swap=7300)  # SwapTotal 8191 in the fixture: 891 MB free, avail below HIGH
+    assert {p for p, _ in rig.kernel.signals("SIGSTOP")} == {b["work"], b["child"]}
+    assert not rig.kernel.signals(pid=b["claude"])
+    assert "swap free 891 MB below 1024 MB" in rig.events("PAUSE")[0]["reason"]
+
+
+def test_config_swap_free_min_mb_and_horizon_samples():
+    assert (parse_config("").memguard.swap_free_min_mb, parse_config("").memguard.horizon_samples) == (
+        1024,
+        2,
+    )
+    c = parse_config("[memguard]\nswap_free_min_mb = 0\nhorizon_samples = 3\n").memguard
+    assert (c.swap_free_min_mb, c.horizon_samples) == (0, 3)
+    for body in (
+        "swap_free_min_mb = -1",
+        "swap_free_min_mb = 1.5",
+        "horizon_samples = 13",
+        "horizon_samples = true",
+    ):
+        with pytest.raises(ConfigError, match=body.split(" ")[0]):
+            parse_config(f"[memguard]\n{body}\n")
 
 
 def test_compile_only_holds_then_aborts_the_largest_rustc_only(rig):

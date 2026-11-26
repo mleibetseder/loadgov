@@ -21,15 +21,17 @@ import logging
 import os
 
 FIELDS = (
-    "ts", "op", "principal", "pid", "cgroup", "cmdline", "project", "reason", "request", "result",
-    "before", "after", "source", "peer",
+    "ts", "host", "op", "principal", "pid", "cgroup", "cmdline", "project", "reason", "request", "result",
+    "before", "after", "source", "peer", "client",
 )  # fmt: skip
 
 log = logging.getLogger("loadgov.audit")
 
 
 class AuditLog:
-    def __init__(self, log_dir: str, max_mb: int = 50, keep: int = 5):
+    def __init__(self, log_dir: str, max_mb: int = 50, keep: int = 5, host: str | None = None):
+        self.host = host  # the host id: every line carries it
+        self.client: str | None = None  # the REST client of the request being handled (set around it)
         self.path = os.path.join(log_dir, "audit.jsonl")
         self.max_mb, self.keep = max_mb, keep
         self._rotate_failed = False
@@ -88,6 +90,8 @@ class AuditLog:
 
     def append(self, entry: dict) -> None:
         row = {k: entry.get(k) for k in FIELDS}
+        row["host"] = self.host
+        row["client"] = row["client"] or self.client
         if row["cmdline"]:
             row["cmdline"] = row["cmdline"][:200]
         line = json.dumps(row, separators=(",", ":")) + "\n"

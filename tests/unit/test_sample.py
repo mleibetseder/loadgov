@@ -45,14 +45,31 @@ def take(host, now=NOW, mirrors=("loop-a",)):
         "cooldown_s": 0.0, "foreign_stopped": [],
     }  # fmt: skip
     out["backstop"] = {"enabled": False, "applied": False, "memory_max_mb": None, "memory_swap_max_mb": None,
-                       "oom_kills": 0, "max_events": 0, "swap_fail_events": 0, "last_event": None, "note": None}  # fmt: skip
+                       "capped_mb": None, "via": None, "oom_kills": 0, "max_events": 0, "swap_fail_events": 0, "last_event": None, "note": None,
+                       "shmem_mb": None, "file_mb": None, "leak_alert_mb": 1024, "leak_alerts": 0,
+                       "projects": {}, "leftovers": []}  # fmt: skip
     out["strays"] = {"enabled": True, "enforce": False, "check_s": 300, "last_check": None, "items": []}
-    out["rest"] = {"enabled": False, "state": "disabled", "error": None, "bind": "192.0.2.10", "port": 7420}
+    out["rest"] = {
+        "enabled": False,
+        "state": "disabled",
+        "error": None,
+        "bind": "192.0.2.10",
+        "port": 7420,
+        "tokens_warning": None,
+    }
+    out["ui"] = {
+        "enabled": False,
+        "state": "disabled",
+        "error": None,
+        "bind": None,
+        "port": 7421,
+        "built": False,
+    }
     out["slots"] = SlotManager(host.fs).summary()  # added by the daemon too
     out["jobs"] = []  # likewise
     out["light"] = {"running": 0, "max": 4, "per_project_max": 2, "cpu_quota_pct": 100,
                     "memory_max_mb": 1024, "max_runtime_s": 600}  # fmt: skip
-    out["image"] = {"window": "00:00-06:00", "timezone": "UTC", "in_window": False, "next_window_start": None,
+    out["image"] = {"window": "00:00-06:00", "timezone": "UTC", "source": "config", "in_window": False, "next_window_start": None,
                     "max_runtime_min": 90, "beta_interval_h": 48, "max_per_night": 6,
                     "env_allow": ["PATH"], "queued": 0, "running": 0, "queue": []}  # fmt: skip
     out["job_stats"] = []
